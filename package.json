@@ -1,0 +1,47 @@
+{
+  "name": "veylo-wallet-bot",
+  "version": "1.0.0",
+  "description": "VEYLO — Crypto at Speed. Telegram-based crypto wallet with giveaway system.",
+  "main": "dist/bot/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bot/index.js",
+    "dev": "ts-node-dev --respawn src/bot/index.ts",
+    "worker:payout": "node dist/workers/payout.js",
+    "worker:deposit": "node dist/workers/deposit.js",
+    "worker:cleanup": "node dist/workers/cleanup.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.15.0",
+    "bullmq": "^5.8.0",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "node-cron": "^3.0.3",
+    "telegraf": "^4.16.3",
+    "winston": "^3.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "@types/node-cron": "^3.0.11",
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "eslint": "^8.57.0",
+    "prisma": "^5.15.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
