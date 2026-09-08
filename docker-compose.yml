@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "3000:3000"
+    command: >
+      sh -c "npx prisma migrate deploy && npm start"
+
+  worker-payout:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    command: npm run worker:payout
+
+  worker-deposit:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    command: npm run worker:deposit
+
+  worker-cleanup:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    command: npm run worker:cleanup
+
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: veylo
+      POSTGRES_PASSWORD: veylo_secret
+      POSTGRES_DB: veylo
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+  redis_data:
+  
