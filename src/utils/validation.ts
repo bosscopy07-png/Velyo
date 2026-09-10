@@ -1,5 +1,7 @@
 import { ethers } from 'ethers';
 
+export { hashIdempotencyKey } from './encryption';
+
 export function isValidEVMAddress(address: string): boolean {
   try {
     return ethers.isAddress(address);
