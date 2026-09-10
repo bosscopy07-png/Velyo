@@ -131,7 +131,7 @@ status                ClaimStatus  @default(RESERVED)
 claimedAt             DateTime     @default(now())
 walletAddress         String?
 
-payoutTransactionId   String?
+payoutTransactionId   String?      @unique
 payoutTransaction     Transaction? @relation("GiveawayPayoutTransaction", fields: [payoutTransactionId], references: [id])
 
 payoutTransactionHash String?
@@ -142,7 +142,6 @@ claimOrder            Int
 @@index([giveawayId])
 @@index([userId])
 @@index([status])
-@@index([payoutTransactionId])
 @@map("giveaway_claims")
 }
 
