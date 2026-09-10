@@ -1,309 +1,318 @@
 generator client {
-  provider = "prisma-client-js"
+provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+provider = "postgresql"
+url      = env("DATABASE_URL")
 }
 
 model User {
-  id            String    @id @default(cuid())
-  telegramId    String    @unique
-  username      String?
-  firstName     String?
-  lastName      String?
-  joinDate      DateTime  @default(now())
-  lastActive    DateTime  @updatedAt
-  mainMessageId String?
-  chatId        String?
-  status        UserStatus @default(ACTIVE)
-  isAdmin       Boolean   @default(false)
-  
-  wallet        Wallet?
-  balances      Balance[]
-  transactions  Transaction[]
-  giveaways     Giveaway[]
-  claims        GiveawayClaim[]
-  codeRedemptions CodeRedemption[]
-  auditLogs     AuditLog[]
-  
-  @@index([telegramId])
-  @@index([status])
-  @@map("users")
+id              String     @id @default(cuid())
+telegramId      String     @unique
+username        String?
+firstName       String?
+lastName        String?
+joinDate        DateTime   @default(now())
+lastActive      DateTime   @updatedAt
+mainMessageId   String?
+chatId          String?
+status          UserStatus @default(ACTIVE)
+isAdmin         Boolean    @default(false)
+
+wallet          Wallet?
+balances        Balance[]
+transactions    Transaction[]
+giveaways       Giveaway[]
+claims          GiveawayClaim[]
+codeRedemptions CodeRedemption[]
+auditLogs       AuditLog[]
+
+@@index([telegramId])
+@@index([status])
+@@map("users")
 }
 
 model Wallet {
-  id                  String   @id @default(cuid())
-  userId              String   @unique
-  user                User     @relation(fields: [userId], references: [id])
-  address             String   @unique
-  encryptedPrivateKey String
-  encryptedMnemonic   String?
-  status              WalletStatus @default(ACTIVE)
-  createdAt           DateTime @default(now())
-  
-  @@index([address])
-  @@index([userId])
-  @@map("wallets")
+id                  String       @id @default(cuid())
+userId              String       @unique
+user                User         @relation(fields: [userId], references: [id])
+address             String       @unique
+encryptedPrivateKey String
+encryptedMnemonic   String?
+status              WalletStatus @default(ACTIVE)
+createdAt           DateTime     @default(now())
+
+@@index([address])
+@@index([userId])
+@@map("wallets")
 }
 
 model Balance {
-  id              String   @id @default(cuid())
-  userId          String
-  user            User     @relation(fields: [userId], references: [id])
-  asset           String
-  availableBalance Decimal @default(0) @db.Decimal(36, 18)
-  lockedBalance   Decimal @default(0) @db.Decimal(36, 18)
-  pendingBalance  Decimal @default(0) @db.Decimal(36, 18)
-  updatedAt       DateTime @updatedAt
-  
-  @@unique([userId, asset])
-  @@index([userId])
-  @@index([asset])
-  @@map("balances")
+id               String   @id @default(cuid())
+userId           String
+user             User     @relation(fields: [userId], references: [id])
+asset            String
+availableBalance Decimal  @default(0) @db.Decimal(36, 18)
+lockedBalance    Decimal  @default(0) @db.Decimal(36, 18)
+pendingBalance   Decimal  @default(0) @db.Decimal(36, 18)
+updatedAt        DateTime @updatedAt
+
+@@unique([userId, asset])
+@@index([userId])
+@@index([asset])
+@@map("balances")
 }
 
 model Transaction {
-  id              String   @id @default(cuid())
-  userId          String
-  user            User     @relation(fields: [userId], references: [id])
-  type            TransactionType
-  asset           String
-  amount          Decimal  @db.Decimal(36, 18)
-  fee             Decimal  @default(0) @db.Decimal(36, 18)
-  netAmount       Decimal  @db.Decimal(36, 18)
-  status          TransactionStatus @default(PENDING)
-  transactionHash String?
-  fromAddress     String?
-  toAddress       String?
-  metadata        Json?
-  idempotencyKey  String   @unique
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  
-  platformFee     PlatformFee?
-  
-  @@index([userId])
-  @@index([status])
-  @@index([transactionHash])
-  @@index([idempotencyKey])
-  @@index([createdAt])
-  @@map("transactions")
+id              String            @id @default(cuid())
+userId          String
+user            User              @relation(fields: [userId], references: [id])
+type            TransactionType
+asset           String
+amount          Decimal           @db.Decimal(36, 18)
+fee             Decimal           @default(0) @db.Decimal(36, 18)
+netAmount       Decimal           @db.Decimal(36, 18)
+status          TransactionStatus @default(PENDING)
+transactionHash String?
+fromAddress     String?
+toAddress       String?
+metadata        Json?
+idempotencyKey  String            @unique
+createdAt       DateTime          @default(now())
+updatedAt       DateTime          @updatedAt
+
+platformFee     PlatformFee?
+
+giveawayClaim   GiveawayClaim? @relation("GiveawayPayoutTransaction")
+
+@@index([userId])
+@@index([status])
+@@index([transactionHash])
+@@index([idempotencyKey])
+@@index([createdAt])
+@@map("transactions")
 }
 
 model Giveaway {
-  id              String   @id @default(cuid())
-  creatorId       String
-  creator         User     @relation(fields: [creatorId], references: [id])
-  asset           String
-  totalAmount     Decimal  @db.Decimal(36, 18)
-  amountPerUser   Decimal  @db.Decimal(36, 18)
-  maxClaimers     Int
-  claimedCount    Int      @default(0)
-  openedCount     Int      @default(0)
-  attemptCount    Int      @default(0)
-  status          GiveawayStatus @default(ACTIVE)
-  secureCode      String   @unique
-  expiresAt       DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  cancelledAt     DateTime?
-  cancellationReason String?
-  
-  claims          GiveawayClaim[]
-  
-  @@index([creatorId])
-  @@index([status])
-  @@index([secureCode])
-  @@index([expiresAt])
-  @@map("giveaways")
+id                 String         @id @default(cuid())
+creatorId          String
+creator            User           @relation(fields: [creatorId], references: [id])
+asset              String
+totalAmount        Decimal        @db.Decimal(36, 18)
+amountPerUser      Decimal        @db.Decimal(36, 18)
+maxClaimers        Int
+claimedCount       Int            @default(0)
+openedCount        Int            @default(0)
+attemptCount       Int            @default(0)
+status             GiveawayStatus @default(ACTIVE)
+secureCode         String         @unique
+expiresAt          DateTime?
+createdAt          DateTime       @default(now())
+updatedAt          DateTime       @updatedAt
+cancelledAt        DateTime?
+cancellationReason String?
+
+claims             GiveawayClaim[]
+
+@@index([creatorId])
+@@index([status])
+@@index([secureCode])
+@@index([expiresAt])
+@@map("giveaways")
 }
 
 model GiveawayClaim {
-  id                  String   @id @default(cuid())
-  giveawayId          String
-  giveaway            Giveaway @relation(fields: [giveawayId], references: [id])
-  userId              String
-  user                User     @relation(fields: [userId], references: [id])
-  status              ClaimStatus @default(RESERVED)
-  claimedAt           DateTime @default(now())
-  walletAddress       String?
-  payoutTransactionId String?
-  payoutTransaction   Transaction? @relation(fields: [payoutTransactionId], references: [id])
-  payoutTransactionHash String?
-  failedReason        String?
-  claimOrder          Int
-  
-  @@unique([giveawayId, userId])
-  @@index([giveawayId])
-  @@index([userId])
-  @@index([status])
-  @@map("giveaway_claims")
+id                    String      @id @default(cuid())
+giveawayId            String
+giveaway              Giveaway    @relation(fields: [giveawayId], references: [id])
+userId                String
+user                  User        @relation(fields: [userId], references: [id])
+status                ClaimStatus @default(RESERVED)
+claimedAt             DateTime    @default(now())
+walletAddress         String?
+
+payoutTransactionId   String?
+payoutTransaction     Transaction? @relation(
+"GiveawayPayoutTransaction",
+fields: [payoutTransactionId],
+references: [id]
+)
+
+payoutTransactionHash String?
+failedReason          String?
+claimOrder            Int
+
+@@unique([giveawayId, userId])
+@@index([giveawayId])
+@@index([userId])
+@@index([status])
+@@index([payoutTransactionId])
+@@map("giveaway_claims")
 }
 
 model RedeemCode {
-  id              String   @id @default(cuid())
-  code            String   @unique
-  asset           String
-  rewardAmount    Decimal  @db.Decimal(36, 18)
-  maxRedemptions  Int      @default(1)
-  redemptionCount Int      @default(0)
-  expiresAt       DateTime?
-  status          CodeStatus @default(ACTIVE)
-  createdBy       String
-  createdAt       DateTime @default(now())
-  
-  redemptions     CodeRedemption[]
-  
-  @@index([code])
-  @@index([status])
-  @@map("redeem_codes")
+id              String     @id @default(cuid())
+code            String     @unique
+asset           String
+rewardAmount    Decimal    @db.Decimal(36, 18)
+maxRedemptions  Int        @default(1)
+redemptionCount Int        @default(0)
+expiresAt       DateTime?
+status          CodeStatus @default(ACTIVE)
+createdBy       String
+createdAt       DateTime   @default(now())
+
+redemptions     CodeRedemption[]
+
+@@index([code])
+@@index([status])
+@@map("redeem_codes")
 }
 
 model CodeRedemption {
-  id          String   @id @default(cuid())
-  codeId      String
-  code        RedeemCode @relation(fields: [codeId], references: [id])
-  userId      String
-  user        User     @relation(fields: [userId], references: [id])
-  redeemedAt  DateTime @default(now())
-  amount      Decimal  @db.Decimal(36, 18)
-  
-  @@unique([codeId, userId])
-  @@index([codeId])
-  @@index([userId])
-  @@map("code_redemptions")
+id         String     @id @default(cuid())
+codeId     String
+code       RedeemCode @relation(fields: [codeId], references: [id])
+userId     String
+user       User       @relation(fields: [userId], references: [id])
+redeemedAt DateTime   @default(now())
+amount     Decimal    @db.Decimal(36, 18)
+
+@@unique([codeId, userId])
+@@index([codeId])
+@@index([userId])
+@@map("code_redemptions")
 }
 
 model PlatformFee {
-  id              String   @id @default(cuid())
-  transactionId   String   @unique
-  transaction     Transaction @relation(fields: [transactionId], references: [id])
-  asset           String
-  amount          Decimal  @db.Decimal(36, 18)
-  feeWallet       String
-  createdAt       DateTime @default(now())
-  
-  @@index([transactionId])
-  @@map("platform_fees")
+id            String      @id @default(cuid())
+transactionId String      @unique
+transaction   Transaction @relation(fields: [transactionId], references: [id])
+asset         String
+amount        Decimal     @db.Decimal(36, 18)
+feeWallet     String
+createdAt     DateTime    @default(now())
+
+@@index([transactionId])
+@@map("platform_fees")
 }
 
 model DepositMonitor {
-  id              String   @id @default(cuid())
-  address         String
-  asset           String
-  txHash          String
-  amount          Decimal  @db.Decimal(36, 18)
-  confirmations   Int      @default(0)
-  requiredConfirmations Int @default(15)
-  status          MonitorStatus @default(PENDING)
-  processedAt     DateTime?
-  createdAt       DateTime @default(now())
-  
-  @@unique([txHash, address])
-  @@index([address])
-  @@index([status])
-  @@map("deposit_monitors")
+id                    String        @id @default(cuid())
+address               String
+asset                 String
+txHash                String
+amount                Decimal       @db.Decimal(36, 18)
+confirmations         Int           @default(0)
+requiredConfirmations Int           @default(15)
+status                MonitorStatus @default(PENDING)
+processedAt           DateTime?
+createdAt             DateTime      @default(now())
+
+@@unique([txHash, address])
+@@index([address])
+@@index([status])
+@@map("deposit_monitors")
 }
 
 model AuditLog {
-  id          String   @id @default(cuid())
-  userId      String?
-  user        User?    @relation(fields: [userId], references: [id])
-  adminId     String?
-  action      String
-  entityType  String
-  entityId    String?
-  oldValue    Json?
-  newValue    Json?
-  ipAddress   String?
-  createdAt   DateTime @default(now())
-  
-  @@index([userId])
-  @@index([action])
-  @@index([createdAt])
-  @@map("audit_logs")
+id         String   @id @default(cuid())
+userId     String?
+user       User?    @relation(fields: [userId], references: [id])
+adminId    String?
+action     String
+entityType String
+entityId   String?
+oldValue   Json?
+newValue   Json?
+ipAddress  String?
+createdAt  DateTime @default(now())
+
+@@index([userId])
+@@index([action])
+@@index([createdAt])
+@@map("audit_logs")
 }
 
 model SystemConfig {
-  id              String   @id @default(cuid())
-  key             String   @unique
-  value           Json
-  updatedAt       DateTime @updatedAt
-  updatedBy       String?
-  
-  @@map("system_configs")
+id        String   @id @default(cuid())
+key       String   @unique
+value     Json
+updatedAt DateTime @updatedAt
+updatedBy String?
+
+@@map("system_configs")
 }
 
 enum UserStatus {
-  ACTIVE
-  SUSPENDED
-  FROZEN
-  BANNED
+ACTIVE
+SUSPENDED
+FROZEN
+BANNED
 }
 
 enum WalletStatus {
-  ACTIVE
-  DISABLED
+ACTIVE
+DISABLED
 }
 
 enum TransactionType {
-  DEPOSIT
-  WITHDRAWAL
-  GIVEAWAY_CREATED
-  GIVEAWAY_CANCELLED
-  GIVEAWAY_REWARD
-  CODE_REDEMPTION
-  PLATFORM_FEE
-  REFUND
-  TRANSFER
-  PAYOUT
+DEPOSIT
+WITHDRAWAL
+GIVEAWAY_CREATED
+GIVEAWAY_CANCELLED
+GIVEAWAY_REWARD
+CODE_REDEMPTION
+PLATFORM_FEE
+REFUND
+TRANSFER
+PAYOUT
 }
 
 enum TransactionStatus {
-  PENDING
-  PROCESSING
-  CONFIRMED
-  FAILED
-  CANCELLED
+PENDING
+PROCESSING
+CONFIRMED
+FAILED
+CANCELLED
 }
 
 enum GiveawayStatus {
-  DRAFT
-  ACTIVE
-  FULL
-  EXPIRED
-  CANCELLED
-  PROCESSING
-  COMPLETED
-  FAILED
+DRAFT
+ACTIVE
+FULL
+EXPIRED
+CANCELLED
+PROCESSING
+COMPLETED
+FAILED
 }
 
 enum ClaimStatus {
-  OPENED
-  ATTEMPTED
-  RESERVED
-  ADDRESS_PENDING
-  ADDRESS_CONFIRMED
-  QUEUED
-  PROCESSING
-  PAID
-  FAILED
-  REJECTED
+OPENED
+ATTEMPTED
+RESERVED
+ADDRESS_PENDING
+ADDRESS_CONFIRMED
+QUEUED
+PROCESSING
+PAID
+FAILED
+REJECTED
 }
 
 enum CodeStatus {
-  ACTIVE
-  INACTIVE
-  EXPIRED
-  DEPLETED
+ACTIVE
+INACTIVE
+EXPIRED
+DEPLETED
 }
 
 enum MonitorStatus {
-  PENDING
-  CONFIRMING
-  CONFIRMED
-  PROCESSED
-  FAILED
+PENDING
+CONFIRMING
+CONFIRMED
+PROCESSED
+FAILED
 }
