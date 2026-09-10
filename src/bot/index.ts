@@ -22,12 +22,14 @@ registerTextHandlers(bot);
 registerAdminCommands(bot);
 
 // Error handling
-bot.catch((err: any, ctx: any) => {
+bot.catch((err: unknown, ctx: any) => {
   logger.error('Bot error:', err);
   try {
     ctx.reply(`${'⚠️'} An unexpected error occurred. Our team has been notified.`);
   } catch {}
 });
+
+let botStarted = false;
 
 // Launch
 async function startBot(): Promise<void> {
@@ -36,7 +38,7 @@ async function startBot(): Promise<void> {
       const app = express();
       app.use(express.json());
       app.use(await bot.createWebhook({ domain: config.WEBHOOK_URL }));
-      
+
       app.listen(config.WEBHOOK_PORT, () => {
         logger.info(`Webhook server running on port ${config.WEBHOOK_PORT}`);
       });
@@ -44,6 +46,7 @@ async function startBot(): Promise<void> {
       await bot.launch();
       logger.info('Bot started in polling mode');
     }
+    botStarted = true;
   } catch (err) {
     logger.error('Failed to start bot:', err);
     process.exit(1);
@@ -52,6 +55,18 @@ async function startBot(): Promise<void> {
 
 startBot();
 
-// Graceful shutdown
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Graceful shutdown — only stop the bot if launch completed successfully,
+// otherwise Telegraf throws "Bot is not running!".
+async function shutdown(signal: string): Promise<void> {
+  if (botStarted) {
+    try {
+      await bot.stop(signal);
+    } catch (err) {
+      logger.error('Error while stopping bot:', err);
+    }
+  }
+  process.exit(0);
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
