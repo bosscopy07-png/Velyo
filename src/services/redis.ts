@@ -75,6 +75,6 @@ export async function getGiveawayViews(giveawayId: string): Promise<number> {
 
 // Idempotency for payouts
 export async function checkIdempotency(key: string): Promise<boolean> {
-  const exists = await redis.set(`idempotency:${key}`, '1', 'NX', 'EX', 86400);
+  const exists = await redis.set(`idempotency:${key}`, '1', 'EX', 86400, 'NX');
   return exists === 'OK';
-  }
+}
