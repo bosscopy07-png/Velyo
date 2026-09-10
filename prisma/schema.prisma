@@ -83,8 +83,7 @@ createdAt       DateTime          @default(now())
 updatedAt       DateTime          @updatedAt
 
 platformFee     PlatformFee?
-
-giveawayClaim   GiveawayClaim? @relation("GiveawayPayoutTransaction")
+giveawayClaim   GiveawayClaim?    @relation("GiveawayPayoutTransaction")
 
 @@index([userId])
 @@index([status])
@@ -123,21 +122,17 @@ claims             GiveawayClaim[]
 }
 
 model GiveawayClaim {
-id                    String      @id @default(cuid())
+id                    String       @id @default(cuid())
 giveawayId            String
-giveaway              Giveaway    @relation(fields: [giveawayId], references: [id])
+giveaway              Giveaway     @relation(fields: [giveawayId], references: [id])
 userId                String
-user                  User        @relation(fields: [userId], references: [id])
-status                ClaimStatus @default(RESERVED)
-claimedAt             DateTime    @default(now())
+user                  User         @relation(fields: [userId], references: [id])
+status                ClaimStatus  @default(RESERVED)
+claimedAt             DateTime     @default(now())
 walletAddress         String?
 
 payoutTransactionId   String?
-payoutTransaction     Transaction? @relation(
-"GiveawayPayoutTransaction",
-fields: [payoutTransactionId],
-references: [id]
-)
+payoutTransaction     Transaction? @relation("GiveawayPayoutTransaction", fields: [payoutTransactionId], references: [id])
 
 payoutTransactionHash String?
 failedReason          String?
