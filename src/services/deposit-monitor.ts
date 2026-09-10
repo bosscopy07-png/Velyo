@@ -2,7 +2,6 @@ import { prisma } from '../database';
 import { blockchain } from './blockchain';
 import { queueDepositCheck } from '../queues';
 import { logger } from '../utils/logger';
-import { config } from '../config';
 import cron from 'node-cron';
 
 class DepositMonitorService {
@@ -10,7 +9,7 @@ class DepositMonitorService {
 
   start(): void {
     // Run every 30 seconds
-    cron.schedule('*/30 * * * * *', () => this.scanDeposits());
+    cron.schedule('*/30 * * * * *', () => void this.scanDeposits());
     logger.info('Deposit monitor started');
   }
 
@@ -25,8 +24,8 @@ class DepositMonitorService {
         include: { user: true },
       });
 
-      const currentBlock = await blockchain.getProvider().then(p => p.getBlockNumber());
-      const fromBlock = currentBlock - 50; // Check last 50 blocks
+      const currentBlock = await (await blockchain.getProvider()).getBlockNumber();
+      const fromBlock = Math.max(0, currentBlock - 50); // Check last 50 blocks
 
       for (const wallet of wallets) {
         // Check USDT transfers
