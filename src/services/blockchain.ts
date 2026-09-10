@@ -18,17 +18,19 @@ class BlockchainService {
   private providerIndex: number = 0;
 
   constructor() {
-    this.primaryProvider = new ethers.JsonRpcProvider(config.BSC_PRIMARY_RPC, {
-      name: 'bnb',
-      chainId: config.BSC_CHAIN_ID,
-    });
+    // staticNetwork prevents ethers v6 from probing the RPC at construction/
+    // first-use time (the "failed to detect network... retry in 1s" loop that
+    // was blocking bot startup). The chainId is fixed by config.
+    const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
+
+    this.primaryProvider = new ethers.JsonRpcProvider(
+      config.BSC_PRIMARY_RPC,
+      network,
+      { staticNetwork: network }
+    );
 
     this.fallbackProviders = config.BSC_PUBLIC_RPCS.map(
-      (url) =>
-        new ethers.JsonRpcProvider(url, {
-          name: 'bnb',
-          chainId: config.BSC_CHAIN_ID,
-        })
+      (url) => new ethers.JsonRpcProvider(url, network, { staticNetwork: network })
     );
 
     this.currentProvider = this.primaryProvider;
@@ -240,4 +242,4 @@ class BlockchainService {
 }
 
 export const blockchain = new BlockchainService();
-  
+    
