@@ -7,6 +7,9 @@ import { handleRecoverKey } from './commands/recover';
 import { registerCallbacks } from './callbacks';
 import { registerTextHandlers } from './handlers/text';
 import { registerAdminCommands } from '../admin/commands';
+import { depositMonitor } from '../services/deposit-monitor';
+import '../workers/payout';   // BullMQ payout consumer runs in-process (no separate worker service on Render)
+import '../workers/cleanup'; // expired-giveaway refund cron
 import express from 'express';
 import type { Server } from 'http';
 
@@ -61,6 +64,9 @@ async function startBot(): Promise<void> {
 
 startBot();
 
+// In-process background jobs (Render runs only this one service)
+depositMonitor.start();
+
 // Graceful shutdown — bot.stop() is only valid in long-polling mode;
 // in webhook mode we close the express server instead.
 async function shutdown(signal: string): Promise<void> {
@@ -83,3 +89,4 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
+                 
