@@ -3,6 +3,7 @@ import { config } from '../config';
 import { logger } from '../utils/logger';
 import { securityMiddleware } from './middleware/security';
 import { handleStart } from './commands/start';
+import { handleRecoverKey } from './commands/recover';
 import { registerCallbacks } from './callbacks';
 import { registerTextHandlers } from './handlers/text';
 import { registerAdminCommands } from '../admin/commands';
@@ -16,6 +17,7 @@ bot.use(securityMiddleware);
 
 // Commands
 bot.command('start', handleStart);
+bot.command('recoverkey', handleRecoverKey); // TEMPORARY — remove after fund recovery
 
 // Callbacks & Text
 registerCallbacks(bot);
