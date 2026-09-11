@@ -64,12 +64,13 @@ export const confirmCancelKeyboard = (confirm: string, cancel: string) => Markup
   ],
 ]);
 
-export const assetKeyboard = (callbackPrefix: string) => Markup.inlineKeyboard([
+// `back` parameter lets callers override the Back target (default 'main')
+export const assetKeyboard = (callbackPrefix: string, back = 'main') => Markup.inlineKeyboard([
   [
     Markup.button.callback('🟡 BNB', `${callbackPrefix}:BNB`),
-    Markup.button.callback('🟢 USDT', `${callbackPrefix}:USDT`),
+    Markup.button.callback('🟢 USDT (BEP20)', `${callbackPrefix}:USDT`),
   ],
-  [Markup.button.callback(`${e('back')} Back`, 'main')],
+  [Markup.button.callback(`${e('back')} Back`, back)],
 ]);
 
 export const adminKeyboard = Markup.inlineKeyboard([
@@ -77,3 +78,4 @@ export const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback(`${e('people')} Broadcast`, 'admin:broadcast')],
   [Markup.button.callback(`${e('back')} Back`, 'main')],
 ]);
+    
