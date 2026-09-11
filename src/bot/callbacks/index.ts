@@ -3,6 +3,7 @@ import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
+import { blockchain } from '../../services/blockchain';
 import { setUserSession } from '../../services/redis';
 import { config } from '../../config';
 import { e } from '../../utils/emoji';
@@ -24,7 +25,7 @@ export function registerCallbacks(bot: any): void {
   const isAdmin = (ctx: Context): boolean =>
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
 
-  // Shared renderers — used directly instead of the invalid bot.handle() calls
+  // Shared renderers
   async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
@@ -43,10 +44,22 @@ export function registerCallbacks(bot: any): void {
       if (!user) return;
     }
 
-    const balances = user.balances.map((b) => ({
-      asset: b.asset,
-      available: Number(b.availableBalance),
-      locked: Number(b.lockedBalance),
+    // LIVE on-chain balances; DB is only a fallback if the chain read fails
+    const live: Record<string, number> = {};
+    for (const asset of ['BNB', 'USDT'] as const) {
+      try {
+        const raw = await blockchain.getBalance(user.wallet.address, asset);
+        live[asset] = Number(raw) / 1e18;
+      } catch (err) {
+        logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
+        live[asset] = Number(user.balances.find((b) => b.asset === asset)?.availableBalance ?? 0);
+      }
+    }
+
+    const balances = (['BNB', 'USDT'] as const).map((asset) => ({
+      asset,
+      available: live[asset],
+      locked: Number(user!.balances.find((b) => b.asset === asset)?.lockedBalance ?? 0),
     }));
 
     const caption = await formatWalletMessage(balances);
@@ -419,4 +432,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-}
+  }
+      
