@@ -3,6 +3,7 @@ import { blockchain } from './blockchain';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
+import type { TransactionResponse } from 'ethers';
 import cron from 'node-cron';
 
 const ASSET_DECIMALS: Record<string, number> = { BNB: 18, USDT: 18 };
@@ -59,10 +60,16 @@ class DepositMonitorService {
   ): Promise<Array<{ from: string; amount: bigint; txHash: string }>> {
     const provider = await blockchain.getProvider();
     const results: Array<{ from: string; amount: bigint; txHash: string }> = [];
+
     for (let b = fromBlock; b <= toBlock; b++) {
       const block = await provider.getBlock(b, true);
       if (!block) continue;
-      for (const tx of block.transactions) {
+
+      // ethers v6 types Block.transactions as string[] (hashes); with
+      // prefetchTxs=true the runtime returns full TransactionResponse objects.
+      const txs = block.transactions as unknown as TransactionResponse[];
+
+      for (const tx of txs) {
         if (tx.to?.toLowerCase() === address.toLowerCase() && tx.value > BigInt(0)) {
           results.push({ from: tx.from, amount: tx.value, txHash: tx.hash });
         }
@@ -173,4 +180,3 @@ class DepositMonitorService {
 }
 
 export const depositMonitor = new DepositMonitorService();
-                                                          
