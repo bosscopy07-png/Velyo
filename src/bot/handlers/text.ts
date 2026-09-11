@@ -34,16 +34,15 @@ export function registerTextHandlers(bot: any): void {
 
     try {
       switch (session.state) {
-        // === GIVEAWAY SINGLE: AMOUNT ===
+        // === GIVEAWAY SINGLE: AMOUNT (asset already chosen via buttons) ===
         case 'giveaway_single_amount': {
-          const parts = text.trim().split(' ');
-          const amountStr = parts[0];
-          const asset = (parts[1] || 'USDT').toUpperCase();
+          const asset = ((session as any).asset || 'USDT') as string;
+          const amountStr = text.trim().split(' ')[0];
 
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Invalid amount. Please enter a valid number.\n\nExample: <code>10 USDT</code>`,
+              `${e('warning')} Invalid amount for ${asset}. Please enter a valid number.\n\nExample: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -72,6 +71,7 @@ export function registerTextHandlers(bot: any): void {
           await editMainMessage(
             ctx,
             `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n\n` +
+            `<b>Asset:</b> ${asset}\n` +
             `<b>Total Reward:</b> ${amount} ${asset}\n` +
             `<b>Claimers:</b> 1 User\n` +
             `<b>Reward Per User:</b> ${amount} ${asset}\n` +
@@ -86,16 +86,15 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === GIVEAWAY MULTI: AMOUNT ===
+        // === GIVEAWAY MULTI: AMOUNT (asset already chosen via buttons) ===
         case 'giveaway_multi_amount': {
-          const parts = text.trim().split(' ');
-          const amountStr = parts[0];
-          const asset = (parts[1] || 'USDT').toUpperCase();
+          const asset = ((session as any).asset || 'USDT') as string;
+          const amountStr = text.trim().split(' ')[0];
 
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Invalid amount. Please enter a valid number.\n\nExample: <code>10 USDT</code>`,
+              `${e('warning')} Invalid amount for ${asset}. Please enter a valid number.\n\nExample: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -120,7 +119,7 @@ export function registerTextHandlers(bot: any): void {
           await editMainMessage(
             ctx,
             `${e('people')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
-            `Amount: <b>${amount} ${asset}</b>\n\n` +
+            `Asset: <b>${asset}</b> | Total: <b>${amount} ${asset}</b>\n\n` +
             `How many people should claim this giveaway?\n\nEnter a number (e.g., 5)`,
             backKeyboard('giveaway:multiple')
           );
@@ -450,5 +449,5 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-            }
+        }
             
