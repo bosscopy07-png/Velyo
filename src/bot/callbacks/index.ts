@@ -24,38 +24,8 @@ export function registerCallbacks(bot: any): void {
   const isAdmin = (ctx: Context): boolean =>
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
 
-  // === MAIN NAVIGATION ===
-  bot.action('main', async (ctx: Context) => {
-    const from = ctx.from!;
-    await editMainMessage(
-      ctx,
-      `${e('lightning')} <b>Welcome to VEYLO</b>\n\n` +
-      `Your crypto wallet built for speed.\n\n` +
-      `Manage your assets, receive payments, create giveaways, and earn with simple Telegram tools.\n\n` +
-      `Fast. Simple. Secure.`,
-      mainKeyboard(isAdmin(ctx))
-    );
-    await ctx.answerCbQuery();
-  });
-
-  // === ADMIN BROADCAST ===
-  // (The 'admin' dashboard action itself lives in src/admin/commands.ts)
-  bot.action('admin:broadcast', async (ctx: Context) => {
-    if (!isAdmin(ctx)) {
-      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
-      return;
-    }
-    await setUserSession(ctx.from!.id.toString(), { state: 'admin_broadcast' });
-    await editMainMessage(
-      ctx,
-      `${e('people')} <b>BROADCAST</b>\n\nSend the message you want to broadcast to all users.\n\nIt will be delivered to every user the bot can reach.`,
-      backKeyboard('admin')
-    );
-    await ctx.answerCbQuery();
-  });
-
-  // === WALLET ===
-  bot.action('wallet', async (ctx: Context) => {
+  // Shared renderers — used directly instead of the invalid bot.handle() calls
+  async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
@@ -64,7 +34,6 @@ export function registerCallbacks(bot: any): void {
 
     if (!user) return;
 
-    // Ensure wallet exists (same guarantee as /start)
     if (!user.wallet) {
       await walletService.createWallet(user.id);
       user = await prisma.user.findUnique({
@@ -82,25 +51,92 @@ export function registerCallbacks(bot: any): void {
 
     const caption = await formatWalletMessage(balances);
     await editMainMessage(ctx, caption, walletKeyboard);
-    await ctx.answerCbQuery();
-  });
+  }
 
-  bot.action('wallet:refresh', async (ctx: Context) => {
+  async function renderHistory(ctx: Context): Promise<void> {
+    const from = ctx.from!;
+    const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
+    if (!user) return;
+
+    const txs = await prisma.transaction.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+    });
+
+    let text = `${e('document')} <b>RECENT ACTIVITY</b>\n\n`;
+    if (txs.length === 0) text += 'No transactions yet.';
+
+    for (const tx of txs) {
+      const sign = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND'].includes(tx.type) ? '+' : '-';
+      text += `${sign}${tx.amount} ${tx.asset} — ${tx.status}\n`;
+    }
+
+    await editMainMessage(ctx, text, backKeyboard('wallet'));
+  }
+
+  // Wrapper: logs any action error instead of dying silently
+  const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
+    try {
+      await fn(ctx);
+    } catch (err) {
+      logger.error(`Callback error: ${(err as Error).message}`, err);
+      try {
+        await ctx.answerCbQuery('Something went wrong. Try again.', { show_alert: true });
+      } catch {}
+    }
+  };
+
+  // === MAIN NAVIGATION ===
+  bot.action('main', guard(async (ctx: Context) => {
+    await editMainMessage(
+      ctx,
+      `${e('lightning')} <b>Welcome to VEYLO</b>\n\n` +
+      `Your crypto wallet built for speed.\n\n` +
+      `Manage your assets, receive payments, create giveaways, and earn with simple Telegram tools.\n\n` +
+      `Fast. Simple. Secure.`,
+      mainKeyboard(isAdmin(ctx))
+    );
+    await ctx.answerCbQuery();
+  }));
+
+  // === ADMIN BROADCAST ===
+  bot.action('admin:broadcast', guard(async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await setUserSession(ctx.from!.id.toString(), { state: 'admin_broadcast' });
+    await editMainMessage(
+      ctx,
+      `${e('people')} <b>BROADCAST</b>\n\nSend the message you want to broadcast to all users.\n\nIt will be delivered to every user the bot can reach.`,
+      backKeyboard('admin')
+    );
+    await ctx.answerCbQuery();
+  }));
+
+  // === WALLET ===
+  bot.action('wallet', guard(async (ctx: Context) => {
+    await renderWallet(ctx);
+    await ctx.answerCbQuery();
+  }));
+
+  bot.action('wallet:refresh', guard(async (ctx: Context) => {
     await ctx.answerCbQuery('Refreshing...');
-    await bot.handle('wallet')!(ctx);
-  });
+    await renderWallet(ctx);
+  }));
 
   // === DEPOSIT ===
-  bot.action('wallet:deposit', async (ctx: Context) => {
+  bot.action('wallet:deposit', guard(async (ctx: Context) => {
     await editMainMessage(
       ctx,
       `${e('deposit')} <b>SELECT ASSET TO DEPOSIT</b>\n\nChoose which asset you want to deposit.`,
       assetKeyboard('deposit')
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action(/deposit:(BNB|USDT)/, async (ctx: Context) => {
+  bot.action(/deposit:(BNB|USDT)/, guard(async (ctx: Context) => {
     const asset = (ctx as any).match[1] as string;
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
@@ -125,9 +161,9 @@ export function registerCallbacks(bot: any): void {
       depositKeyboard(asset)
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action(/wallet:copy:(BNB|USDT)/, async (ctx: Context) => {
+  bot.action(/wallet:copy:(BNB|USDT)/, guard(async (ctx: Context) => {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
@@ -138,38 +174,20 @@ export function registerCallbacks(bot: any): void {
     } else {
       await ctx.answerCbQuery('No wallet found. Send /start first.', { show_alert: true });
     }
-  });
+  }));
 
-  bot.action(/wallet:check:(BNB|USDT)/, async (ctx: Context) => {
+  bot.action(/wallet:check:(BNB|USDT)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery('Checking deposits... This may take a moment.');
-    await bot.handle('wallet')!(ctx);
-  });
+    await renderWallet(ctx);
+  }));
 
-  bot.action('wallet:history', async (ctx: Context) => {
-    const from = ctx.from!;
-    const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
-    if (!user) return;
-
-    const txs = await prisma.transaction.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 10,
-    });
-
-    let text = `${e('document')} <b>RECENT ACTIVITY</b>\n\n`;
-    if (txs.length === 0) text += 'No transactions yet.';
-
-    for (const tx of txs) {
-      const sign = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND'].includes(tx.type) ? '+' : '-';
-      text += `${sign}${tx.amount} ${tx.asset} — ${tx.status}\n`;
-    }
-
-    await editMainMessage(ctx, text, backKeyboard('wallet'));
+  bot.action('wallet:history', guard(async (ctx: Context) => {
+    await renderHistory(ctx);
     await ctx.answerCbQuery();
-  });
+  }));
 
   // === GIVEAWAY ===
-  bot.action('giveaway', async (ctx: Context) => {
+  bot.action('giveaway', guard(async (ctx: Context) => {
     if (!config.ENABLE_GIVEAWAYS) {
       await ctx.answerCbQuery('Giveaways are temporarily disabled.', { show_alert: true });
       return;
@@ -180,9 +198,9 @@ export function registerCallbacks(bot: any): void {
       giveawayTypeKeyboard
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action('giveaway:single', async (ctx: Context) => {
+  bot.action('giveaway:single', guard(async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_single_amount' });
     await editMainMessage(
@@ -194,9 +212,9 @@ export function registerCallbacks(bot: any): void {
       backKeyboard('giveaway')
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action('giveaway:multiple', async (ctx: Context) => {
+  bot.action('giveaway:multiple', guard(async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_multi_amount' });
     await editMainMessage(
@@ -207,9 +225,9 @@ export function registerCallbacks(bot: any): void {
       backKeyboard('giveaway')
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action('giveaway:mine', async (ctx: Context) => {
+  bot.action('giveaway:mine', guard(async (ctx: Context) => {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
     if (!user) return;
@@ -231,9 +249,9 @@ export function registerCallbacks(bot: any): void {
 
     await editMainMessage(ctx, text, backKeyboard('giveaway'));
     await ctx.answerCbQuery();
-  });
+  }));
 
-  bot.action(/giveaway:cancel:(.+)/, async (ctx: Context) => {
+  bot.action(/giveaway:cancel:(.+)/, guard(async (ctx: Context) => {
     const giveawayId = (ctx as any).match[1];
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
@@ -244,10 +262,24 @@ export function registerCallbacks(bot: any): void {
       result.success ? 'Giveaway cancelled. Funds returned.' : result.reason,
       { show_alert: !result.success }
     );
-    if (result.success) await bot.handle('giveaway:mine')!(ctx);
-  });
+    if (result.success) {
+      const giveaways = await prisma.giveaway.findMany({
+        where: { creatorId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        include: { claims: true },
+      });
+      let text = `${e('chart')} <b>MY GIVEAWAYS</b>\n\n`;
+      if (giveaways.length === 0) text += 'No giveaways created yet.';
+      for (const g of giveaways) {
+        const status = g.status === 'ACTIVE' ? '🟢' : g.status === 'FULL' ? '🔴' : '⚪';
+        text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
+      }
+      await editMainMessage(ctx, text, backKeyboard('giveaway'));
+    }
+  }));
 
-  bot.action(/giveaway:stats:(.+)/, async (ctx: Context) => {
+  bot.action(/giveaway:stats:(.+)/, guard(async (ctx: Context) => {
     const giveawayId = (ctx as any).match[1];
     const stats = await giveawayService.getGiveawayStats(giveawayId);
 
@@ -265,15 +297,16 @@ export function registerCallbacks(bot: any): void {
 
     await editMainMessage(ctx, text, backKeyboard('giveaway:mine'));
     await ctx.answerCbQuery();
-  });
+  }));
 
   // === HISTORY ===
-  bot.action('history', async (ctx: Context) => {
-    await bot.handle('wallet:history')!(ctx);
-  });
+  bot.action('history', guard(async (ctx: Context) => {
+    await renderHistory(ctx);
+    await ctx.answerCbQuery();
+  }));
 
   // === ACCOUNT ===
-  bot.action('account', async (ctx: Context) => {
+  bot.action('account', guard(async (ctx: Context) => {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
@@ -289,9 +322,9 @@ export function registerCallbacks(bot: any): void {
       _count: { id: true },
     });
 
-    const totalDeposited = stats.find((s) => s.type === 'DEPOSIT')?._sum.amount || 0;
-    const totalGiveaways = stats.find((s) => s.type === 'GIVEAWAY_CREATED')?._sum.amount || 0;
-    const totalRewards = stats.find((s) => s.type === 'GIVEAWAY_REWARD')?._sum.amount || 0;
+    const totalDeposited = Number(stats.find((s) => s.type === 'DEPOSIT')?._sum.amount || 0);
+    const totalGiveaways = Number(stats.find((s) => s.type === 'GIVEAWAY_CREATED')?._sum.amount || 0);
+    const totalRewards = Number(stats.find((s) => s.type === 'GIVEAWAY_REWARD')?._sum.amount || 0);
 
     const caption = [
       `${e('person')} <b>MY ACCOUNT</b>`,
@@ -309,18 +342,16 @@ export function registerCallbacks(bot: any): void {
     ].join('\n');
 
     const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback(`${e('document')} History`, 'wallet:history'),
-      ],
+      [Markup.button.callback(`${e('document')} History`, 'wallet:history')],
       [Markup.button.callback(`${e('back')} Back`, 'main')],
     ]);
 
     await editMainMessage(ctx, caption, keyboard);
     await ctx.answerCbQuery();
-  });
+  }));
 
   // === HELP ===
-  bot.action('help', async (ctx: Context) => {
+  bot.action('help', guard(async (ctx: Context) => {
     await editMainMessage(
       ctx,
       `${e('help')} <b>HELP CENTER</b>\n\n` +
@@ -341,10 +372,10 @@ export function registerCallbacks(bot: any): void {
       backKeyboard('main')
     );
     await ctx.answerCbQuery();
-  });
+  }));
 
   // === CONFIRM/CREATE GIVEAWAY ===
-  bot.action(/giveaway:confirm:(.+)/, async (ctx: Context) => {
+  bot.action(/giveaway:confirm:(.+)/, guard(async (ctx: Context) => {
     const sessionData = (ctx as any).match[1];
     const [type, asset, amountStr, claimersStr, expiryHours] = sessionData.split('|');
     const from = ctx.from!;
@@ -381,12 +412,11 @@ export function registerCallbacks(bot: any): void {
       logger.error('Giveaway creation error:', err);
       await ctx.answerCbQuery((err as Error).message, { show_alert: true });
     }
-  });
+  }));
 
-  bot.action(/giveaway:copy:(.+)/, async (ctx: Context) => {
+  bot.action(/giveaway:copy:(.+)/, guard(async (ctx: Context) => {
     const code = (ctx as any).match[1];
     const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
-  });
-      }
-      
+  }));
+}
