@@ -1,12 +1,12 @@
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Job } from 'bullmq';
 import { config } from '../config';
-import { redis } from '../services/redis';
-import { logger } from '../utils/logger';
+import { bullmqConnection } from '../services/redis';
 
-// Queue instances
-export const payoutQueue = new Queue('payouts', { connection: redis });
-export const depositQueue = new Queue('deposits', { connection: redis });
-export const notificationQueue = new Queue('notifications', { connection: redis });
+// Queue instances — MUST use bullmqConnection (maxRetriesPerRequest: null).
+// Passing the shared `redis` client here crashes BullMQ instantly.
+export const payoutQueue = new Queue('payouts', { connection: bullmqConnection });
+export const depositQueue = new Queue('deposits', { connection: bullmqConnection });
+export const notificationQueue = new Queue('notifications', { connection: bullmqConnection });
 
 // Job producers
 export async function queuePayout(data: {
@@ -56,4 +56,4 @@ export async function queueNotification(data: {
     attempts: 3,
     backoff: { type: 'fixed', delay: 5000 },
   });
-}
+  }
