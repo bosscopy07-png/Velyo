@@ -15,6 +15,23 @@ redis.on('connect', () => {
   logger.info('Redis connected');
 });
 
+// Dedicated connection for BullMQ (queues + workers).
+// BullMQ issues blocking commands (BRPOPLPUSH etc.) which REQUIRE
+// maxRetriesPerRequest: null — the shared client's value of 3 crashes it
+// with "BullMQ: Your redis options maxRetriesPerRequest must be null."
+export const bullmqConnection = new Redis(config.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+
+bullmqConnection.on('error', (err) => {
+  logger.error('BullMQ Redis error:', err);
+});
+
+bullmqConnection.on('connect', () => {
+  logger.info('BullMQ Redis connected');
+});
+
 // Distributed lock for atomic giveaway claims
 export async function acquireLock(lockKey: string, ttlMs = 10000): Promise<string | null> {
   const token = `${Date.now()}-${Math.random()}`;
@@ -77,4 +94,4 @@ export async function getGiveawayViews(giveawayId: string): Promise<number> {
 export async function checkIdempotency(key: string): Promise<boolean> {
   const exists = await redis.set(`idempotency:${key}`, '1', 'EX', 86400, 'NX');
   return exists === 'OK';
-}
+                                }
