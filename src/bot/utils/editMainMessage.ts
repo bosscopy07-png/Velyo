@@ -5,15 +5,23 @@ import { logger } from '../../utils/logger';
 export const VEYLO_IMAGE = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1788789976/file_00000000d1ec81f4adfb8b48d09eb39d_k1fwyl.png';
 
 /**
+ * Returns true if the Telegram error means "edit succeeded, nothing changed".
+ * This is NOT a failure — treat it as a successful no-op edit.
+ */
+function isNotModifiedError(err: unknown): boolean {
+  const desc = (err as any)?.response?.description ?? (err as Error)?.message ?? '';
+  return typeof desc === 'string' && desc.toLowerCase().includes('not modified');
+}
+
+/**
  * Universal "edit the main message" helper.
  *
- * Order of operations (per product requirement: auto-edit ONLY):
- *   1. Try editMessageCaption  (cheapest)
- *   2. Try editMessageMedia    (type changed)
- *   3. Delete the old main message and send a fresh photo+caption
- *      (only when editing is impossible)
+ * Order of operations (edit-only policy):
+ *   1. editMessageCaption   (cheapest)
+ *   2. editMessageMedia     (handles type changes)
+ *   3. delete + send new    (ONLY when editing is genuinely impossible)
  *
- * If the user has no main message yet, one is created and stored.
+ * "message is not modified" counts as SUCCESS at every step.
  */
 export async function editMainMessage(
   ctx: Context,
@@ -27,9 +35,12 @@ export async function editMainMessage(
   const user = await prisma.user.findUnique({ where: { telegramId } });
   const chatId = ctx.chat?.id ?? (user?.chatId ? parseInt(user.chatId) : undefined);
 
-  if (!chatId) return;
+  if (!chatId) {
+    logger.warn(`editMainMessage: no chatId for ${telegramId}`);
+    return;
+  }
 
-  // No main message on record yet — must create one
+  // No main message on record — nothing to edit, must create one
   if (!user?.mainMessageId) {
     const msg = await ctx.telegram.sendPhoto(chatId, VEYLO_IMAGE, {
       caption,
@@ -47,7 +58,7 @@ export async function editMainMessage(
 
   const messageId = parseInt(user.mainMessageId);
 
-  // 1. Edit caption
+  // 1. Try caption edit
   try {
     await ctx.telegram.editMessageCaption(
       chatId,
@@ -57,11 +68,12 @@ export async function editMainMessage(
       { parse_mode: 'HTML', reply_markup: keyboard?.reply_markup as any }
     );
     return;
-  } catch {
-    // fall through
+  } catch (err) {
+    if (isNotModifiedError(err)) return; // success no-op
+    logger.warn(`editMainMessage: caption edit failed for ${telegramId} (msg ${messageId}): ${(err as any)?.response?.description ?? (err as Error).message}`);
   }
 
-  // 2. Edit media (handles cases where message type changed)
+  // 2. Try media edit
   try {
     await ctx.telegram.editMessageMedia(
       chatId,
@@ -71,11 +83,13 @@ export async function editMainMessage(
       { reply_markup: keyboard?.reply_markup as any }
     );
     return;
-  } catch {
-    // fall through
+  } catch (err) {
+    if (isNotModifiedError(err)) return; // success no-op
+    logger.warn(`editMainMessage: media edit failed for ${telegramId} (msg ${messageId}): ${(err as any)?.response?.description ?? (err as Error).message}`);
   }
 
-  // 3. Editing impossible — delete old, send new, remember the new id
+  // 3. Editing genuinely impossible — delete old, send new, remember ID
+  logger.warn(`editMainMessage: falling back to delete+resend for ${telegramId} (msg ${messageId})`);
   try {
     await ctx.telegram.deleteMessage(chatId, messageId);
   } catch {
@@ -95,4 +109,5 @@ export async function editMainMessage(
   } catch (err) {
     logger.error('editMainMessage: failed to send replacement message:', err);
   }
-}
+  }
+    
