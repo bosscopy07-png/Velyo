@@ -1,17 +1,16 @@
 import { Context } from 'telegraf';
+import { Markup } from 'telegraf';
 import { prisma } from '../../database';
-import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
 import { getUserSession, setUserSession, clearUserSession } from '../../services/redis';
 import { pricing } from '../../services/pricing';
-import { blockchain } from '../../services/blockchain';
 import { queuePayout } from '../../queues';
 import { config, GIVEAWAY_EXPIRY_OPTIONS } from '../../config';
 import { e } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
 import { isValidEVMAddress, normalizeAddress, isValidAmount, hashIdempotencyKey } from '../../utils/validation';
-import { Markup } from 'telegraf';
-import { backKeyboard, confirmCancelKeyboard, assetKeyboard } from '../keyboards/main';
+import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
+import { editMainMessage } from '../utils/editMainMessage';
 
 export function registerTextHandlers(bot: any): void {
   bot.on('text', async (ctx: Context) => {
@@ -21,9 +20,15 @@ export function registerTextHandlers(bot: any): void {
     const telegramId = from.id.toString();
     const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
     const session = await getUserSession(telegramId);
-    
+
+    // Always delete the user's message — the bot edits its own main message instead
+    try {
+      await ctx.deleteMessage();
+    } catch {
+      // message already gone or not deletable — non-fatal
+    }
+
     if (!session?.state) {
-      // Ignore random text if not in a flow
       return;
     }
 
@@ -36,13 +41,21 @@ export function registerTextHandlers(bot: any): void {
           const asset = (parts[1] || 'USDT').toUpperCase();
 
           if (!isValidAmount(amountStr)) {
-            await ctx.reply(`${e('warning')} Invalid amount. Please enter a valid number.`);
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Invalid amount. Please enter a valid number.\n\nExample: <code>10 USDT</code>`,
+              backKeyboard('giveaway')
+            );
             return;
           }
 
           const amount = parseFloat(amountStr);
           if (amount <= 0) {
-            await ctx.reply(`${e('warning')} Amount must be greater than 0.`);
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Amount must be greater than 0.`,
+              backKeyboard('giveaway')
+            );
             return;
           }
 
@@ -56,7 +69,8 @@ export function registerTextHandlers(bot: any): void {
           const usdValue = await pricing.convertToUSD(asset, amount);
           const ngnValue = await pricing.convertToNGN(asset, amount);
 
-          await ctx.reply(
+          await editMainMessage(
+            ctx,
             `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n\n` +
             `<b>Total Reward:</b> ${amount} ${asset}\n` +
             `<b>Claimers:</b> 1 User\n` +
@@ -64,13 +78,10 @@ export function registerTextHandlers(bot: any): void {
             `<b>Estimated Value:</b> ${pricing.formatUSD(usdValue)}\n` +
             `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n\n` +
             `<b>Status:</b> Ready`,
-            {
-              parse_mode: 'HTML',
-              reply_markup: confirmCancelKeyboard(
-                `giveaway:confirm:single|${asset}|${amount}|1|0`,
-                'giveaway'
-              ).reply_markup,
-            }
+            confirmCancelKeyboard(
+              `giveaway:confirm:single|${asset}|${amount}|1|0`,
+              'giveaway'
+            )
           );
           break;
         }
@@ -82,13 +93,21 @@ export function registerTextHandlers(bot: any): void {
           const asset = (parts[1] || 'USDT').toUpperCase();
 
           if (!isValidAmount(amountStr)) {
-            await ctx.reply(`${e('warning')} Invalid amount. Please enter a valid number.`);
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Invalid amount. Please enter a valid number.\n\nExample: <code>10 USDT</code>`,
+              backKeyboard('giveaway')
+            );
             return;
           }
 
           const amount = parseFloat(amountStr);
           if (amount <= 0) {
-            await ctx.reply(`${e('warning')} Amount must be greater than 0.`);
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Amount must be greater than 0.`,
+              backKeyboard('giveaway')
+            );
             return;
           }
 
@@ -98,10 +117,12 @@ export function registerTextHandlers(bot: any): void {
             asset,
           });
 
-          await ctx.reply(
-            `${e('people')} How many people should claim this giveaway?\n\n` +
-            `Enter a number (e.g., 5)`,
-            { reply_markup: backKeyboard('giveaway').reply_markup }
+          await editMainMessage(
+            ctx,
+            `${e('people')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
+            `Amount: <b>${amount} ${asset}</b>\n\n` +
+            `How many people should claim this giveaway?\n\nEnter a number (e.g., 5)`,
+            backKeyboard('giveaway:multiple')
           );
           break;
         }
@@ -110,7 +131,11 @@ export function registerTextHandlers(bot: any): void {
         case 'giveaway_multi_claimers': {
           const claimers = parseInt(text.trim());
           if (isNaN(claimers) || claimers < 1) {
-            await ctx.reply(`${e('warning')} Please enter a valid number of claimers.`);
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Please enter a valid number of claimers.`,
+              backKeyboard('giveaway:multiple')
+            );
             return;
           }
 
@@ -125,12 +150,13 @@ export function registerTextHandlers(bot: any): void {
             amountPerUser,
           });
 
-          const buttons = GIVEAWAY_EXPIRY_OPTIONS.map(opt => 
+          const buttons = GIVEAWAY_EXPIRY_OPTIONS.map((opt) =>
             Markup.button.callback(opt.label, `giveaway:expiry:${opt.hours || 0}`)
           );
-          
-          await ctx.reply(
-            `${e('clock')} Select giveaway expiry:`,
+
+          await editMainMessage(
+            ctx,
+            `${e('clock')} <b>SELECT EXPIRY</b>\n\nTotal: ${amount} ${asset} | ${claimers} claimers | ${amountPerUser.toFixed(6)} ${asset} each`,
             Markup.inlineKeyboard([
               ...buttons.reduce((rows: any[][], btn, i) => {
                 if (i % 2 === 0) rows.push([btn]);
@@ -143,7 +169,7 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === REDEEM CODE ===
+        // === REDEEM CODE (flow kept for compatibility; no UI button anymore) ===
         case 'redeem_code': {
           const code = text.trim().toUpperCase();
           const user = await prisma.user.findUnique({ where: { telegramId } });
@@ -155,46 +181,39 @@ export function registerTextHandlers(bot: any): void {
           });
 
           if (!redeemCode) {
-            await ctx.reply(`${e('warning')} Invalid code. Please check and try again.`);
+            await editMainMessage(ctx, `${e('warning')} Invalid code. Please check and try again.`, backKeyboard('main'));
             return;
           }
 
           if (redeemCode.status !== 'ACTIVE') {
-            await ctx.reply(`${e('warning')} This code is no longer active.`);
+            await editMainMessage(ctx, `${e('warning')} This code is no longer active.`, backKeyboard('main'));
             return;
           }
 
           if (redeemCode.expiresAt && redeemCode.expiresAt < new Date()) {
-            await ctx.reply(`${e('warning')} This code has expired.`);
+            await editMainMessage(ctx, `${e('warning')} This code has expired.`, backKeyboard('main'));
             return;
           }
 
           if (redeemCode.redemptions.length >= redeemCode.maxRedemptions) {
-            await ctx.reply(`${e('warning')} This code has reached its maximum redemptions.`);
+            await editMainMessage(ctx, `${e('warning')} This code has reached its maximum redemptions.`, backKeyboard('main'));
             return;
           }
 
-          const alreadyRedeemed = redeemCode.redemptions.some(r => r.userId === user.id);
+          const alreadyRedeemed = redeemCode.redemptions.some((r) => r.userId === user.id);
           if (alreadyRedeemed) {
-            await ctx.reply(`${e('warning')} You already redeemed this code.`);
+            await editMainMessage(ctx, `${e('warning')} You already redeemed this code.`, backKeyboard('main'));
             return;
           }
 
-          // Process redemption
           await prisma.$transaction(async (tx) => {
             await tx.codeRedemption.create({
-              data: {
-                codeId: redeemCode.id,
-                userId: user.id,
-                amount: Number(redeemCode.rewardAmount),
-              },
+              data: { codeId: redeemCode.id, userId: user.id, amount: Number(redeemCode.rewardAmount) },
             });
-
             await tx.redeemCode.update({
               where: { id: redeemCode.id },
               data: { redemptionCount: { increment: 1 } },
             });
-
             await tx.balance.upsert({
               where: { userId_asset: { userId: user.id, asset: redeemCode.asset } },
               create: {
@@ -202,11 +221,8 @@ export function registerTextHandlers(bot: any): void {
                 asset: redeemCode.asset,
                 availableBalance: Number(redeemCode.rewardAmount),
               },
-              update: {
-                availableBalance: { increment: Number(redeemCode.rewardAmount) },
-              },
+              update: { availableBalance: { increment: Number(redeemCode.rewardAmount) } },
             });
-
             await tx.transaction.create({
               data: {
                 userId: user.id,
@@ -222,10 +238,10 @@ export function registerTextHandlers(bot: any): void {
           });
 
           await clearUserSession(telegramId);
-          await ctx.reply(
-            `${e('party')} <b>CODE REDEEMED!</b>\n\n` +
-            `You received <b>${redeemCode.rewardAmount} ${redeemCode.asset}</b>!`,
-            { parse_mode: 'HTML' }
+          await editMainMessage(
+            ctx,
+            `${e('party')} <b>CODE REDEEMED!</b>\n\nYou received <b>${redeemCode.rewardAmount} ${redeemCode.asset}</b>!`,
+            backKeyboard('main')
           );
           break;
         }
@@ -236,29 +252,27 @@ export function registerTextHandlers(bot: any): void {
           const { claimId, asset } = session as any;
 
           if (!isValidEVMAddress(address)) {
-            await ctx.reply(
-              `${e('warning')} Invalid address. Please send a valid BEP20 address.\n\n` +
-              `Example: <code>0x1234...abcd</code>`,
-              { parse_mode: 'HTML' }
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Invalid address. Please send a valid BEP20 address.\n\nExample: <code>0x1234...abcd</code>`,
+              backKeyboard('main')
             );
             return;
           }
 
           const normalized = normalizeAddress(address);
 
-          await ctx.reply(
+          await editMainMessage(
+            ctx,
             `${e('shield')} <b>Confirm Your Wallet Address</b>\n\n` +
             `<b>Network:</b> BNB Smart Chain\n` +
             `<b>Asset:</b> ${asset} BEP20\n` +
             `<b>Address:</b> <code>${normalized}</code>`,
-            {
-              parse_mode: 'HTML',
-              reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback(`${e('check')} Confirm Address`, `payout:confirm:${claimId}:${normalized}`)],
-                [Markup.button.callback(`${e('edit')} Change Address`, `payout:change:${claimId}`)],
-                [Markup.button.callback(`${e('cancel')} Cancel`, `payout:cancel:${claimId}`)],
-              ]).reply_markup,
-            }
+            Markup.inlineKeyboard([
+              [Markup.button.callback(`${e('check')} Confirm Address`, `payout:confirm:${claimId}:${normalized}`)],
+              [Markup.button.callback(`${e('edit')} Change Address`, `payout:change:${claimId}`)],
+              [Markup.button.callback(`${e('cancel')} Cancel`, `payout:cancel:${claimId}`)],
+            ])
           );
 
           await setUserSession(telegramId, {
@@ -270,12 +284,50 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
+        // === ADMIN BROADCAST ===
+        case 'admin_broadcast': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
+          }
+
+          const users = await prisma.user.findMany({
+            where: { chatId: { not: null } },
+            select: { chatId: true },
+          });
+
+          let sent = 0;
+          let failed = 0;
+          for (const u of users) {
+            try {
+              await ctx.telegram.sendMessage(u.chatId!, text);
+              sent++;
+            } catch {
+              failed++;
+            }
+            // gentle rate limit — Telegram allows ~30 msg/s; stay well under
+            await new Promise((r) => setTimeout(r, 50));
+          }
+
+          await clearUserSession(telegramId);
+          await editMainMessage(
+            ctx,
+            `${e('check')} <b>BROADCAST COMPLETE</b>\n\nDelivered: ${sent}\nFailed/blocked: ${failed}`,
+            backKeyboard('admin')
+          );
+          break;
+        }
+
         default:
           await clearUserSession(telegramId);
       }
     } catch (err) {
       logger.error('Text handler error:', err);
-      await ctx.reply(`${e('warning')} An error occurred. Please try again.`);
+      await editMainMessage(
+        ctx,
+        `${e('warning')} An error occurred. Please try again.`,
+        backKeyboard('main')
+      );
       await clearUserSession(telegramId);
     }
   });
@@ -285,7 +337,7 @@ export function registerTextHandlers(bot: any): void {
     const hours = parseInt((ctx as any).match[1]);
     const from = ctx.from!;
     const session = await getUserSession(from.id.toString());
-    
+
     if (!session || session.state !== 'giveaway_multi_expiry') {
       await ctx.answerCbQuery('Session expired. Start over.');
       return;
@@ -306,7 +358,8 @@ export function registerTextHandlers(bot: any): void {
     const ngnValue = await pricing.convertToNGN(asset, amount);
     const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
 
-    await ctx.editMessageText(
+    await editMainMessage(
+      ctx,
       `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n\n` +
       `<b>Total Amount:</b> ${amount} ${asset}\n` +
       `<b>Total Claimers:</b> ${maxClaimers}\n` +
@@ -316,13 +369,10 @@ export function registerTextHandlers(bot: any): void {
       `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n` +
       `<b>Expiry:</b> ${hours === 0 ? 'No Expiry' : `${hours} Hours`}\n\n` +
       `Ready to create?`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: confirmCancelKeyboard(
-          `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
-          'giveaway'
-        ).reply_markup,
-      }
+      confirmCancelKeyboard(
+        `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
+        'giveaway'
+      )
     );
     await ctx.answerCbQuery();
   });
@@ -341,14 +391,12 @@ export function registerTextHandlers(bot: any): void {
     });
 
     if (!claim || claim.status !== 'RESERVED') {
-      await ctx.reply(`${e('warning')} Invalid or expired claim.`);
+      await editMainMessage(ctx, `${e('warning')} Invalid or expired claim.`, backKeyboard('main'));
       return;
     }
 
-    // Update claim
     await giveawayService.submitAddress(claimId, address);
 
-    // Queue payout
     const idempotencyKey = hashIdempotencyKey('payout', claimId, Date.now().toString());
     await queuePayout({
       claimId,
@@ -362,23 +410,24 @@ export function registerTextHandlers(bot: any): void {
 
     await clearUserSession(from.id.toString());
 
-    await ctx.editMessageText(
+    await editMainMessage(
+      ctx,
       `${e('check')} <b>REWARD QUEUED</b>\n\n` +
       `Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward has been queued for payout.\n\n` +
       `You will receive a notification once it's sent.`,
-      { parse_mode: 'HTML' }
+      backKeyboard('main')
     );
   });
 
   bot.action(/payout:change:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
-    
+
     const claim = await prisma.giveawayClaim.findUnique({
       where: { id: claimId },
       include: { giveaway: true },
     });
-    
+
     if (!claim) return;
 
     await setUserSession(from.id.toString(), {
@@ -387,9 +436,10 @@ export function registerTextHandlers(bot: any): void {
       asset: claim.giveaway.asset,
     });
 
-    await ctx.editMessageText(
-      `📥 Send your ${claim.giveaway.asset} BEP20 wallet address.\n\n` +
-      `⚠️ Must support BNB Smart Chain (BEP20)`
+    await editMainMessage(
+      ctx,
+      `📥 Send your ${claim.giveaway.asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
+      backKeyboard('main')
     );
     await ctx.answerCbQuery();
   });
@@ -397,7 +447,8 @@ export function registerTextHandlers(bot: any): void {
   bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
     const from = ctx.from!;
     await clearUserSession(from.id.toString());
-    await ctx.editMessageText(`${e('cancel')} Payout cancelled.`);
+    await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-}
+            }
+            
