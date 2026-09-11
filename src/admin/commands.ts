@@ -1,59 +1,49 @@
 import { Context, Markup } from 'telegraf';
 import { prisma } from '../database';
-import { config } from '../config';
 import { isAdmin } from '../bot/middleware/security';
 import { logger } from '../utils/logger';
 import { e } from '../utils/emoji';
-import { hashIdempotencyKey } from '../utils/encryption';
+import { editMainMessage } from '../bot/utils/editMainMessage';
+import { backKeyboard } from '../bot/keyboards/main';
+
+const adminPanelKeyboard = Markup.inlineKeyboard([
+  [
+    Markup.button.callback(`${e('people')} Users`, 'admin:users'),
+    Markup.button.callback(`${e('gift')} Giveaways`, 'admin:giveaways'),
+  ],
+  [
+    Markup.button.callback(`${e('chart')} Fees`, 'admin:fees'),
+    Markup.button.callback(`${e('people')} Broadcast`, 'admin:broadcast'),
+  ],
+  [
+    Markup.button.callback(`${e('diamond')} Create Code`, 'admin:code:create'),
+    Markup.button.callback(`${e('warning')} Emergency`, 'admin:emergency'),
+  ],
+  [Markup.button.callback(`${e('back')} Back`, 'main')],
+]);
 
 export function registerAdminCommands(bot: any): void {
-  
-  // Admin entry point
+  // /admin command — renders into the main message (edit-only policy)
   bot.command('admin', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
-    
-    const stats = await getAdminStats();
-    
-    await ctx.reply(
-      `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n\n` +
-      `<b>Users</b>\n` +
-      `Total: ${stats.totalUsers}\n` +
-      `New Today: ${stats.newUsersToday}\n` +
-      `Active Today: ${stats.activeUsersToday}\n\n` +
-      `<b>Finance</b>\n` +
-      `Total Deposits: ${stats.totalDeposits}\n` +
-      `Fees Collected: ${stats.totalFees}\n` +
-      `USDT Held: ${stats.totalUSDT}\n` +
-      `BNB Held: ${stats.totalBNB}\n\n` +
-      `<b>Giveaways</b>\n` +
-      `Total: ${stats.totalGiveaways}\n` +
-      `Active: ${stats.activeGiveaways}\n` +
-      `Pending Payouts: ${stats.pendingPayouts}`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: Markup.inlineKeyboard([
-          [
-            Markup.button.callback('👥 Users', 'admin:users'),
-            Markup.button.callback('🎁 Giveaways', 'admin:giveaways'),
-          ],
-          [
-            Markup.button.callback('💰 Fees', 'admin:fees'),
-            Markup.button.callback('⚙️ Config', 'admin:config'),
-          ],
-          [
-            Markup.button.callback('🎟 Create Code', 'admin:code:create'),
-            Markup.button.callback('🚨 Emergency', 'admin:emergency'),
-          ],
-        ]).reply_markup,
-      }
-    );
+    try { await ctx.deleteMessage(); } catch {}
+    await renderDashboard(ctx);
   });
 
-  // Admin callbacks
+  // Same dashboard behind the Admin button in the main menu
+  bot.action('admin', async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await renderDashboard(ctx);
+    await ctx.answerCbQuery();
+  });
+
   bot.action('admin:users', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    
+
     const users = await prisma.user.findMany({
       take: 20,
       orderBy: { joinDate: 'desc' },
@@ -61,18 +51,19 @@ export function registerAdminCommands(bot: any): void {
     });
 
     let text = `${e('people')} <b>RECENT USERS</b>\n\n`;
+    if (users.length === 0) text += 'No users yet.';
     for (const u of users) {
       const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
-      text += `@${u.username || 'N/A'} | ${u.telegramId} | $${bal.toFixed(2)}\n`;
+      text += `@${u.username || 'N/A'} | <code>${u.telegramId}</code> | $${bal.toFixed(2)}\n`;
     }
 
-    await ctx.editMessageText(text, { parse_mode: 'HTML' });
+    await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
   bot.action('admin:giveaways', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    
+
     const giveaways = await prisma.giveaway.findMany({
       take: 20,
       orderBy: { createdAt: 'desc' },
@@ -80,23 +71,24 @@ export function registerAdminCommands(bot: any): void {
     });
 
     let text = `${e('gift')} <b>RECENT GIVEAWAYS</b>\n\n`;
+    if (giveaways.length === 0) text += 'No giveaways yet.';
     for (const g of giveaways) {
       text += `${g.status} | ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} | @${g.creator.username || 'N/A'}\n`;
     }
 
-    await ctx.editMessageText(text, { parse_mode: 'HTML' });
+    await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
   bot.action('admin:fees', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    
+
     const fees = await prisma.platformFee.findMany({
       take: 20,
       orderBy: { createdAt: 'desc' },
     });
 
-    let text = `${e('money')} <b>PLATFORM FEES</b>\n\n`;
+    let text = `${e('chart')} <b>PLATFORM FEES</b>\n\n`;
     let total = 0;
     for (const f of fees) {
       total += Number(f.amount);
@@ -104,17 +96,20 @@ export function registerAdminCommands(bot: any): void {
     }
     text += `\n<b>Total Collected:</b> $${total.toFixed(2)}`;
 
-    await ctx.editMessageText(text, { parse_mode: 'HTML' });
+    await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
-  // Create redeem code
+  // Create redeem code — instructions shown in the main message
   bot.action('admin:code:create', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    await ctx.reply(
-      'Create redeem code:\nFormat: <code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n' +
-      'Example: <code>VEYLO2026|USDT|10|100|7</code>',
-      { parse_mode: 'HTML' }
+    await editMainMessage(
+      ctx,
+      `${e('diamond')} <b>CREATE REDEEM CODE</b>\n\n` +
+      `Send a message in this format:\n` +
+      `<code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
+      `Example: <code>VEYLO2026|USDT|10|100|7</code>`,
+      backKeyboard('admin')
     );
   });
 
@@ -122,20 +117,17 @@ export function registerAdminCommands(bot: any): void {
   bot.action('admin:emergency', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    
-    await ctx.editMessageText(
-      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n\n` +
-      `Use these carefully. All actions are logged.`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('⛔ Pause Deposits', 'admin:pause:deposits')],
-          [Markup.button.callback('⛔ Pause Giveaways', 'admin:pause:giveaways')],
-          [Markup.button.callback('⛔ Pause Payouts', 'admin:pause:payouts')],
-          [Markup.button.callback('🔒 Maintenance Mode', 'admin:maintenance')],
-          [Markup.button.callback('◀️ Back', 'admin:back')],
-        ]).reply_markup,
-      }
+
+    await editMainMessage(
+      ctx,
+      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n\nUse these carefully. All actions are logged.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⛔ Pause Deposits', 'admin:pause:deposits')],
+        [Markup.button.callback('⛔ Pause Giveaways', 'admin:pause:giveaways')],
+        [Markup.button.callback('⛔ Pause Payouts', 'admin:pause:payouts')],
+        [Markup.button.callback('🔒 Maintenance Mode', 'admin:maintenance')],
+        [Markup.button.callback(`${e('back')} Back`, 'admin')],
+      ])
     );
   });
 
@@ -144,7 +136,6 @@ export function registerAdminCommands(bot: any): void {
     const feature = (ctx as any).match[1];
     await ctx.answerCbQuery(`${feature} paused!`);
     logger.warn(`Admin ${ctx.from!.id} paused ${feature}`);
-    // In production, update SystemConfig table
   });
 
   bot.action('admin:maintenance', async (ctx: Context) => {
@@ -156,20 +147,21 @@ export function registerAdminCommands(bot: any): void {
   bot.action('admin:back', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    await bot.handle('admin')!(ctx);
+    await renderDashboard(ctx);
   });
 
   // Handle admin text commands for code creation
-  bot.hears(/^[A-Z0-9]+\|(?:BNB|USDT)\|[\d.]+|\d+(?:\|\d+)?$/, async (ctx: Context) => {
+  bot.hears(/^[A-Z0-9]+\|(BNB|USDT)\|[\d.]+(\|\d+)?(\|\d+)?$/i, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
-    
+    try { await ctx.deleteMessage(); } catch {}
+
     const text = (ctx.message as any).text as string;
     const [code, asset, amountStr, maxRedemptions = '1', expiryDays = '30'] = text.split('|');
-    
+
     await prisma.redeemCode.create({
       data: {
         code: code.toUpperCase(),
-        asset,
+        asset: asset.toUpperCase(),
         rewardAmount: parseFloat(amountStr),
         maxRedemptions: parseInt(maxRedemptions),
         expiresAt: new Date(Date.now() + parseInt(expiryDays) * 86400000),
@@ -177,8 +169,37 @@ export function registerAdminCommands(bot: any): void {
       },
     });
 
-    await ctx.reply(`${e('check')} Code <code>${code}</code> created!`, { parse_mode: 'HTML' });
+    logger.info(`Redeem code ${code} created by admin ${ctx.from!.id}`);
+
+    await editMainMessage(
+      ctx,
+      `${e('check')} <b>CODE CREATED</b>\n\n<code>${code.toUpperCase()}</code>\n${amountStr} ${asset.toUpperCase()} | ${maxRedemptions} redemptions | expires in ${expiryDays} days`,
+      backKeyboard('admin')
+    );
   });
+}
+
+async function renderDashboard(ctx: Context): Promise<void> {
+  const stats = await getAdminStats();
+
+  await editMainMessage(
+    ctx,
+    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n\n` +
+    `<b>Users</b>\n` +
+    `Total: ${stats.totalUsers}\n` +
+    `New Today: ${stats.newUsersToday}\n` +
+    `Active Today: ${stats.activeUsersToday}\n\n` +
+    `<b>Finance</b>\n` +
+    `Total Deposits: ${stats.totalDeposits}\n` +
+    `Fees Collected: ${stats.totalFees}\n` +
+    `USDT Held: ${stats.totalUSDT}\n` +
+    `BNB Held: ${stats.totalBNB}\n\n` +
+    `<b>Giveaways</b>\n` +
+    `Total: ${stats.totalGiveaways}\n` +
+    `Active: ${stats.activeGiveaways}\n` +
+    `Pending Payouts: ${stats.pendingPayouts}`,
+    adminPanelKeyboard
+  );
 }
 
 async function getAdminStats() {
@@ -221,4 +242,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-}
+                           }
+                  
