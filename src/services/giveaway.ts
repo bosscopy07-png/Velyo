@@ -14,12 +14,25 @@ class GiveawayService {
     expiresAt?: Date;
   }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number }> {
     const amountPerUser = data.totalAmount / data.maxClaimers;
-    
-    // Lock funds first
+
+    // Pre-check with a CLEAR error: shows exact asset, have vs need.
+    // (lockFunds alone throws a generic "Insufficient balance".)
+    const balance = await prisma.balance.findUnique({
+      where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
+    });
+    const available = Number(balance?.availableBalance ?? 0);
+    if (available < data.totalAmount) {
+      throw new Error(
+        `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
+        `need ${data.totalAmount} ${data.asset}. Deposit more ${data.asset} first.`
+      );
+    }
+
+    // Lock funds (available → locked)
     await walletService.lockFunds(data.creatorId, data.asset, data.totalAmount);
-    
+
     const secureCode = generateSecureCode(20);
-    
+
     const giveaway = await prisma.giveaway.create({
       data: {
         creatorId: data.creatorId,
@@ -49,24 +62,23 @@ class GiveawayService {
       },
     });
 
-    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId}`);
+    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
   }
 
   async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     const lockKey = `giveaway:claim:${giveawayId}`;
     const lockToken = await acquireLock(lockKey, 5000);
-    
+
     if (!lockToken) {
       return { success: false, reason: 'System busy, please try again' };
     }
 
     try {
-      // Check if user already claimed
       const existingClaim = await prisma.giveawayClaim.findUnique({
         where: { giveawayId_userId: { giveawayId, userId } },
       });
-      
+
       if (existingClaim) {
         return { success: false, reason: 'You already claimed this giveaway' };
       }
@@ -87,15 +99,15 @@ class GiveawayService {
 
       // Atomic increment using raw query for true concurrency safety
       const result = await prisma.$queryRaw<{ claimed_count: number }[]>`
-        UPDATE giveaways 
-        SET claimed_count = claimed_count + 1, 
-            status = CASE 
-              WHEN claimed_count + 1 >= max_claimers THEN 'FULL'::"GiveawayStatus" 
-              ELSE status 
+        UPDATE giveaways
+        SET claimed_count = claimed_count + 1,
+            status = CASE
+              WHEN claimed_count + 1 >= max_claimers THEN 'FULL'::"GiveawayStatus"
+              ELSE status
             END,
             updated_at = NOW()
-        WHERE id = ${giveawayId} 
-          AND claimed_count < max_claimers 
+        WHERE id = ${giveawayId}
+          AND claimed_count < max_claimers
           AND status = 'ACTIVE'
         RETURNING claimed_count
       `;
@@ -141,12 +153,12 @@ class GiveawayService {
     if (!giveaway) return { success: false, reason: 'Giveaway not found' };
     if (giveaway.creatorId !== userId) return { success: false, reason: 'Not authorized' };
     if (giveaway.status === 'CANCELLED') return { success: false, reason: 'Already cancelled' };
-    if (giveaway.claims.some(c => c.status === 'PAID')) {
+    if (giveaway.claims.some((c) => c.status === 'PAID')) {
       return { success: false, reason: 'Cannot cancel: payouts already sent' };
     }
 
-    const unclaimedAmount = Number(giveaway.totalAmount) - 
-      (giveaway.claims.filter(c => c.status === 'PAID').length * Number(giveaway.amountPerUser));
+    const unclaimedAmount = Number(giveaway.totalAmount) -
+      (giveaway.claims.filter((c) => c.status === 'PAID').length * Number(giveaway.amountPerUser));
 
     await prisma.$transaction(async (tx) => {
       await tx.giveaway.update({
@@ -168,7 +180,6 @@ class GiveawayService {
       }
     });
 
-    // Record refund transaction
     if (unclaimedAmount > 0) {
       const { hashIdempotencyKey } = await import('../utils/encryption');
       await prisma.transaction.create({
@@ -205,8 +216,8 @@ class GiveawayService {
 
     if (!giveaway) throw new Error('Giveaway not found');
 
-    const linkOpens = await trackGiveawayView(giveawayId).then(() => 
-      redis.get(`giveaway:views:${giveawayId}`).then(v => parseInt(v || '0'))
+    const linkOpens = await trackGiveawayView(giveawayId).then(() =>
+      redis.get(`giveaway:views:${giveawayId}`).then((v) => parseInt(v || '0'))
     );
 
     return {
@@ -215,7 +226,7 @@ class GiveawayService {
       linkOpens,
       claimAttempts: giveaway.attemptCount,
       spotsSecured: giveaway.claimedCount,
-      payoutsCompleted: giveaway.claims.filter(c => c.status === 'PAID').length,
+      payoutsCompleted: giveaway.claims.filter((c) => c.status === 'PAID').length,
       remainingSlots: giveaway.maxClaimers - giveaway.claimedCount,
     };
   }
@@ -229,3 +240,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
+                                                 
