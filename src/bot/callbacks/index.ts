@@ -3,90 +3,104 @@ import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
-import { pricing } from '../../services/pricing';
-import { setUserSession, getUserSession, clearUserSession } from '../../services/redis';
-import { blockchain } from '../../services/blockchain';
-import { config, ASSETS, GIVEAWAY_EXPIRY_OPTIONS } from '../../config';
+import { setUserSession } from '../../services/redis';
+import { config } from '../../config';
 import { e } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
-import { formatWalletMessage, formatDepositMessage, formatGiveawayCreatedMessage, formatAccountMessage } from '../messages';
-import { mainKeyboard, walletKeyboard, depositKeyboard, giveawayTypeKeyboard, backKeyboard, confirmCancelKeyboard, assetKeyboard } from '../keyboards/main';
-import { isValidEVMAddress, normalizeAddress, formatAddress, isValidAmount } from '../../utils/validation';
-import { queuePayout } from '../../queues';
-import { hashIdempotencyKey } from '../../utils/encryption';
-
-const VEYLO_IMAGE = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1788789976/file_00000000d1ec81f4adfb8b48d09eb39d_k1fwyl.png';
-
-// Helper to update main message
-async function updateMainMessage(ctx: Context, caption: string, keyboard?: any): Promise<void> {
-  const from = ctx.from;
-  if (!from) return;
-
-  const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
-  if (!user?.chatId || !user?.mainMessageId) {
-    await ctx.answerCbQuery();
-    return;
-  }
-
-  try {
-    await ctx.telegram.editMessageCaption(
-      parseInt(user.chatId),
-      parseInt(user.mainMessageId),
-      undefined,
-      caption,
-      { parse_mode: 'HTML', reply_markup: keyboard?.reply_markup }
-    );
-  } catch (err) {
-    // If edit fails, try editMessageMedia for image+text updates
-    try {
-      await ctx.telegram.editMessageMedia(
-        parseInt(user.chatId),
-        parseInt(user.mainMessageId),
-        undefined,
-        { type: 'photo', media: VEYLO_IMAGE, caption, parse_mode: 'HTML' },
-        { reply_markup: keyboard?.reply_markup }
-      );
-    } catch {
-      logger.error('Failed to update main message');
-    }
-  }
-  await ctx.answerCbQuery();
-}
+import { formatWalletMessage, formatDepositMessage, formatGiveawayCreatedMessage } from '../messages';
+import {
+  mainKeyboard,
+  walletKeyboard,
+  depositKeyboard,
+  giveawayTypeKeyboard,
+  backKeyboard,
+  confirmCancelKeyboard,
+  assetKeyboard,
+  adminKeyboard,
+} from '../keyboards/main';
+import { formatAddress } from '../../utils/validation';
+import { editMainMessage } from '../utils/editMainMessage';
 
 export function registerCallbacks(bot: any): void {
-  
+  const isAdmin = (ctx: Context): boolean =>
+    !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
+
   // === MAIN NAVIGATION ===
   bot.action('main', async (ctx: Context) => {
     const from = ctx.from!;
-    const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('lightning')} <b>Welcome to VEYLO</b>\n\n` +
       `Your crypto wallet built for speed.\n\n` +
       `Manage your assets, receive payments, create giveaways, and earn with simple Telegram tools.\n\n` +
       `Fast. Simple. Secure.`,
-      mainKeyboard
+      mainKeyboard(isAdmin(ctx))
     );
+    await ctx.answerCbQuery();
+  });
+
+  // === ADMIN PANEL ===
+  bot.action('admin', async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await editMainMessage(ctx, await buildAdminStats(), adminKeyboard);
+    await ctx.answerCbQuery();
+  });
+
+  bot.action('admin:stats', async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await editMainMessage(ctx, await buildAdminStats(), adminKeyboard);
+    await ctx.answerCbQuery('Stats refreshed');
+  });
+
+  bot.action('admin:broadcast', async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await setUserSession(ctx.from!.id.toString(), { state: 'admin_broadcast' });
+    await editMainMessage(
+      ctx,
+      `${e('people')} <b>BROADCAST</b>\n\nSend the message you want to broadcast to all users.\n\nIt will be delivered to every user the bot can reach.`,
+      backKeyboard('admin')
+    );
+    await ctx.answerCbQuery();
   });
 
   // === WALLET ===
   bot.action('wallet', async (ctx: Context) => {
     const from = ctx.from!;
-    const user = await prisma.user.findUnique({
+    let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
       include: { balances: true, wallet: true },
     });
 
     if (!user) return;
 
-    const balances = user.balances.map(b => ({
+    // Ensure wallet exists (same guarantee as /start)
+    if (!user.wallet) {
+      await walletService.createWallet(user.id);
+      user = await prisma.user.findUnique({
+        where: { telegramId: from.id.toString() },
+        include: { balances: true, wallet: true },
+      });
+      if (!user) return;
+    }
+
+    const balances = user.balances.map((b) => ({
       asset: b.asset,
       available: Number(b.availableBalance),
       locked: Number(b.lockedBalance),
     }));
 
     const caption = await formatWalletMessage(balances);
-    await updateMainMessage(ctx, caption, walletKeyboard);
+    await editMainMessage(ctx, caption, walletKeyboard);
+    await ctx.answerCbQuery();
   });
 
   bot.action('wallet:refresh', async (ctx: Context) => {
@@ -96,28 +110,39 @@ export function registerCallbacks(bot: any): void {
 
   // === DEPOSIT ===
   bot.action('wallet:deposit', async (ctx: Context) => {
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('deposit')} <b>SELECT ASSET TO DEPOSIT</b>\n\nChoose which asset you want to deposit.`,
       assetKeyboard('deposit')
     );
+    await ctx.answerCbQuery();
   });
 
   bot.action(/deposit:(BNB|USDT)/, async (ctx: Context) => {
     const asset = (ctx as any).match[1] as string;
     const from = ctx.from!;
-    const user = await prisma.user.findUnique({
+    let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
       include: { wallet: true },
     });
 
-    if (!user?.wallet) return;
+    if (!user) return;
 
-    await updateMainMessage(
+    if (!user.wallet) {
+      await walletService.createWallet(user.id);
+      user = await prisma.user.findUnique({
+        where: { telegramId: from.id.toString() },
+        include: { wallet: true },
+      });
+      if (!user?.wallet) return;
+    }
+
+    await editMainMessage(
       ctx,
       formatDepositMessage(asset, user.wallet.address),
       depositKeyboard(asset)
     );
+    await ctx.answerCbQuery();
   });
 
   bot.action(/wallet:copy:(BNB|USDT)/, async (ctx: Context) => {
@@ -128,37 +153,37 @@ export function registerCallbacks(bot: any): void {
     });
     if (user?.wallet) {
       await ctx.answerCbQuery('Address copied! Paste it in your wallet app.', { show_alert: true });
+    } else {
+      await ctx.answerCbQuery('No wallet found. Send /start first.', { show_alert: true });
     }
   });
 
   bot.action(/wallet:check:(BNB|USDT)/, async (ctx: Context) => {
     await ctx.answerCbQuery('Checking deposits... This may take a moment.');
-    // Deposit monitor runs automatically; just refresh balance
     await bot.handle('wallet')!(ctx);
-  });
-
-  // === SEND (Basic placeholder for future expansion) ===
-  bot.action('wallet:send', async (ctx: Context) => {
-    await ctx.answerCbQuery('Send feature coming soon! Use giveaways for now.', { show_alert: true });
   });
 
   bot.action('wallet:history', async (ctx: Context) => {
     const from = ctx.from!;
+    const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
+    if (!user) return;
+
     const txs = await prisma.transaction.findMany({
-      where: { userId: (await prisma.user.findUnique({ where: { telegramId: from.id.toString() } }))!.id },
+      where: { userId: user.id },
       orderBy: { createdAt: 'desc' },
       take: 10,
     });
 
     let text = `${e('document')} <b>RECENT ACTIVITY</b>\n\n`;
     if (txs.length === 0) text += 'No transactions yet.';
-    
+
     for (const tx of txs) {
       const sign = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND'].includes(tx.type) ? '+' : '-';
       text += `${sign}${tx.amount} ${tx.asset} — ${tx.status}\n`;
     }
 
-    await updateMainMessage(ctx, text, backKeyboard('wallet'));
+    await editMainMessage(ctx, text, backKeyboard('wallet'));
+    await ctx.answerCbQuery();
   });
 
   // === GIVEAWAY ===
@@ -167,18 +192,18 @@ export function registerCallbacks(bot: any): void {
       await ctx.answerCbQuery('Giveaways are temporarily disabled.', { show_alert: true });
       return;
     }
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('gift')} <b>CREATE GIVEAWAY</b>\n\nChoose your giveaway type.`,
       giveawayTypeKeyboard
     );
+    await ctx.answerCbQuery();
   });
 
-  // Single Claim
   bot.action('giveaway:single', async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_single_amount' });
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('gift')} <b>SINGLE CLAIM GIVEAWAY</b>\n\n` +
       `Enter the total amount to give away.\n\n` +
@@ -186,22 +211,22 @@ export function registerCallbacks(bot: any): void {
       `One lucky user will receive the full amount.`,
       backKeyboard('giveaway')
     );
+    await ctx.answerCbQuery();
   });
 
-  // Multiple Claim
   bot.action('giveaway:multiple', async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_multi_amount' });
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('gift')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
       `Enter the total amount to distribute.\n\n` +
       `Example: <code>10 USDT</code>`,
       backKeyboard('giveaway')
     );
+    await ctx.answerCbQuery();
   });
 
-  // My Giveaways
   bot.action('giveaway:mine', async (ctx: Context) => {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
@@ -222,10 +247,10 @@ export function registerCallbacks(bot: any): void {
       text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
     }
 
-    await updateMainMessage(ctx, text, backKeyboard('giveaway'));
+    await editMainMessage(ctx, text, backKeyboard('giveaway'));
+    await ctx.answerCbQuery();
   });
 
-  // Cancel Giveaway
   bot.action(/giveaway:cancel:(.+)/, async (ctx: Context) => {
     const giveawayId = (ctx as any).match[1];
     const from = ctx.from!;
@@ -233,15 +258,17 @@ export function registerCallbacks(bot: any): void {
     if (!user) return;
 
     const result = await giveawayService.cancelGiveaway(giveawayId, user.id);
-    await ctx.answerCbQuery(result.success ? 'Giveaway cancelled. Funds returned.' : result.reason, { show_alert: !result.success });
+    await ctx.answerCbQuery(
+      result.success ? 'Giveaway cancelled. Funds returned.' : result.reason,
+      { show_alert: !result.success }
+    );
     if (result.success) await bot.handle('giveaway:mine')!(ctx);
   });
 
-  // Giveaway Stats
   bot.action(/giveaway:stats:(.+)/, async (ctx: Context) => {
     const giveawayId = (ctx as any).match[1];
     const stats = await giveawayService.getGiveawayStats(giveawayId);
-    
+
     const text = [
       `${e('chart')} <b>GIVEAWAY STATISTICS</b>`,
       '',
@@ -254,18 +281,8 @@ export function registerCallbacks(bot: any): void {
       `<b>Remaining Slots:</b> ${stats.remainingSlots}`,
     ].join('\n');
 
-    await updateMainMessage(ctx, text, backKeyboard('giveaway:mine'));
-  });
-
-  // === REDEEM CODE ===
-  bot.action('redeem', async (ctx: Context) => {
-    const from = ctx.from!;
-    await setUserSession(from.id.toString(), { state: 'redeem_code' });
-    await updateMainMessage(
-      ctx,
-      `${e('diamond')} <b>REDEEM CODE</b>\n\nEnter your redeem code.\n\nExample: <code>VEYLO2026</code>`,
-      backKeyboard('main')
-    );
+    await editMainMessage(ctx, text, backKeyboard('giveaway:mine'));
+    await ctx.answerCbQuery();
   });
 
   // === HISTORY ===
@@ -290,9 +307,9 @@ export function registerCallbacks(bot: any): void {
       _count: { id: true },
     });
 
-    const totalDeposited = stats.find(s => s.type === 'DEPOSIT')?._sum.amount || 0;
-    const totalGiveaways = stats.find(s => s.type === 'GIVEAWAY_CREATED')?._sum.amount || 0;
-    const totalRewards = stats.find(s => s.type === 'GIVEAWAY_REWARD')?._sum.amount || 0;
+    const totalDeposited = stats.find((s) => s.type === 'DEPOSIT')?._sum.amount || 0;
+    const totalGiveaways = stats.find((s) => s.type === 'GIVEAWAY_CREATED')?._sum.amount || 0;
+    const totalRewards = stats.find((s) => s.type === 'GIVEAWAY_REWARD')?._sum.amount || 0;
 
     const caption = [
       `${e('person')} <b>MY ACCOUNT</b>`,
@@ -311,30 +328,18 @@ export function registerCallbacks(bot: any): void {
 
     const keyboard = Markup.inlineKeyboard([
       [
-        Markup.button.callback(`${e('shield')} Security`, 'account:security'),
         Markup.button.callback(`${e('document')} History`, 'wallet:history'),
       ],
       [Markup.button.callback(`${e('back')} Back`, 'main')],
     ]);
 
-    await updateMainMessage(ctx, caption, keyboard);
-  });
-
-  bot.action('account:security', async (ctx: Context) => {
-    await updateMainMessage(
-      ctx,
-      `${e('shield')} <b>SECURITY</b>\n\n` +
-      `🔒 Your private keys are encrypted at rest.\n` +
-      `🛡 Two-factor authentication coming soon.\n` +
-      `🔑 PIN protection coming soon.\n\n` +
-      `Your funds are secured with industry-standard encryption.`,
-      backKeyboard('account')
-    );
+    await editMainMessage(ctx, caption, keyboard);
+    await ctx.answerCbQuery();
   });
 
   // === HELP ===
   bot.action('help', async (ctx: Context) => {
-    await updateMainMessage(
+    await editMainMessage(
       ctx,
       `${e('help')} <b>HELP CENTER</b>\n\n` +
       `<b>Getting Started</b>\n` +
@@ -353,14 +358,15 @@ export function registerCallbacks(bot: any): void {
       `For assistance, contact @VeyloSupport`,
       backKeyboard('main')
     );
+    await ctx.answerCbQuery();
   });
 
-  // === CONFIRM/CREATE GIVEAWAY CALLBACKS ===
+  // === CONFIRM/CREATE GIVEAWAY ===
   bot.action(/giveaway:confirm:(.+)/, async (ctx: Context) => {
     const sessionData = (ctx as any).match[1];
     const [type, asset, amountStr, claimersStr, expiryHours] = sessionData.split('|');
     const from = ctx.from!;
-    
+
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
     if (!user) return;
 
@@ -378,7 +384,7 @@ export function registerCallbacks(bot: any): void {
 
       const amountPerUser = amount / maxClaimers;
 
-      await updateMainMessage(
+      await editMainMessage(
         ctx,
         formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode),
         Markup.inlineKeyboard([
@@ -388,6 +394,7 @@ export function registerCallbacks(bot: any): void {
           [Markup.button.callback(`${e('back')} My Giveaways`, 'giveaway:mine')],
         ])
       );
+      await ctx.answerCbQuery('Giveaway created!');
     } catch (err) {
       logger.error('Giveaway creation error:', err);
       await ctx.answerCbQuery((err as Error).message, { show_alert: true });
@@ -399,5 +406,25 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   });
-  }
-      
+}
+
+async function buildAdminStats(): Promise<string> {
+  const [totalUsers, activeGiveaways, pendingPayouts, totalBalances] = await Promise.all([
+    prisma.user.count(),
+    prisma.giveaway.count({ where: { status: 'ACTIVE' } }),
+    prisma.giveawayClaim.count({
+      where: { status: { in: ['ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING'] } },
+    }),
+    prisma.balance.aggregate({ _sum: { availableBalance: true } }),
+  ]);
+
+  return [
+    `${e('shield')} <b>ADMIN PANEL</b>`,
+    '',
+    `<b>Total Users:</b> ${totalUsers}`,
+    `<b>Active Giveaways:</b> ${activeGiveaways}`,
+    `<b>Pending Payouts:</b> ${pendingPayouts}`,
+    `<b>Total User Balances:</b> ${totalBalances._sum.availableBalance ?? 0}`,
+  ].join('\n');
+             }
+             
