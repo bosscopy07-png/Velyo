@@ -16,7 +16,6 @@ import {
   backKeyboard,
   confirmCancelKeyboard,
   assetKeyboard,
-  adminKeyboard,
 } from '../keyboards/main';
 import { formatAddress } from '../../utils/validation';
 import { editMainMessage } from '../utils/editMainMessage';
@@ -39,25 +38,8 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   });
 
-  // === ADMIN PANEL ===
-  bot.action('admin', async (ctx: Context) => {
-    if (!isAdmin(ctx)) {
-      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
-      return;
-    }
-    await editMainMessage(ctx, await buildAdminStats(), adminKeyboard);
-    await ctx.answerCbQuery();
-  });
-
-  bot.action('admin:stats', async (ctx: Context) => {
-    if (!isAdmin(ctx)) {
-      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
-      return;
-    }
-    await editMainMessage(ctx, await buildAdminStats(), adminKeyboard);
-    await ctx.answerCbQuery('Stats refreshed');
-  });
-
+  // === ADMIN BROADCAST ===
+  // (The 'admin' dashboard action itself lives in src/admin/commands.ts)
   bot.action('admin:broadcast', async (ctx: Context) => {
     if (!isAdmin(ctx)) {
       await ctx.answerCbQuery('Not authorized.', { show_alert: true });
@@ -406,25 +388,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   });
-}
-
-async function buildAdminStats(): Promise<string> {
-  const [totalUsers, activeGiveaways, pendingPayouts, totalBalances] = await Promise.all([
-    prisma.user.count(),
-    prisma.giveaway.count({ where: { status: 'ACTIVE' } }),
-    prisma.giveawayClaim.count({
-      where: { status: { in: ['ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING'] } },
-    }),
-    prisma.balance.aggregate({ _sum: { availableBalance: true } }),
-  ]);
-
-  return [
-    `${e('shield')} <b>ADMIN PANEL</b>`,
-    '',
-    `<b>Total Users:</b> ${totalUsers}`,
-    `<b>Active Giveaways:</b> ${activeGiveaways}`,
-    `<b>Pending Payouts:</b> ${pendingPayouts}`,
-    `<b>Total User Balances:</b> ${totalBalances._sum.availableBalance ?? 0}`,
-  ].join('\n');
-             }
-             
+      }
+      
