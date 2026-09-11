@@ -26,7 +26,7 @@ export function registerCallbacks(bot: any): void {
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
 
   // Shared renderers
-  async function renderWallet(ctx: Context): Promise<void> {
+    async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
@@ -41,30 +41,36 @@ export function registerCallbacks(bot: any): void {
         where: { telegramId: from.id.toString() },
         include: { balances: true, wallet: true },
       });
-      if (!user) return;
     }
+
+    if (!user?.wallet) return;
+
+    // Capture into const — TS narrowing is lost across await reassignment
+    const walletAddress = user.wallet.address;
+    const dbBalances = user.balances;
 
     // LIVE on-chain balances; DB is only a fallback if the chain read fails
     const live: Record<string, number> = {};
     for (const asset of ['BNB', 'USDT'] as const) {
       try {
-        const raw = await blockchain.getBalance(user.wallet.address, asset);
+        const raw = await blockchain.getBalance(walletAddress, asset);
         live[asset] = Number(raw) / 1e18;
       } catch (err) {
         logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
-        live[asset] = Number(user.balances.find((b) => b.asset === asset)?.availableBalance ?? 0);
+        live[asset] = Number(dbBalances.find((b) => b.asset === asset)?.availableBalance ?? 0);
       }
     }
 
     const balances = (['BNB', 'USDT'] as const).map((asset) => ({
       asset,
       available: live[asset],
-      locked: Number(user!.balances.find((b) => b.asset === asset)?.lockedBalance ?? 0),
+      locked: Number(dbBalances.find((b) => b.asset === asset)?.lockedBalance ?? 0),
     }));
 
     const caption = await formatWalletMessage(balances);
     await editMainMessage(ctx, caption, walletKeyboard);
-  }
+    }
+  
 
   async function renderHistory(ctx: Context): Promise<void> {
     const from = ctx.from!;
