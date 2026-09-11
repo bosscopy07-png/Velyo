@@ -26,7 +26,7 @@ export function registerCallbacks(bot: any): void {
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
 
   // Shared renderers
-    async function renderWallet(ctx: Context): Promise<void> {
+  async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
@@ -69,8 +69,7 @@ export function registerCallbacks(bot: any): void {
 
     const caption = await formatWalletMessage(balances);
     await editMainMessage(ctx, caption, walletKeyboard);
-    }
-  
+  }
 
   async function renderHistory(ctx: Context): Promise<void> {
     const from = ctx.from!;
@@ -219,28 +218,61 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   }));
 
+  // Step 1: pick asset for single-claim
   bot.action('giveaway:single', guard(async (ctx: Context) => {
     const from = ctx.from!;
-    await setUserSession(from.id.toString(), { state: 'giveaway_single_amount' });
+    await setUserSession(from.id.toString(), { state: 'giveaway_single_asset' });
     await editMainMessage(
       ctx,
       `${e('gift')} <b>SINGLE CLAIM GIVEAWAY</b>\n\n` +
+      `One lucky user will receive the full amount.\n\n` +
+      `First, select the asset:`,
+      assetKeyboard('gws', 'giveaway')
+    );
+    await ctx.answerCbQuery();
+  }));
+
+  // Step 1: pick asset for multi-claim
+  bot.action('giveaway:multiple', guard(async (ctx: Context) => {
+    const from = ctx.from!;
+    await setUserSession(from.id.toString(), { state: 'giveaway_multi_asset' });
+    await editMainMessage(
+      ctx,
+      `${e('gift')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
+      `The total amount is split between all claimers.\n\n` +
+      `First, select the asset:`,
+      assetKeyboard('gwm', 'giveaway')
+    );
+    await ctx.answerCbQuery();
+  }));
+
+  // Step 2a: asset chosen for single → ask amount
+  bot.action(/gws:(BNB|USDT)/, guard(async (ctx: Context) => {
+    const asset = (ctx as any).match[1] as string;
+    const from = ctx.from!;
+    await setUserSession(from.id.toString(), { state: 'giveaway_single_amount', asset });
+    await editMainMessage(
+      ctx,
+      `${e('gift')} <b>SINGLE CLAIM GIVEAWAY</b>\n\n` +
+      `Asset: <b>${asset}</b>\n\n` +
       `Enter the total amount to give away.\n\n` +
-      `Example: <code>10 USDT</code>\n\n` +
-      `One lucky user will receive the full amount.`,
+      `Example: <code>10</code>`,
       backKeyboard('giveaway')
     );
     await ctx.answerCbQuery();
   }));
 
-  bot.action('giveaway:multiple', guard(async (ctx: Context) => {
+  // Step 2b: asset chosen for multi → ask amount
+  bot.action(/gwm:(BNB|USDT)/, guard(async (ctx: Context) => {
+    const asset = (ctx as any).match[1] as string;
     const from = ctx.from!;
-    await setUserSession(from.id.toString(), { state: 'giveaway_multi_amount' });
+    await setUserSession(from.id.toString(), { state: 'giveaway_multi_amount', asset });
     await editMainMessage(
       ctx,
       `${e('gift')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
+      `Asset: <b>${asset}</b>\n\n` +
       `Enter the total amount to distribute.\n\n` +
-      `Example: <code>10 USDT</code>`,
+      `Example: <code>10</code>`,
       backKeyboard('giveaway')
     );
     await ctx.answerCbQuery();
@@ -438,5 +470,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-  }
+      }
       
