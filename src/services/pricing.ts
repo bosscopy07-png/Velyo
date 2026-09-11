@@ -12,7 +12,6 @@ interface PriceCache {
 interface CoinGeckoSimplePriceResponse {
   [coinId: string]: {
     usd?: number;
-    // other vs_currencies would appear here if requested
   } | undefined;
 }
 
@@ -25,7 +24,7 @@ interface ExchangeRatesResponse {
 }
 
 class PricingService {
-  private readonly CACHE_TTL = 300; // 5 minutes
+  private readonly CACHE_TTL = 600; // 10 minutes — halves request volume vs 5
 
   async getPrice(asset: string): Promise<PriceCache> {
     const cacheKey = `price:${asset.toLowerCase()}`;
@@ -45,9 +44,9 @@ class PricingService {
     try {
       const coinId = this.getCoinGeckoId(asset);
 
-      // Fetch USD price from CoinGecko
+      // ONE request for both assets (BNB + USDT) — cuts CoinGecko calls in half
       const cgResponse = await fetch(
-        `${config.PRICE_API_URL}/simple/price?ids=${coinId}&vs_currencies=usd`
+        `${config.PRICE_API_URL}/simple/price?ids=binancecoin,tether&vs_currencies=usd`
       );
       if (!cgResponse.ok) {
         throw new Error(`CoinGecko request failed with ${cgResponse.status}`);
@@ -58,7 +57,6 @@ class PricingService {
         throw new Error(`No USD price returned for ${asset} (${coinId})`);
       }
 
-      // Fetch NGN rate
       const ngnResponse = await fetch(config.NGN_RATE_API_URL);
       if (!ngnResponse.ok) {
         throw new Error(`NGN rate request failed with ${ngnResponse.status}`);
@@ -124,4 +122,3 @@ class PricingService {
 }
 
 export const pricing = new PricingService();
-  
