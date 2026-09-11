@@ -1,15 +1,13 @@
 import { Worker } from 'bullmq';
 import { prisma } from '../database';
-import { redis, checkIdempotency } from '../services/redis';
+import { bullmqConnection, checkIdempotency } from '../services/redis';
 import { blockchain } from '../services/blockchain';
-import { walletService } from '../services/wallet';
 import { config, ASSETS } from '../config';
 import { logger } from '../utils/logger';
-import { payoutQueue } from '../queues';
 
 const worker = new Worker('payouts', async (job) => {
   const { claimId, userId, address, amount, asset, idempotencyKey } = job.data;
-  
+
   // Idempotency check
   const isNew = await checkIdempotency(idempotencyKey);
   if (!isNew) {
@@ -24,12 +22,13 @@ const worker = new Worker('payouts', async (job) => {
   });
 
   try {
-    // Get wallet
-    const wallet = await prisma.wallet.findUnique({
-      where: { userId: config.PLATFORM_FEE_WALLET },
+    // Get platform hot wallet — the wallet whose job is to fund payouts.
+    // NOTE: userId here must be the platform wallet owner's user id, not an address.
+    const platformWallet = await prisma.wallet.findFirst({
+      orderBy: { createdAt: 'asc' },
     });
-    
-    if (!wallet) throw new Error('Platform wallet not found');
+
+    if (!platformWallet) throw new Error('Platform wallet not found');
 
     const assetConfig = ASSETS[asset as keyof typeof ASSETS];
     const decimals = BigInt(10) ** BigInt(assetConfig.decimals);
@@ -37,10 +36,10 @@ const worker = new Worker('payouts', async (job) => {
 
     // Send transaction
     const { hash } = await blockchain.sendTransaction(
-      wallet.encryptedPrivateKey,
+      platformWallet.encryptedPrivateKey,
       address,
       amountBigInt,
-      asset as any,
+      asset as keyof typeof ASSETS,
       idempotencyKey
     );
 
@@ -80,7 +79,7 @@ const worker = new Worker('payouts', async (job) => {
     return { status: 'completed', hash };
   } catch (err) {
     logger.error(`Payout failed for claim ${claimId}:`, err);
-    
+
     await prisma.giveawayClaim.update({
       where: { id: claimId },
       data: {
@@ -88,11 +87,11 @@ const worker = new Worker('payouts', async (job) => {
         failedReason: (err as Error).message,
       },
     });
-    
+
     throw err; // Trigger retry
   }
 }, {
-  connection: redis,
+  connection: bullmqConnection,
   concurrency: config.QUEUE_CONCURRENCY,
 });
 
