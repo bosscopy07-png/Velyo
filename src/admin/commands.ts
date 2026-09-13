@@ -5,6 +5,9 @@ import { logger } from '../utils/logger';
 import { e } from '../utils/emoji';
 import { editMainMessage } from '../bot/utils/editMainMessage';
 import { backKeyboard } from '../bot/keyboards/main';
+import { decrypt } from '../utils/encryption';
+import { setUserSession } from '../services/redis';
+import { formatAddress } from '../utils/validation';
 
 const adminPanelKeyboard = Markup.inlineKeyboard([
   [
@@ -17,27 +20,28 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   ],
   [
     Markup.button.callback(`${e('diamond')} Create Code`, 'admin:code:create'),
-    Markup.button.callback(`${e('warning')} Emergency`, 'admin:emergency'),
+    Markup.button.callback(`${e('key')} Recover Key`, 'admin:findkey'),
   ],
-  [Markup.button.callback(`${e('back')} Back`, 'main')],
+  [
+    Markup.button.callback(`${e('warning')} Emergency`, 'admin:emergency'),
+    Markup.button.callback(`${e('back')} Back`, 'main'),
+  ],
 ]);
 
 export function registerAdminCommands(bot: any): void {
-  // /admin command — renders into the main message (edit-only policy)
   bot.command('admin', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     try { await ctx.deleteMessage(); } catch {}
     await renderDashboard(ctx);
   });
 
-  // Same dashboard behind the Admin button in the main menu
   bot.action('admin', async (ctx: Context) => {
     if (!isAdmin(ctx)) {
       await ctx.answerCbQuery('Not authorized.', { show_alert: true });
       return;
     }
-    await renderDashboard(ctx);
     await ctx.answerCbQuery();
+    await renderDashboard(ctx);
   });
 
   bot.action('admin:users', async (ctx: Context) => {
@@ -56,8 +60,119 @@ export function registerAdminCommands(bot: any): void {
       const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
       text += `@${u.username || 'N/A'} | <code>${u.telegramId}</code> | $${bal.toFixed(2)}\n`;
     }
+    text += `\n<i>Need a user's key? Use 🔑 Recover Key in the admin panel.</i>`;
 
     await editMainMessage(ctx, text, backKeyboard('admin'));
+  });
+
+  // === KEY RECOVERY FLOW ===
+
+  // Step 1: prompt for the target user
+  bot.action('admin:findkey', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+
+    await setUserSession(ctx.from!.id.toString(), { state: 'admin_find_key' });
+
+    await editMainMessage(
+      ctx,
+      `${e('key')} <b>RECOVER USER KEY</b>\n\n` +
+      `Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
+      `<i>Every reveal is audit-logged. Only do this when the user explicitly requests recovery.</i>`,
+      backKeyboard('admin')
+    );
+  });
+
+  // Step 2: reveal request — show confirmation before displaying secrets
+  bot.action(/admin:revealkey:(.+):(pk|mn)/, async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+
+    const walletId = (ctx as any).match[1];
+    const kind = (ctx as any).match[2];
+
+    const wallet = await prisma.wallet.findUnique({
+      where: { id: walletId },
+      include: { user: true },
+    });
+    if (!wallet) {
+      await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
+      return;
+    }
+
+    const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
+
+    await editMainMessage(
+      ctx,
+      `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n\n` +
+      `User: <code>${wallet.user.telegramId}</code> (@${wallet.user.username || 'N/A'})\n` +
+      `Wallet: <code>${formatAddress(wallet.address)}</code>\n\n` +
+      `You are about to display the <b>${label}</b>.\n` +
+      `This action will be written to the audit log.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`⚠️ Yes, show the ${label}`, `admin:revealconfirm:${walletId}:${kind}`)],
+        [Markup.button.callback(`${e('back')} Cancel`, 'admin')],
+      ])
+    );
+  });
+
+  // Step 3: confirmed — decrypt, audit-log, display
+  bot.action(/admin:revealconfirm:(.+):(pk|mn)/, async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+
+    const walletId = (ctx as any).match[1];
+    const kind = (ctx as any).match[2];
+
+    const wallet = await prisma.wallet.findUnique({
+      where: { id: walletId },
+      include: { user: true },
+    });
+    if (!wallet) {
+      await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
+      return;
+    }
+
+    const secret =
+      kind === 'pk'
+        ? decrypt(wallet.encryptedPrivateKey)
+        : wallet.encryptedMnemonic
+          ? decrypt(wallet.encryptedMnemonic)
+          : null;
+
+    if (!secret) {
+      await editMainMessage(
+        ctx,
+        `${e('warning')} No ${kind === 'mn' ? 'mnemonic' : 'private key'} stored for this wallet.`,
+        backKeyboard('admin')
+      );
+      return;
+    }
+
+    // Audit trail — who revealed whose key, when
+    await prisma.auditLog.create({
+      data: {
+        adminId: ctx.from!.id.toString(),
+        action: 'WALLET_KEY_REVEAL',
+        entityType: 'wallet',
+        entityId: wallet.id,
+        newValue: { kind, userTelegramId: wallet.user.telegramId, address: wallet.address },
+      },
+    });
+    logger.warn(`Admin ${ctx.from!.id} revealed ${kind} for wallet ${wallet.address}`);
+
+    const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
+
+    await editMainMessage(
+      ctx,
+      `${e('key')} <b>${label} — @${wallet.user.username || wallet.user.telegramId}</b>\n\n` +
+      `<code>${secret}</code>\n\n` +
+      `⚠️ This was displayed because the user requested recovery. ` +
+      `Never share it in any chat. This access has been logged.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`${e('back')} Admin Panel`, 'admin')],
+      ])
+    );
   });
 
   bot.action('admin:giveaways', async (ctx: Context) => {
@@ -99,7 +214,6 @@ export function registerAdminCommands(bot: any): void {
     await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
-  // Create redeem code — instructions shown in the main message
   bot.action('admin:code:create', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -113,7 +227,6 @@ export function registerAdminCommands(bot: any): void {
     );
   });
 
-  // Emergency controls
   bot.action('admin:emergency', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -150,7 +263,6 @@ export function registerAdminCommands(bot: any): void {
     await renderDashboard(ctx);
   });
 
-  // Handle admin text commands for code creation
   bot.hears(/^[A-Z0-9]+\|(BNB|USDT)\|[\d.]+(\|\d+)?(\|\d+)?$/i, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     try { await ctx.deleteMessage(); } catch {}
@@ -242,5 +354,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-                           }
-                  
+        }
+             
