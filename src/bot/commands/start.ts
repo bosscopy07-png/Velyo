@@ -7,7 +7,6 @@ import { formatWelcomeMessage } from '../messages';
 import { editMainMessage, VEYLO_IMAGE } from '../utils/editMainMessage';
 import { logger } from '../../utils/logger';
 import { giveawayService } from '../../services/giveaway';
-import { Markup } from 'telegraf';
 import { e } from '../../utils/emoji';
 import { config } from '../../config';
 
@@ -19,8 +18,10 @@ export async function handleStart(ctx: Context): Promise<void> {
   const startPayload = (ctx as any).startPayload as string | undefined;
   const isAdmin = config.ADMIN_TELEGRAM_IDS.includes(telegramId);
 
+  // Debug: proves what Telegram delivered (settles deep-link questions)
+  logger.info(`[start] payload="${startPayload ?? ''}" from ${telegramId}`);
+
   try {
-    // Find or create user
     let user = await prisma.user.findUnique({
       where: { telegramId },
       include: { wallet: true },
@@ -52,9 +53,7 @@ export async function handleStart(ctx: Context): Promise<void> {
       });
     }
 
-    // FIX: always guarantee a wallet exists for this user.
-    // Previously, an existing user without a wallet stayed wallet-less forever,
-    // which is what made the bot appear to "create a new wallet" / lose the old one.
+    // Always guarantee a wallet exists for this user
     if (!user.wallet) {
       await walletService.createWallet(user.id);
       logger.info(`Wallet provisioned for existing user ${telegramId}`);
@@ -64,7 +63,6 @@ export async function handleStart(ctx: Context): Promise<void> {
       });
     }
 
-    // Handle deep links
     if (startPayload?.startsWith('giveaway_')) {
       const code = startPayload.replace('giveaway_', '');
       await handleGiveawayDeepLink(ctx, user!.id, code);
@@ -77,30 +75,20 @@ export async function handleStart(ctx: Context): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
 
-    // Try to edit the existing main message; if impossible the helper
-    // deletes it and sends a fresh one (edit-only policy).
     if (user!.mainMessageId) {
       try {
         await ctx.telegram.editMessageMedia(
           chatId,
           parseInt(user!.mainMessageId),
           undefined,
-          {
-            type: 'photo',
-            media: VEYLO_IMAGE,
-            caption,
-            parse_mode: 'HTML',
-          },
+          { type: 'photo', media: VEYLO_IMAGE, caption, parse_mode: 'HTML' },
           { reply_markup: mainKeyboard(isAdmin).reply_markup }
         );
         return;
       } catch {
-        // fall through: edit not possible → delete old, send new below
         try {
           await ctx.telegram.deleteMessage(chatId, parseInt(user!.mainMessageId));
-        } catch {
-          // already gone
-        }
+        } catch {}
       }
     }
 
@@ -120,7 +108,8 @@ export async function handleStart(ctx: Context): Promise<void> {
   }
 }
 
-async function handleGiveawayDeepLink(ctx: Context, userId: string, code: string): Promise<void> {
+/** Exported so the /claim command can reuse the exact same claim flow. */
+export async function handleGiveawayDeepLink(ctx: Context, userId: string, code: string): Promise<void> {
   try {
     const giveaway = await prisma.giveaway.findUnique({
       where: { secureCode: code },
@@ -158,7 +147,7 @@ async function handleGiveawayDeepLink(ctx: Context, userId: string, code: string
     if (giveaway.status === 'FULL') {
       await editMainMessage(
         ctx,
-        `${e('warning')} <b>GIVEAWAY FULL</b>\n\nAll available spots have already been claimed.\n\nBetter luck next time. ${e('lightning')}`,
+        `${e('warning')} <b>GIVEAWAY FULL</b>\n\nAll available spots have already been claimed.\n\nBetter luck next time.`,
         mainKeyboard(false)
       );
       return;
@@ -212,5 +201,4 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `📥 Send your ${asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
     { reply_markup: undefined }
   );
-                                         }
-      
+      }
