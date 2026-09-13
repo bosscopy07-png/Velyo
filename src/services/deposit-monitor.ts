@@ -13,7 +13,7 @@ class DepositMonitorService {
 
   start(): void {
     cron.schedule('*/30 * * * * *', () => void this.scanDeposits());
-    logger.info('Deposit monitor started (in-process crediting)');
+    logger.info('Deposit monitor started (in-process crediting + fee forwarding)');
   }
 
   private async scanDeposits(): Promise<void> {
@@ -79,11 +79,15 @@ class DepositMonitorService {
   }
 
   private async processDeposit(
-    wallet: { address: string; userId: string; user: { chatId: string | null; telegramId: string } },
+    wallet: {
+      address: string;
+      userId: string;
+      encryptedPrivateKey: string;
+      user: { chatId: string | null; telegramId: string };
+    },
     asset: string,
     event: { from: string; amount: bigint; txHash: string }
   ): Promise<void> {
-    // Idempotency guard (mirror of the old worker's transactionHash check)
     const existing = await prisma.transaction.findFirst({
       where: { transactionHash: event.txHash },
     });
@@ -94,26 +98,24 @@ class DepositMonitorService {
     });
     if (seen?.status === 'PROCESSED') return;
 
-    // Verify on-chain before crediting
     const receipt = await blockchain.getTransactionReceipt(event.txHash);
-    if (!receipt || receipt.status !== 1) return; // not confirmed yet — next scan will catch it
+    if (!receipt || receipt.status !== 1) return;
 
     const decimals = ASSET_DECIMALS[asset] ?? 18;
     const amount = Number(event.amount) / 10 ** decimals;
     if (amount <= 0) return;
 
-    // Same fee logic as the original deposit worker
     const feePercent = config.ENABLE_FEES ? config.PLATFORM_FEE_PERCENT : 0;
     const fee = amount * (feePercent / 100);
     const netAmount = amount - fee;
 
-    // Mark seen first so a crash mid-credit can never double-pay
     await prisma.depositMonitor.upsert({
       where: { txHash_address: { txHash: event.txHash, address: wallet.address } },
       create: { address: wallet.address, asset, txHash: event.txHash, amount, status: 'CONFIRMING' },
       update: {},
     });
 
+    let depositTxId = '';
     await prisma.$transaction(async (tx) => {
       await tx.balance.upsert({
         where: { userId_asset: { userId: wallet.userId, asset } },
@@ -136,6 +138,7 @@ class DepositMonitorService {
           idempotencyKey: hashIdempotencyKey('deposit', event.txHash),
         },
       });
+      depositTxId = depositTx.id;
 
       if (fee > 0) {
         await tx.platformFee.create({
@@ -154,7 +157,45 @@ class DepositMonitorService {
       data: { status: 'PROCESSED', processedAt: new Date() },
     });
 
-    logger.info(`Deposit credited in-process: ${netAmount} ${asset} (tx ${event.txHash})`);
+    logger.info(`Deposit credited: ${netAmount} ${asset} (tx ${event.txHash})`);
+
+    // Forward the fee ON-CHAIN to the admin fee wallet.
+    // Requires a little BNB in the user's custodial wallet for gas; if the
+    // transfer fails the fee stays recorded in platformFee for manual sweep.
+    if (fee > 0) {
+      try {
+        const rawFee = BigInt(Math.floor(fee * 1e18));
+        const { hash } = await blockchain.sendTransaction(
+          wallet.encryptedPrivateKey,
+          config.PLATFORM_FEE_WALLET,
+          rawFee,
+          asset as 'BNB' | 'USDT',
+          hashIdempotencyKey('fee-forward', event.txHash)
+        );
+
+        await prisma.transaction.create({
+          data: {
+            userId: wallet.userId,
+            type: 'PLATFORM_FEE',
+            asset,
+            amount: fee,
+            fee: 0,
+            netAmount: fee,
+            status: 'CONFIRMED',
+            transactionHash: hash,
+            toAddress: config.PLATFORM_FEE_WALLET,
+            metadata: { depositTxId, depositTxHash: event.txHash },
+            idempotencyKey: hashIdempotencyKey('fee-forward-tx', event.txHash),
+          },
+        });
+
+        logger.info(`Fee forwarded: ${fee} ${asset} → ${config.PLATFORM_FEE_WALLET} (tx ${hash})`);
+      } catch (err) {
+        logger.error(
+          `Fee forward failed for ${event.txHash} (fee ${fee} ${asset} recorded in platform_fees — sweep manually). Reason: ${(err as Error).message}`
+        );
+      }
+    }
 
     if (wallet.user.chatId) {
       await this.notify(
