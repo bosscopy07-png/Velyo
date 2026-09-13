@@ -5,7 +5,7 @@ export const EMOJIS = {
   // Core Brand
   lightning: '6132195567532512343',
   rocket: '6131845772511024828',
-  
+
   // Navigation & UI
   wallet: '5359785904535774578',
   gift: '6217489739675604129',
@@ -20,7 +20,7 @@ export const EMOJIS = {
   home: '5416041192905265756',
   refresh: '5264727218734524899',
   chart: '5884161133174067365',
-  
+
   // Actions
   deposit: '5433811242135331842',
   send: '5433614747381538714',
@@ -29,14 +29,14 @@ export const EMOJIS = {
   cancel: '6131800692534285654',
   confirm: '5039844895779455925',
   edit: '5039826874096681939',
-  
+
   // Financial
   money: '5039789890133296083',
   bank: '5264895611517300926',
   card: '5269472852653912623',
   diamond: '5384426402495893753',
   naira: '5294456308047563965',
-  
+
   // Status
   star: '6131878581766198553',
   trophy: '5462927083132970373',
@@ -45,7 +45,7 @@ export const EMOJIS = {
   sparkle: '6131673419768403090',
   party: '5989848973974704652',
   fire: '5041845079229072486',
-  
+
   // Misc
   people: '5453957997418004470',
   person: '5877235236416266965',
@@ -61,21 +61,14 @@ export const EMOJIS = {
 export type EmojiKey = keyof typeof EMOJIS;
 
 /**
- * Creates a custom emoji entity for Telegram API
+ * Creates a custom emoji entity for Telegram API (use inside HTML text)
  */
 export function customEmoji(key: EmojiKey): string {
   return `<tg-emoji emoji-id="${EMOJIS[key]}">⭐</tg-emoji>`;
 }
 
 /**
- * Creates fallback-safe emoji text
- */
-export function emojiText(key: EmojiKey, fallback: string): string {
-  return `<tg-emoji emoji-id="${EMOJIS[key]}">${fallback}</tg-emoji>`;
-}
-
-/**
- * Unicode fallback map for non-premium clients
+ * Unicode fallback map for non-premium clients / non-HTML contexts
  */
 export const EMOJI_FALLBACK: Record<EmojiKey, string> = {
   lightning: '⚡',
@@ -111,7 +104,7 @@ export const EMOJI_FALLBACK: Record<EmojiKey, string> = {
   target: '🎯',
   sparkle: '✨',
   party: '🎉',
-  fire: '🔼',
+  fire: '🔥',
   people: '👥',
   person: '👤',
   clock: '⌛',
@@ -124,8 +117,14 @@ export const EMOJI_FALLBACK: Record<EmojiKey, string> = {
 };
 
 /**
- * Get emoji with fallback for captions
+ * Premium custom emoji for HTML-parse-mode messages (captions, editMessage*).
+ * Renders as the animated custom emoji in Telegram; the inner fallback char
+ * shows anywhere the tg-emoji tag can't render.
+ *
+ * ⚠️ Only use in messages sent with parse_mode: 'HTML' — in plain text
+ * (e.g. answerCbQuery alerts) it would show the raw tag. For those, use
+ * EMOJI_FALLBACK[key] directly.
  */
 export function e(key: EmojiKey): string {
-  return EMOJI_FALLBACK[key];
+  return `<tg-emoji emoji-id="${EMOJIS[key]}">${EMOJI_FALLBACK[key]}</tg-emoji>`;
 }
