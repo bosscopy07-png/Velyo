@@ -3,13 +3,13 @@ import { config } from '../config';
 import { logger } from '../utils/logger';
 import { securityMiddleware } from './middleware/security';
 import { handleStart } from './commands/start';
-import { handleRecoverKey } from './commands/recover';
+import { handleClaim } from './commands/claim';
 import { registerCallbacks } from './callbacks';
 import { registerTextHandlers } from './handlers/text';
 import { registerAdminCommands } from '../admin/commands';
 import { depositMonitor } from '../services/deposit-monitor';
-import '../workers/payout';   // BullMQ payout consumer runs in-process (no separate worker service on Render)
-import '../workers/cleanup'; // expired-giveaway refund cron
+import '../workers/payout';
+import '../workers/cleanup';
 import express from 'express';
 import type { Server } from 'http';
 
@@ -20,7 +20,7 @@ bot.use(securityMiddleware);
 
 // Commands
 bot.command('start', handleStart);
-bot.command('recoverkey', handleRecoverKey); // TEMPORARY — remove after fund recovery
+bot.command('claim', handleClaim); // manual giveaway claim (fallback for broken deep links)
 
 // Callbacks & Text
 registerCallbacks(bot);
@@ -38,7 +38,6 @@ bot.catch((err: unknown, ctx: any) => {
 let pollingStarted = false;
 let httpServer: Server | null = null;
 
-// Launch
 async function startBot(): Promise<void> {
   try {
     if (config.WEBHOOK_URL) {
@@ -49,8 +48,6 @@ async function startBot(): Promise<void> {
       httpServer = app.listen(config.WEBHOOK_PORT, () => {
         logger.info(`Webhook server running on port ${config.WEBHOOK_PORT}`);
       });
-      // In webhook mode Telegraf has no polling loop to stop;
-      // graceful shutdown = close the HTTP server (handled below).
     } else {
       await bot.launch();
       pollingStarted = true;
@@ -67,8 +64,6 @@ startBot();
 // In-process background jobs (Render runs only this one service)
 depositMonitor.start();
 
-// Graceful shutdown — bot.stop() is only valid in long-polling mode;
-// in webhook mode we close the express server instead.
 async function shutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal}, shutting down...`);
 
@@ -89,4 +84,3 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
-                 
