@@ -24,7 +24,7 @@ export async function handleClaim(ctx: Context): Promise<void> {
 
   const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
   if (!user) {
-    await ctx.reply(`${e('warning')} Please send /start first.`);
+    await ctx.reply(`${e('warning')} Please send /start first.`, { parse_mode: 'HTML' });
     return;
   }
 
