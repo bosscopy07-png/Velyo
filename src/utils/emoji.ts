@@ -61,14 +61,8 @@ export const EMOJIS = {
 export type EmojiKey = keyof typeof EMOJIS;
 
 /**
- * Creates a custom emoji entity for Telegram API (use inside HTML text)
- */
-export function customEmoji(key: EmojiKey): string {
-  return `<tg-emoji emoji-id="${EMOJIS[key]}">⭐</tg-emoji>`;
-}
-
-/**
- * Unicode fallback map for non-premium clients / non-HTML contexts
+ * Unicode fallback map — used for button labels, alerts, and log lines
+ * (contexts where HTML custom-emoji tags cannot render)
  */
 export const EMOJI_FALLBACK: Record<EmojiKey, string> = {
   lightning: '⚡',
@@ -117,14 +111,21 @@ export const EMOJI_FALLBACK: Record<EmojiKey, string> = {
 };
 
 /**
- * Premium custom emoji for HTML-parse-mode messages (captions, editMessage*).
+ * Premium custom emoji for HTML-parse-mode message captions/text.
  * Renders as the animated custom emoji in Telegram; the inner fallback char
  * shows anywhere the tg-emoji tag can't render.
  *
- * ⚠️ Only use in messages sent with parse_mode: 'HTML' — in plain text
- * (e.g. answerCbQuery alerts) it would show the raw tag. For those, use
- * EMOJI_FALLBACK[key] directly.
+ * ⚠️ ONLY use in messages sent with parse_mode: 'HTML'. Never in button
+ * labels (they're plain text) — use eb() there.
  */
 export function e(key: EmojiKey): string {
   return `<tg-emoji emoji-id="${EMOJIS[key]}">${EMOJI_FALLBACK[key]}</tg-emoji>`;
+}
+
+/**
+ * Plain unicode emoji for inline KEYBOARD BUTTON labels.
+ * Button text never parses HTML, so <tg-emoji> tags would show as raw text.
+ */
+export function eb(key: EmojiKey): string {
+  return EMOJI_FALLBACK[key];
 }
