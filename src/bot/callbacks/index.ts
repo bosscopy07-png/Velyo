@@ -3,7 +3,6 @@ import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
-import { blockchain } from '../../services/blockchain';
 import { setUserSession } from '../../services/redis';
 import { config } from '../../config';
 import { e } from '../../utils/emoji';
@@ -20,6 +19,9 @@ import {
 } from '../keyboards/main';
 import { formatAddress } from '../../utils/validation';
 import { editMainMessage } from '../utils/editMainMessage';
+
+// Telegram t.me links break if the username contains "@"
+const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 
 export function registerCallbacks(bot: any): void {
   const isAdmin = (ctx: Context): boolean =>
@@ -45,27 +47,17 @@ export function registerCallbacks(bot: any): void {
 
     if (!user?.wallet) return;
 
-    // Capture into const — TS narrowing is lost across await reassignment
-    const walletAddress = user.wallet.address;
-    const dbBalances = user.balances;
-
-    // LIVE on-chain balances; DB is only a fallback if the chain read fails
-    const live: Record<string, number> = {};
-    for (const asset of ['BNB', 'USDT'] as const) {
-      try {
-        const raw = await blockchain.getBalance(walletAddress, asset);
-        live[asset] = Number(raw) / 1e18;
-      } catch (err) {
-        logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
-        live[asset] = Number(dbBalances.find((b) => b.asset === asset)?.availableBalance ?? 0);
-      }
-    }
-
-    const balances = (['BNB', 'USDT'] as const).map((asset) => ({
-      asset,
-      available: live[asset],
-      locked: Number(dbBalances.find((b) => b.asset === asset)?.lockedBalance ?? 0),
-    }));
+    // Spendable balance comes from the DB — it includes deposits (credited by
+    // the monitor) AND internal credits (giveaway wins, redeem codes).
+    // This is exactly what giveaways can spend, so it's what we display.
+    const balances = (['BNB', 'USDT'] as const).map((asset) => {
+      const db = user!.balances.find((b) => b.asset === asset);
+      return {
+        asset,
+        available: Number(db?.availableBalance ?? 0),
+        locked: Number(db?.lockedBalance ?? 0),
+      };
+    });
 
     const caption = await formatWalletMessage(balances);
     await editMainMessage(ctx, caption, walletKeyboard);
@@ -218,7 +210,6 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   }));
 
-  // Step 1: pick asset for single-claim
   bot.action('giveaway:single', guard(async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_single_asset' });
@@ -232,7 +223,6 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   }));
 
-  // Step 1: pick asset for multi-claim
   bot.action('giveaway:multiple', guard(async (ctx: Context) => {
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_multi_asset' });
@@ -246,7 +236,6 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   }));
 
-  // Step 2a: asset chosen for single → ask amount
   bot.action(/gws:(BNB|USDT)/, guard(async (ctx: Context) => {
     const asset = (ctx as any).match[1] as string;
     const from = ctx.from!;
@@ -262,7 +251,6 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
   }));
 
-  // Step 2b: asset chosen for multi → ask amount
   bot.action(/gwm:(BNB|USDT)/, guard(async (ctx: Context) => {
     const asset = (ctx as any).match[1] as string;
     const from = ctx.from!;
@@ -467,8 +455,8 @@ export function registerCallbacks(bot: any): void {
 
   bot.action(/giveaway:copy:(.+)/, guard(async (ctx: Context) => {
     const code = (ctx as any).match[1];
-    const link = `https://t.me/${config.BOT_USERNAME}?start=giveaway_${code}`;
+    const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-      }
-      
+                              }
+                                             
