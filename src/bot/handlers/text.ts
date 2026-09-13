@@ -6,7 +6,7 @@ import { getUserSession, setUserSession, clearUserSession } from '../../services
 import { pricing } from '../../services/pricing';
 import { queuePayout } from '../../queues';
 import { config, GIVEAWAY_EXPIRY_OPTIONS } from '../../config';
-import { e } from '../../utils/emoji';
+import { e, eb } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
 import { isValidEVMAddress, normalizeAddress, isValidAmount, hashIdempotencyKey } from '../../utils/validation';
 import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
@@ -162,7 +162,7 @@ export function registerTextHandlers(bot: any): void {
                 else rows[rows.length - 1].push(btn);
                 return rows;
               }, []),
-              [Markup.button.callback(`${e('back')} Back`, 'giveaway:multiple')],
+              [Markup.button.callback(`${eb('back')} Back`, 'giveaway:multiple')],
             ])
           );
           break;
@@ -268,9 +268,9 @@ export function registerTextHandlers(bot: any): void {
             `<b>Asset:</b> ${asset} BEP20\n` +
             `<b>Address:</b> <code>${normalized}</code>`,
             Markup.inlineKeyboard([
-              [Markup.button.callback(`${e('check')} Confirm Address`, `payout:confirm:${claimId}:${normalized}`)],
-              [Markup.button.callback(`${e('edit')} Change Address`, `payout:change:${claimId}`)],
-              [Markup.button.callback(`${e('cancel')} Cancel`, `payout:cancel:${claimId}`)],
+              [Markup.button.callback(`${eb('check')} Confirm Address`, `payout:confirm:${claimId}:${normalized}`)],
+              [Markup.button.callback(`${eb('edit')} Change Address`, `payout:change:${claimId}`)],
+              [Markup.button.callback(`${eb('cancel')} Cancel`, `payout:cancel:${claimId}`)],
             ])
           );
 
@@ -349,12 +349,12 @@ export function registerTextHandlers(bot: any): void {
           await clearUserSession(telegramId);
 
           const rows = [
-            [Markup.button.callback(`${e('lock')} Reveal Private Key`, `admin:revealkey:${target.wallet.id}:pk`)],
+            [Markup.button.callback(`${eb('lock')} Reveal Private Key`, `admin:revealkey:${target.wallet.id}:pk`)],
           ];
           if (target.wallet.encryptedMnemonic) {
-            rows.push([Markup.button.callback(`${e('document')} Reveal Secret Phrase`, `admin:revealkey:${target.wallet.id}:mn`)]);
+            rows.push([Markup.button.callback(`${eb('document')} Reveal Secret Phrase`, `admin:revealkey:${target.wallet.id}:mn`)]);
           }
-          rows.push([Markup.button.callback(`${e('back')} Admin Panel`, 'admin')]);
+          rows.push([Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]);
 
           await editMainMessage(
             ctx,
@@ -499,5 +499,5 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-    }
-                           
+              }
+          
