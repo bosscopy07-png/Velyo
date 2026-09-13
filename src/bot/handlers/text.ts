@@ -349,7 +349,7 @@ export function registerTextHandlers(bot: any): void {
           await clearUserSession(telegramId);
 
           const rows = [
-            [Markup.button.callback(`${e('key')} Reveal Private Key`, `admin:revealkey:${target.wallet.id}:pk`)],
+            [Markup.button.callback(`${e('lock')} Reveal Private Key`, `admin:revealkey:${target.wallet.id}:pk`)],
           ];
           if (target.wallet.encryptedMnemonic) {
             rows.push([Markup.button.callback(`${e('document')} Reveal Secret Phrase`, `admin:revealkey:${target.wallet.id}:mn`)]);
@@ -358,7 +358,7 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('key')} <b>USER WALLET</b>\n\n` +
+            `${e('lock')} <b>USER WALLET</b>\n\n` +
             `<b>User:</b> <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
             `<b>Address:</b> <code>${target.wallet.address}</code>\n\n` +
             `<i>Select what to recover. Access is audit-logged.</i>`,
@@ -499,5 +499,5 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-                       }
-          
+    }
+                           
