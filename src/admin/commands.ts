@@ -2,7 +2,7 @@ import { Context, Markup } from 'telegraf';
 import { prisma } from '../database';
 import { isAdmin } from '../bot/middleware/security';
 import { logger } from '../utils/logger';
-import { e } from '../utils/emoji';
+import { e, eb } from '../utils/emoji';
 import { editMainMessage } from '../bot/utils/editMainMessage';
 import { backKeyboard } from '../bot/keyboards/main';
 import { decrypt } from '../utils/encryption';
@@ -11,20 +11,20 @@ import { formatAddress } from '../utils/validation';
 
 const adminPanelKeyboard = Markup.inlineKeyboard([
   [
-    Markup.button.callback(`${e('people')} Users`, 'admin:users'),
-    Markup.button.callback(`${e('gift')} Giveaways`, 'admin:giveaways'),
+    Markup.button.callback(`${eb('people')} Users`, 'admin:users'),
+    Markup.button.callback(`${eb('gift')} Giveaways`, 'admin:giveaways'),
   ],
   [
-    Markup.button.callback(`${e('chart')} Fees`, 'admin:fees'),
-    Markup.button.callback(`${e('people')} Broadcast`, 'admin:broadcast'),
+    Markup.button.callback(`${eb('chart')} Fees`, 'admin:fees'),
+    Markup.button.callback(`${eb('people')} Broadcast`, 'admin:broadcast'),
   ],
   [
-    Markup.button.callback(`${e('diamond')} Create Code`, 'admin:code:create'),
-    Markup.button.callback(`${e('lock')} Recover Key`, 'admin:findkey'),
+    Markup.button.callback(`${eb('diamond')} Create Code`, 'admin:code:create'),
+    Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
   ],
   [
-    Markup.button.callback(`${e('warning')} Emergency`, 'admin:emergency'),
-    Markup.button.callback(`${e('back')} Back`, 'main'),
+    Markup.button.callback(`${eb('warning')} Emergency`, 'admin:emergency'),
+    Markup.button.callback(`${eb('back')} Back`, 'main'),
   ],
 ]);
 
@@ -67,7 +67,6 @@ export function registerAdminCommands(bot: any): void {
 
   // === KEY RECOVERY FLOW ===
 
-  // Step 1: prompt for the target user
   bot.action('admin:findkey', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -83,7 +82,6 @@ export function registerAdminCommands(bot: any): void {
     );
   });
 
-  // Step 2: reveal request — show confirmation before displaying secrets
   bot.action(/admin:revealkey:(.+):(pk|mn)/, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -111,12 +109,11 @@ export function registerAdminCommands(bot: any): void {
       `This action will be written to the audit log.`,
       Markup.inlineKeyboard([
         [Markup.button.callback(`⚠️ Yes, show the ${label}`, `admin:revealconfirm:${walletId}:${kind}`)],
-        [Markup.button.callback(`${e('back')} Cancel`, 'admin')],
+        [Markup.button.callback(`${eb('back')} Cancel`, 'admin')],
       ])
     );
   });
 
-  // Step 3: confirmed — decrypt, audit-log, display
   bot.action(/admin:revealconfirm:(.+):(pk|mn)/, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -149,7 +146,6 @@ export function registerAdminCommands(bot: any): void {
       return;
     }
 
-    // Audit trail — who revealed whose key, when
     await prisma.auditLog.create({
       data: {
         adminId: ctx.from!.id.toString(),
@@ -170,7 +166,7 @@ export function registerAdminCommands(bot: any): void {
       `⚠️ This was displayed because the user requested recovery. ` +
       `Never share it in any chat. This access has been logged.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback(`${e('back')} Admin Panel`, 'admin')],
+        [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
       ])
     );
   });
@@ -239,7 +235,7 @@ export function registerAdminCommands(bot: any): void {
         [Markup.button.callback('⛔ Pause Giveaways', 'admin:pause:giveaways')],
         [Markup.button.callback('⛔ Pause Payouts', 'admin:pause:payouts')],
         [Markup.button.callback('🔒 Maintenance Mode', 'admin:maintenance')],
-        [Markup.button.callback(`${e('back')} Back`, 'admin')],
+        [Markup.button.callback(`${eb('back')} Back`, 'admin')],
       ])
     );
   });
@@ -354,5 +350,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-    }
-    
+      }
+      
