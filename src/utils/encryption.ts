@@ -4,19 +4,19 @@ import { config } from '../config';
 /**
  * AES-256-GCM encryption for sensitive wallet data (private keys, mnemonics).
  *
- * Why not CryptoJS: CryptoJS does not support GCM at all (its typings have no
- * `mode.GCM`), so the previous implementation could never have produced valid
- * ciphertext. We therefore use Node's built-in `crypto` with AES-256-GCM,
- * which provides authenticated encryption (integrity + confidentiality).
+ * Wire format: v1:<iv>:<authTag>:<ciphertext>   (all base64)
+ * NOTE: values written between 2026-09-11 and this fix have a double colon
+ * ("v1::<iv>...") due to a join() bug — decrypt() accepts BOTH formats, so
+ * existing data needs no migration.
  *
- * Legacy compatibility: any ciphertext produced by the old CryptoJS
- * `AES.encrypt(text, key)` (default CBC mode, "Salted__..." wire format) is
- * still decryptable via the fallback path below.
+ * Legacy compatibility: ciphertext produced by the old CryptoJS
+ * AES.encrypt(text, key) (CBC, "Salted__..." wire format) is still decryptable
+ * via the fallback path.
  */
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12; // 96-bit nonce, recommended for GCM
-const LEGACY_PREFIX = 'v1:';
+const PREFIX = 'v1';
 
 // Derive a stable 32-byte key from the configured secret. scrypt is used for
 // key derivation; the salt is not secret (only the passphrase is).
@@ -37,17 +37,15 @@ export function encrypt(plaintext: string): string {
   const authTag = cipher.getAuthTag();
 
   // iv and tag are safe to store alongside the ciphertext (GCM design).
-  return [
-    LEGACY_PREFIX,
-    iv.toString('base64'),
-    authTag.toString('base64'),
-    ciphertext.toString('base64'),
-  ].join(':');
+  return [PREFIX, iv.toString('base64'), authTag.toString('base64'), ciphertext.toString('base64')].join(':');
 }
 
 export function decrypt(payload: string): string {
-  if (payload.startsWith(LEGACY_PREFIX)) {
-    const parts = payload.split(':');
+  if (payload.startsWith(`${PREFIX}:`)) {
+    // Accept BOTH "v1:iv:tag:ct" and the buggy "v1::iv:tag:ct" (empty segment
+    // from the old double-colon join). Base64 segments are never empty, so
+    // filtering empties is safe.
+    const parts = payload.split(':').filter((p) => p.length > 0);
     if (parts.length !== 4) {
       throw new Error('Malformed ciphertext payload');
     }
@@ -67,7 +65,7 @@ export function decrypt(payload: string): string {
   }
 
   // Legacy fallback: CryptoJS AES (CBC/Pkcs7, "Salted__" format). Kept so that
-  // any data encrypted before this fix remains recoverable.
+  // any data encrypted before the GCM migration remains recoverable.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const CryptoJS = require('crypto-js') as typeof import('crypto-js');
   const bytes = CryptoJS.AES.decrypt(payload, config.WALLET_ENCRYPTION_KEY);
@@ -88,4 +86,4 @@ export function hashIdempotencyKey(...parts: string[]): string {
     .createHash('sha256')
     .update(parts.join('|') + config.WALLET_ENCRYPTION_KEY)
     .digest('hex');
-    }
+}
