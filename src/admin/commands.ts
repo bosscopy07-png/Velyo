@@ -20,7 +20,7 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   ],
   [
     Markup.button.callback(`${e('diamond')} Create Code`, 'admin:code:create'),
-    Markup.button.callback(`${e('key')} Recover Key`, 'admin:findkey'),
+    Markup.button.callback(`${e('lock')} Recover Key`, 'admin:findkey'),
   ],
   [
     Markup.button.callback(`${e('warning')} Emergency`, 'admin:emergency'),
@@ -76,7 +76,7 @@ export function registerAdminCommands(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `${e('key')} <b>RECOVER USER KEY</b>\n\n` +
+      `${e('lock')} <b>RECOVER USER KEY</b>\n\n` +
       `Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
       `<i>Every reveal is audit-logged. Only do this when the user explicitly requests recovery.</i>`,
       backKeyboard('admin')
@@ -165,7 +165,7 @@ export function registerAdminCommands(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `${e('key')} <b>${label} — @${wallet.user.username || wallet.user.telegramId}</b>\n\n` +
+      `${e('lock')} <b>${label} — @${wallet.user.username || wallet.user.telegramId}</b>\n\n` +
       `<code>${secret}</code>\n\n` +
       `⚠️ This was displayed because the user requested recovery. ` +
       `Never share it in any chat. This access has been logged.`,
@@ -354,5 +354,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-        }
-             
+    }
+    
