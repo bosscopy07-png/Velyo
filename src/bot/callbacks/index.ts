@@ -5,7 +5,7 @@ import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
 import { setUserSession } from '../../services/redis';
 import { config } from '../../config';
-import { e } from '../../utils/emoji';
+import { e, eb } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
 import { formatWalletMessage, formatDepositMessage, formatGiveawayCreatedMessage } from '../messages';
 import {
@@ -96,7 +96,7 @@ export function registerCallbacks(bot: any): void {
 
   // === MAIN NAVIGATION ===
   bot.action('main', guard(async (ctx: Context) => {
-    await ctx.answerCbQuery(); // answer first — no spinner
+    await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
       `${e('lightning')} <b>Welcome to VEYLO</b>\n\n` +
@@ -208,7 +208,7 @@ export function registerCallbacks(bot: any): void {
   }));
 
   bot.action('giveaway:single', guard(async (ctx: Context) => {
-    await ctx.answerCbQuery(); // first — kills the spinner
+    await ctx.answerCbQuery();
     const from = ctx.from!;
     await setUserSession(from.id.toString(), { state: 'giveaway_single_asset' });
     await editMainMessage(
@@ -379,8 +379,8 @@ export function registerCallbacks(bot: any): void {
     ].join('\n');
 
     const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback(`${e('document')} History`, 'wallet:history')],
-      [Markup.button.callback(`${e('back')} Back`, 'main')],
+      [Markup.button.callback(`${eb('document')} History`, 'wallet:history')],
+      [Markup.button.callback(`${eb('back')} Back`, 'main')],
     ]);
 
     await editMainMessage(ctx, caption, keyboard);
@@ -437,10 +437,10 @@ export function registerCallbacks(bot: any): void {
         ctx,
         formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode),
         Markup.inlineKeyboard([
-          [Markup.button.callback(`${e('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
-          [Markup.button.callback(`${e('chart')} View Stats`, `giveaway:stats:${secureCode}`)],
-          [Markup.button.callback(`${e('cancel')} Cancel Giveaway`, `giveaway:cancel:${secureCode}`)],
-          [Markup.button.callback(`${e('back')} My Giveaways`, 'giveaway:mine')],
+          [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
+          [Markup.button.callback(`${eb('chart')} View Stats`, `giveaway:stats:${secureCode}`)],
+          [Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${secureCode}`)],
+          [Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine')],
         ])
       );
       await ctx.answerCbQuery('Giveaway created!');
@@ -455,5 +455,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-        }
-    
+                        }
+                                                                                                        
