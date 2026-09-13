@@ -104,7 +104,7 @@ export async function handleStart(ctx: Context): Promise<void> {
     });
   } catch (err) {
     logger.error('Start command error:', err);
-    await ctx.reply(`${e('warning')} Something went wrong. Please try /start again.`);
+    await ctx.reply(`${e('warning')} Something went wrong. Please try /start again.`, { parse_mode: 'HTML' });
   }
 }
 
@@ -201,4 +201,4 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `📥 Send your ${asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
     { reply_markup: undefined }
   );
-      }
+}
