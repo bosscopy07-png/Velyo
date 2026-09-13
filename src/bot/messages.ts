@@ -1,6 +1,9 @@
 import { e } from '../utils/emoji';
 import { pricing } from '../services/pricing';
-import type { AssetSymbol } from '../config';
+import { config } from '../config';
+
+// Telegram t.me links break if the username contains "@"
+const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 
 export async function formatWalletMessage(
   balances: Array<{ asset: string; available: number; locked: number }>
@@ -15,18 +18,18 @@ export async function formatWalletMessage(
     const usdValue = await pricing.convertToUSD(bal.asset, bal.available);
     const ngnValue = await pricing.convertToNGN(bal.asset, bal.available);
     totalUSD += usdValue;
-    
+
     lines.push(
       `${bal.asset === 'BNB' ? '🟡' : '🟢'} <b>${bal.asset}</b>`,
       `${bal.available.toFixed(6)} ${bal.asset}`,
-      `≈ ${pricing.formatUSD(usdValue)}`,
-      `≈ ${pricing.formatNGN(ngnValue)}`,
+      usdValue > 0 ? `≈ ${pricing.formatUSD(usdValue)}` : '',
+      ngnValue > 0 ? `≈ ${pricing.formatNGN(ngnValue)}` : '',
       bal.locked > 0 ? `🔒 Locked: ${bal.locked.toFixed(6)}` : '',
       ''
     );
   }
 
-  lines.splice(2, 0, `<b>Total Balance</b>`, `${pricing.formatUSD(totalUSD)}`, '');
+  lines.splice(2, 0, `<b>Total Balance</b>`, totalUSD > 0 ? `${pricing.formatUSD(totalUSD)}` : '—', '');
 
   return lines.filter(Boolean).join('\n');
 }
@@ -72,7 +75,7 @@ export function formatGiveawayCreatedMessage(
     `<b>Reward:</b> ${reward.toFixed(6)} ${asset} each`,
     '',
     `Claim Link:`,
-    `<code>https://t.me/${process.env.BOT_USERNAME}?start=giveaway_${code}</code>`,
+    `<code>https://t.me/${BOT_USERNAME}?start=giveaway_${code}</code>`,
   ].join('\n');
 }
 
@@ -83,7 +86,6 @@ export function formatClaimSuccessMessage(asset: string, amount: number): string
     `You successfully secured a giveaway spot.`,
     '',
     `<b>Reward:</b> ${amount} ${asset}`,
-    `<b>Estimated Value:</b> ≈ ${pricing.formatUSD(0)}`,
     '',
     `Your reward will be sent after you provide your ${asset} BEP20 address.`,
     '',
