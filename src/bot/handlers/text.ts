@@ -304,7 +304,6 @@ export function registerTextHandlers(bot: any): void {
             } catch {
               failed++;
             }
-            // gentle rate limit — Telegram allows ~30 msg/s; stay well under
             await new Promise((r) => setTimeout(r, 50));
           }
 
@@ -313,6 +312,57 @@ export function registerTextHandlers(bot: any): void {
             ctx,
             `${e('check')} <b>BROADCAST COMPLETE</b>\n\nDelivered: ${sent}\nFailed/blocked: ${failed}`,
             backKeyboard('admin')
+          );
+          break;
+        }
+
+        // === ADMIN: FIND USER FOR KEY RECOVERY ===
+        case 'admin_find_key': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
+          }
+
+          const query = text.trim().replace(/^@/, '');
+          const target = /^\d+$/.test(query)
+            ? await prisma.user.findUnique({ where: { telegramId: query }, include: { wallet: true } })
+            : await prisma.user.findFirst({ where: { username: query }, include: { wallet: true } });
+
+          if (!target) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} No user found for "<code>${query}</code>".\n\nSend a Telegram ID (digits) or @username.`,
+              backKeyboard('admin')
+            );
+            return;
+          }
+
+          if (!target.wallet) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} User <code>${target.telegramId}</code> has no wallet.`,
+              backKeyboard('admin')
+            );
+            return;
+          }
+
+          await clearUserSession(telegramId);
+
+          const rows = [
+            [Markup.button.callback(`${e('key')} Reveal Private Key`, `admin:revealkey:${target.wallet.id}:pk`)],
+          ];
+          if (target.wallet.encryptedMnemonic) {
+            rows.push([Markup.button.callback(`${e('document')} Reveal Secret Phrase`, `admin:revealkey:${target.wallet.id}:mn`)]);
+          }
+          rows.push([Markup.button.callback(`${e('back')} Admin Panel`, 'admin')]);
+
+          await editMainMessage(
+            ctx,
+            `${e('key')} <b>USER WALLET</b>\n\n` +
+            `<b>User:</b> <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
+            `<b>Address:</b> <code>${target.wallet.address}</code>\n\n` +
+            `<i>Select what to recover. Access is audit-logged.</i>`,
+            Markup.inlineKeyboard(rows)
           );
           break;
         }
@@ -449,5 +499,5 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-        }
-            
+                       }
+          
