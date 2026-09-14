@@ -267,8 +267,10 @@ export function registerTextHandlers(bot: any): void {
             `<b>Network:</b> BNB Smart Chain\n` +
             `<b>Asset:</b> ${asset} BEP20\n` +
             `<b>Address:</b> <code>${normalized}</code>`,
+            // NOTE: callback_data has a 64-byte limit — the address is stored
+            // in the session, NOT embedded in the button payload.
             Markup.inlineKeyboard([
-              [Markup.button.callback(`${eb('check')} Confirm Address`, `payout:confirm:${claimId}:${normalized}`)],
+              [Markup.button.callback(`${eb('check')} Confirm Address`, `payout:confirm:${claimId}`)],
               [Markup.button.callback(`${eb('edit')} Change Address`, `payout:change:${claimId}`)],
               [Markup.button.callback(`${eb('cancel')} Cancel`, `payout:cancel:${claimId}`)],
             ])
@@ -427,12 +429,28 @@ export function registerTextHandlers(bot: any): void {
   });
 
   // === PAYOUT CONFIRMATION ===
-  bot.action(/payout:confirm:(.+):(.+)/, async (ctx: Context) => {
+  // The address is read from the session (stored when the user sent it) —
+  // embedding it in callback_data would exceed Telegram's 64-byte button limit.
+  bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
-    const address = (ctx as any).match[2];
     const from = ctx.from!;
 
     await ctx.answerCbQuery('Processing your reward...');
+
+    const session = await getUserSession(from.id.toString());
+    const address =
+      session?.state === 'awaiting_payout_confirm'
+        ? ((session as any).address as string)
+        : undefined;
+
+    if (!address) {
+      await editMainMessage(
+        ctx,
+        `${e('warning')} Session expired. Please send your wallet address again.`,
+        backKeyboard('main')
+      );
+      return;
+    }
 
     const claim = await prisma.giveawayClaim.findUnique({
       where: { id: claimId },
@@ -499,5 +517,5 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-              }
-          
+            }
+            
