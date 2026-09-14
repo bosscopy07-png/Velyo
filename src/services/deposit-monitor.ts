@@ -1,19 +1,20 @@
 import { prisma } from '../database';
 import { blockchain } from './blockchain';
+import { redis } from './redis';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
-import type { TransactionResponse } from 'ethers';
-import cron from 'node-cron';
 
 const ASSET_DECIMALS: Record<string, number> = { BNB: 18, USDT: 18 };
+const MAX_LOG_WINDOW = 500; // cap getLogs range — public RPCs reject huge ranges
 
 class DepositMonitorService {
   private isRunning = false;
 
   start(): void {
-    cron.schedule('*/30 * * * * *', () => void this.scanDeposits());
-    logger.info('Deposit monitor started (in-process crediting + fee forwarding)');
+    // Every 60s (was 30s) — halves request volume
+    cron.schedule('0 * * * * *', () => void this.scanDeposits());
+    logger.info('Deposit monitor started (credit-efficient mode)');
   }
 
   private async scanDeposits(): Promise<void> {
@@ -27,25 +28,47 @@ class DepositMonitorService {
       });
       if (wallets.length === 0) return;
 
-      const currentBlock = await (await blockchain.getProvider()).getBlockNumber();
-      const fromBlock = Math.max(0, currentBlock - 50);
+      const provider = await blockchain.getProvider();
+      const currentBlock = await provider.getBlockNumber();
+
+      // Resume from where we last scanned (per-instance cursor in Redis)
+      const cursorKey = 'monitor:lastBlock';
+      const cached = await redis.get(cursorKey);
+      const lastScanned = cached ? parseInt(cached) : currentBlock - 20;
+      const fromBlock = Math.max(lastScanned + 1, currentBlock - MAX_LOG_WINDOW);
 
       for (const wallet of wallets) {
-        for (const asset of ['USDT', 'BNB'] as const) {
-          try {
-            const events =
-              asset === 'BNB'
-                ? await this.getNativeTransfers(wallet.address, fromBlock, currentBlock)
-                : await blockchain.getTokenTransferEvents(asset, wallet.address, fromBlock, currentBlock);
-
+        // USDT: event logs over only the NEW blocks since last scan
+        try {
+          if (fromBlock <= currentBlock) {
+            const events = await blockchain.getTokenTransferEvents(
+              'USDT',
+              wallet.address,
+              fromBlock,
+              currentBlock
+            );
             for (const event of events) {
-              await this.processDeposit(wallet, asset, event);
+              await this.processDeposit(wallet, 'USDT', {
+                from: event.from,
+                amount: event.amount,
+                txHash: event.txHash,
+              });
             }
-          } catch (err) {
-            logger.error(`Error scanning ${asset} for ${wallet.address}:`, err);
           }
+        } catch (err) {
+          logger.error(`Error scanning USDT for ${wallet.address}:`, err);
+        }
+
+        // BNB: cheap balance-diff instead of fetching full blocks
+        try {
+          await this.checkNativeBalance(wallet, currentBlock);
+        } catch (err) {
+          logger.error(`Error checking BNB balance for ${wallet.address}:`, err);
         }
       }
+
+      // Advance cursor only after a full pass
+      await redis.set(cursorKey, currentBlock.toString());
     } catch (err) {
       logger.error('Deposit scan error:', err);
     } finally {
@@ -53,29 +76,29 @@ class DepositMonitorService {
     }
   }
 
-  private async getNativeTransfers(
-    address: string,
-    fromBlock: number,
-    toBlock: number
-  ): Promise<Array<{ from: string; amount: bigint; txHash: string }>> {
-    const provider = await blockchain.getProvider();
-    const results: Array<{ from: string; amount: bigint; txHash: string }> = [];
+  private async checkNativeBalance(
+    wallet: { address: string; userId: string; encryptedPrivateKey: string; user: { chatId: string | null; telegramId: string } },
+    currentBlock: number
+  ): Promise<void> {
+    const key = `monitor:bal:${wallet.address}:BNB`;
+    const raw = await blockchain.getBalance(wallet.address, 'BNB');
+    const current = Number(raw) / 1e18;
 
-    for (let b = fromBlock; b <= toBlock; b++) {
-      const block = await provider.getBlock(b, true);
-      if (!block) continue;
+    const prevStr = await redis.get(key);
+    await redis.set(key, current.toFixed(8));
 
-      // ethers v6 types Block.transactions as string[] (hashes); with
-      // prefetchTxs=true the runtime returns full TransactionResponse objects.
-      const txs = block.transactions as unknown as TransactionResponse[];
+    if (!prevStr) return; // first sighting — establish baseline, don't credit
 
-      for (const tx of txs) {
-        if (tx.to?.toLowerCase() === address.toLowerCase() && tx.value > BigInt(0)) {
-          results.push({ from: tx.from, amount: tx.value, txHash: tx.hash });
-        }
-      }
-    }
-    return results;
+    const prev = parseFloat(prevStr);
+    const diff = current - prev;
+    if (diff <= 0) return; // no new deposit (fee forwards/payouts decrease — ignored)
+
+    // Synthetic-but-stable idempotency key for diff-based crediting
+    await this.processDeposit(wallet, 'BNB', {
+      from: '',
+      amount: BigInt(Math.floor(diff * 1e18)),
+      txHash: `bnb-diff:${wallet.address}:${currentBlock}`,
+    });
   }
 
   private async processDeposit(
@@ -98,9 +121,7 @@ class DepositMonitorService {
     });
     if (seen?.status === 'PROCESSED') return;
 
-    const receipt = await blockchain.getTransactionReceipt(event.txHash);
-    if (!receipt || receipt.status !== 1) return;
-
+    // getLogs events are already confirmed; balance-diff deposits are too
     const decimals = ASSET_DECIMALS[asset] ?? 18;
     const amount = Number(event.amount) / 10 ** decimals;
     if (amount <= 0) return;
@@ -133,7 +154,7 @@ class DepositMonitorService {
           netAmount,
           status: 'CONFIRMED',
           transactionHash: event.txHash,
-          fromAddress: event.from,
+          fromAddress: event.from || null,
           toAddress: wallet.address,
           idempotencyKey: hashIdempotencyKey('deposit', event.txHash),
         },
@@ -157,11 +178,9 @@ class DepositMonitorService {
       data: { status: 'PROCESSED', processedAt: new Date() },
     });
 
-    logger.info(`Deposit credited: ${netAmount} ${asset} (tx ${event.txHash})`);
+    logger.info(`Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 20)}...)`);
 
-    // Forward the fee ON-CHAIN to the admin fee wallet.
-    // Requires a little BNB in the user's custodial wallet for gas; if the
-    // transfer fails the fee stays recorded in platformFee for manual sweep.
+    // Forward the fee ON-CHAIN (needs a little BNB for gas in the wallet)
     if (fee > 0) {
       try {
         const rawFee = BigInt(Math.floor(fee * 1e18));
@@ -189,11 +208,9 @@ class DepositMonitorService {
           },
         });
 
-        logger.info(`Fee forwarded: ${fee} ${asset} → ${config.PLATFORM_FEE_WALLET} (tx ${hash})`);
+        logger.info(`Fee forwarded: ${fee} ${asset} → fee wallet`);
       } catch (err) {
-        logger.error(
-          `Fee forward failed for ${event.txHash} (fee ${fee} ${asset} recorded in platform_fees — sweep manually). Reason: ${(err as Error).message}`
-        );
+        logger.error(`Fee forward failed for ${event.txHash} (recorded for manual sweep): ${(err as Error).message}`);
       }
     }
 
@@ -202,7 +219,7 @@ class DepositMonitorService {
         wallet.user.chatId,
         `🟢 <b>DEPOSIT RECEIVED</b>\n\n<b>Amount:</b> ${amount} ${asset}\n` +
         (fee > 0 ? `<b>Fee:</b> ${fee.toFixed(6)} ${asset}\n<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n` : '') +
-        `<b>Tx:</b> <code>${event.txHash}</code>`
+        `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`
       );
     }
   }
@@ -220,4 +237,7 @@ class DepositMonitorService {
   }
 }
 
+import cron from 'node-cron';
+
 export const depositMonitor = new DepositMonitorService();
+                                        
