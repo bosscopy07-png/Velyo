@@ -137,7 +137,9 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         );
       } else if (existingClaim.status === 'ADDRESS_CONFIRMED' || existingClaim.status === 'QUEUED' || existingClaim.status === 'PROCESSING') {
         await editMainMessage(ctx, `${e('clock')} Your reward is being processed. Please wait.`, mainKeyboard(false));
-      } else if (existingClaim.status === 'ADDRESS_PENDING') {
+      } else if (existingClaim.status === 'RESERVED' || existingClaim.status === 'ADDRESS_PENDING') {
+        // Crashed/interrupted before payout was queued — let the user RESUME
+        // by submitting their address again. (Was a dead-end "already secured".)
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
       } else {
         await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, mainKeyboard(false));
@@ -202,4 +204,4 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `📥 Send your ${asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
     { reply_markup: undefined }
   );
-}
+  }
