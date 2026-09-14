@@ -63,8 +63,11 @@ export async function handleStart(ctx: Context): Promise<void> {
       });
     }
 
+    // Handle deep links (giveaway claim)
     if (startPayload?.startsWith('giveaway_')) {
       const code = startPayload.replace('giveaway_', '');
+      // Delete the old main message first — the claim flow renders its own
+      await deleteMainMessage(ctx, user!);
       await handleGiveawayDeepLink(ctx, user!.id, code);
       return;
     }
@@ -75,22 +78,9 @@ export async function handleStart(ctx: Context): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
 
-    if (user!.mainMessageId) {
-      try {
-        await ctx.telegram.editMessageMedia(
-          chatId,
-          parseInt(user!.mainMessageId),
-          undefined,
-          { type: 'photo', media: VEYLO_IMAGE, caption, parse_mode: 'HTML' },
-          { reply_markup: mainKeyboard(isAdmin).reply_markup }
-        );
-        return;
-      } catch {
-        try {
-          await ctx.telegram.deleteMessage(chatId, parseInt(user!.mainMessageId));
-        } catch {}
-      }
-    }
+    // Always delete the old main message and send a fresh one — a clean
+    // screen for every /start, deep link, or /claim arrival.
+    await deleteMainMessage(ctx, user!);
 
     const msg = await ctx.replyWithPhoto(VEYLO_IMAGE, {
       caption,
@@ -105,6 +95,17 @@ export async function handleStart(ctx: Context): Promise<void> {
   } catch (err) {
     logger.error('Start command error:', err);
     await ctx.reply(`${e('warning')} Something went wrong. Please try /start again.`, { parse_mode: 'HTML' });
+  }
+}
+
+/** Best-effort deletion of the user's stored main message. */
+async function deleteMainMessage(ctx: Context, user: { mainMessageId: string | null }): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId || !user.mainMessageId) return;
+  try {
+    await ctx.telegram.deleteMessage(chatId, parseInt(user.mainMessageId));
+  } catch {
+    // already gone or not deletable — non-fatal
   }
 }
 
@@ -185,7 +186,7 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
     });
   } catch (err) {
     logger.error('Giveaway deep link error:', err);
-    await editMainMessage(ctx, `${e('warning')} Unable to process giveaway link.`, mainKeyboard(false));
+    await editMainMessage(ctx, `${e('warning')} Unable to process giveaway claim.`, mainKeyboard(false));
   }
 }
 
