@@ -83,6 +83,39 @@ export function registerCallbacks(bot: any): void {
     await editMainMessage(ctx, text, backKeyboard('wallet'));
   }
 
+  /** Renders the "My Giveaways" list with per-giveaway Cancel/Stats buttons. */
+  async function renderMyGiveaways(ctx: Context, userId: string): Promise<void> {
+    const giveaways = await prisma.giveaway.findMany({
+      where: { creatorId: userId },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+      include: { claims: true },
+    });
+
+    let text = `${e('chart')} <b>MY GIVEAWAYS</b>\n\n`;
+    if (giveaways.length === 0) text += 'No giveaways created yet.';
+
+    for (const g of giveaways) {
+      const status = g.status === 'ACTIVE' ? '🟢' : g.status === 'FULL' ? '🔴' : '⚪';
+      text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
+    }
+
+    // One action row per cancellable giveaway (FULL included — claims that
+    // never paid out are refunded on cancel)
+    const rows: any[] = giveaways
+      .filter((g) => g.status === 'ACTIVE' || g.status === 'FULL')
+      .map((g) => [
+        Markup.button.callback(
+          `${eb('cancel')} Cancel ${g.totalAmount} ${g.asset}`,
+          `giveaway:cancel:${g.id}`
+        ),
+        Markup.button.callback(`${eb('chart')} Stats`, `giveaway:stats:${g.id}`),
+      ]);
+    rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
+
+    await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
+  }
+
   const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
@@ -263,28 +296,13 @@ export function registerCallbacks(bot: any): void {
     );
   }));
 
+  // === MY GIVEAWAYS ===
   bot.action('giveaway:mine', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
     if (!user) return;
-
-    const giveaways = await prisma.giveaway.findMany({
-      where: { creatorId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 10,
-      include: { claims: true },
-    });
-
-    let text = `${e('chart')} <b>MY GIVEAWAYS</b>\n\n`;
-    if (giveaways.length === 0) text += 'No giveaways created yet.';
-
-    for (const g of giveaways) {
-      const status = g.status === 'ACTIVE' ? '🟢' : g.status === 'FULL' ? '🔴' : '⚪';
-      text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
-    }
-
-    await editMainMessage(ctx, text, backKeyboard('giveaway'));
+    await renderMyGiveaways(ctx, user.id);
   }));
 
   bot.action(/giveaway:cancel:(.+)/, guard(async (ctx: Context) => {
@@ -299,19 +317,7 @@ export function registerCallbacks(bot: any): void {
       { show_alert: !result.success }
     );
     if (result.success) {
-      const giveaways = await prisma.giveaway.findMany({
-        where: { creatorId: user.id },
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-        include: { claims: true },
-      });
-      let text = `${e('chart')} <b>MY GIVEAWAYS</b>\n\n`;
-      if (giveaways.length === 0) text += 'No giveaways created yet.';
-      for (const g of giveaways) {
-        const status = g.status === 'ACTIVE' ? '🟢' : g.status === 'FULL' ? '🔴' : '⚪';
-        text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
-      }
-      await editMainMessage(ctx, text, backKeyboard('giveaway'));
+      await renderMyGiveaways(ctx, user.id);
     }
   }));
 
@@ -423,7 +429,7 @@ export function registerCallbacks(bot: any): void {
     const maxClaimers = parseInt(claimersStr);
 
     try {
-      const { secureCode } = await giveawayService.createGiveaway({
+      const { giveawayId, secureCode } = await giveawayService.createGiveaway({
         creatorId: user.id,
         asset: asset as any,
         totalAmount: amount,
@@ -439,7 +445,8 @@ export function registerCallbacks(bot: any): void {
         Markup.inlineKeyboard([
           [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
           [Markup.button.callback(`${eb('chart')} View Stats`, `giveaway:stats:${secureCode}`)],
-          [Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${secureCode}`)],
+          // FIX: cancelGiveaway expects the giveaway ID, not the secure code
+          [Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${giveawayId}`)],
           [Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine')],
         ])
       );
@@ -455,5 +462,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-                        }
-                                                                                                        
+      }
+                
