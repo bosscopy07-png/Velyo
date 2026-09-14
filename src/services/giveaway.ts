@@ -16,7 +16,6 @@ class GiveawayService {
     const amountPerUser = data.totalAmount / data.maxClaimers;
 
     // Pre-check with a CLEAR error: shows exact asset, have vs need.
-    // (lockFunds alone throws a generic "Insufficient balance".)
     const balance = await prisma.balance.findUnique({
       where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
     });
@@ -97,26 +96,28 @@ class GiveawayService {
         return { success: false, reason: 'Giveaway is full' };
       }
 
-      // Atomic increment using raw query for true concurrency safety
-      const result = await prisma.$queryRaw<{ claimed_count: number }[]>`
+      // Atomic increment using raw query for true concurrency safety.
+      // NOTE: Prisma created camelCase columns (the schema has no @map on these
+      // fields), so they MUST be double-quoted in raw SQL.
+      const result = await prisma.$queryRaw<{ claimedCount: number }[]>`
         UPDATE giveaways
-        SET claimed_count = claimed_count + 1,
+        SET "claimedCount" = "claimedCount" + 1,
             status = CASE
-              WHEN claimed_count + 1 >= max_claimers THEN 'FULL'::"GiveawayStatus"
+              WHEN "claimedCount" + 1 >= "maxClaimers" THEN 'FULL'::"GiveawayStatus"
               ELSE status
             END,
-            updated_at = NOW()
+            "updatedAt" = NOW()
         WHERE id = ${giveawayId}
-          AND claimed_count < max_claimers
+          AND "claimedCount" < "maxClaimers"
           AND status = 'ACTIVE'
-        RETURNING claimed_count
+        RETURNING "claimedCount"
       `;
 
       if (!result || result.length === 0) {
         return { success: false, reason: 'Giveaway just filled up' };
       }
 
-      const claimOrder = result[0].claimed_count;
+      const claimOrder = result[0].claimedCount;
 
       await prisma.giveawayClaim.create({
         data: {
@@ -240,4 +241,3 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-                                                 
