@@ -1,6 +1,5 @@
 import { prisma } from '../database';
 import { redis, acquireLock, releaseLock, trackGiveawayView } from './redis';
-import { walletService } from './wallet';
 import { generateSecureCode } from '../utils/validation';
 import { logger } from '../utils/logger';
 import type { AssetSymbol } from '../config';
@@ -14,51 +13,59 @@ class GiveawayService {
     expiresAt?: Date;
   }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number }> {
     const amountPerUser = data.totalAmount / data.maxClaimers;
-
-    // Pre-check with a CLEAR error: shows exact asset, have vs need.
-    const balance = await prisma.balance.findUnique({
-      where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
-    });
-    const available = Number(balance?.availableBalance ?? 0);
-    if (available < data.totalAmount) {
-      throw new Error(
-        `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
-        `need ${data.totalAmount} ${data.asset}. Deposit more ${data.asset} first.`
-      );
-    }
-
-    // Lock funds (available → locked)
-    await walletService.lockFunds(data.creatorId, data.asset, data.totalAmount);
-
     const secureCode = generateSecureCode(20);
-
-    const giveaway = await prisma.giveaway.create({
-      data: {
-        creatorId: data.creatorId,
-        asset: data.asset,
-        totalAmount: data.totalAmount,
-        amountPerUser,
-        maxClaimers: data.maxClaimers,
-        secureCode,
-        expiresAt: data.expiresAt,
-        status: 'ACTIVE',
-      },
-    });
-
-    // Record transaction
     const { hashIdempotencyKey } = await import('../utils/encryption');
-    await prisma.transaction.create({
-      data: {
-        userId: data.creatorId,
-        type: 'GIVEAWAY_CREATED',
-        asset: data.asset,
-        amount: data.totalAmount,
-        fee: 0,
-        netAmount: -data.totalAmount,
-        status: 'CONFIRMED',
-        idempotencyKey: hashIdempotencyKey('giveaway', giveaway.id),
-        metadata: { giveawayId: giveaway.id },
-      },
+
+    // Everything in ONE transaction: lock funds + create giveaway + record tx.
+    // A failure midway now rolls back the lock — no orphaned locked funds.
+    const giveaway = await prisma.$transaction(async (tx) => {
+      const balance = await tx.balance.findUnique({
+        where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
+      });
+      const available = Number(balance?.availableBalance ?? 0);
+      if (available < data.totalAmount) {
+        throw new Error(
+          `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
+          `need ${data.totalAmount} ${data.asset}. Deposit more ${data.asset} first.`
+        );
+      }
+
+      await tx.balance.update({
+        where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
+        data: {
+          availableBalance: { decrement: data.totalAmount },
+          lockedBalance: { increment: data.totalAmount },
+        },
+      });
+
+      const g = await tx.giveaway.create({
+        data: {
+          creatorId: data.creatorId,
+          asset: data.asset,
+          totalAmount: data.totalAmount,
+          amountPerUser,
+          maxClaimers: data.maxClaimers,
+          secureCode,
+          expiresAt: data.expiresAt,
+          status: 'ACTIVE',
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          userId: data.creatorId,
+          type: 'GIVEAWAY_CREATED',
+          asset: data.asset,
+          amount: data.totalAmount,
+          fee: 0,
+          netAmount: -data.totalAmount,
+          status: 'CONFIRMED',
+          idempotencyKey: hashIdempotencyKey('giveaway', g.id),
+          metadata: { giveawayId: g.id },
+        },
+      });
+
+      return g;
     });
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset})`);
@@ -97,8 +104,8 @@ class GiveawayService {
       }
 
       // Atomic increment using raw query for true concurrency safety.
-      // NOTE: Prisma created camelCase columns (the schema has no @map on these
-      // fields), so they MUST be double-quoted in raw SQL.
+      // NOTE: Prisma created camelCase columns (no @map in schema), so they
+      // MUST be double-quoted in raw SQL.
       const result = await prisma.$queryRaw<{ claimedCount: number }[]>`
         UPDATE giveaways
         SET "claimedCount" = "claimedCount" + 1,
@@ -241,3 +248,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
+                
