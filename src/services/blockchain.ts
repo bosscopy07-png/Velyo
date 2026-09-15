@@ -17,10 +17,14 @@ class BlockchainService {
   private currentProvider: ethers.JsonRpcProvider;
   private providerIndex: number = 0;
 
+  /**
+   * Per-address send queue. ALL outgoing transactions from one wallet are
+   * serialized through this queue — that prevents "gapped nonce" rejections
+   * when a gas-seed tx and a payout tx fire in quick succession.
+   */
+  private sendQueues = new Map<string, Promise<{ hash: string; nonce: number }>>();
+
   constructor() {
-    // staticNetwork prevents ethers v6 from probing the RPC at construction/
-    // first-use time (the "failed to detect network... retry in 1s" loop that
-    // was blocking bot startup). The chainId is fixed by config.
     const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
 
     this.primaryProvider = new ethers.JsonRpcProvider(
@@ -53,11 +57,6 @@ class BlockchainService {
     }, 30000);
   }
 
-  /**
-   * Public accessor used by deposit monitoring and other services that need
-   * a working provider. Delegates to the private failover logic so the
-   * provider-selection rules stay in one place.
-   */
   async getProvider(): Promise<ethers.JsonRpcProvider> {
     return this.resolveProvider();
   }
@@ -76,7 +75,6 @@ class BlockchainService {
       }
     }
 
-    // Try fallbacks
     for (let i = 0; i < this.fallbackProviders.length; i++) {
       const idx = (this.providerIndex + i) % this.fallbackProviders.length;
       try {
@@ -106,6 +104,10 @@ class BlockchainService {
     return (await contract.balanceOf(address)) as bigint;
   }
 
+  /**
+   * Serialized send: every tx from the same wallet waits for the previous one
+   * to at least broadcast. Returns once the tx is accepted by the node.
+   */
   async sendTransaction(
     encryptedPrivateKey: string,
     to: string,
@@ -113,45 +115,75 @@ class BlockchainService {
     asset: AssetSymbol,
     idempotencyKey: string
   ): Promise<{ hash: string; nonce: number }> {
-    const provider = await this.resolveProvider();
     const { decrypt } = await import('../utils/encryption');
     const privateKey = decrypt(encryptedPrivateKey);
-    const wallet = new ethers.Wallet(privateKey, provider);
+    const wallet = new ethers.Wallet(privateKey);
 
-    let tx: ethers.TransactionResponse;
-    const nonce = await this.getNextNonce(wallet.address);
-
-    if (asset === 'BNB') {
-      tx = await wallet.sendTransaction({
-        to,
-        value: amount,
-        nonce,
-      });
-    } else {
-      const assetConfig = ASSETS[asset];
-      if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
-
-      const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, wallet);
-      tx = (await contract.transfer(to, amount, { nonce })) as ethers.TransactionResponse;
-    }
-
-    return { hash: tx.hash, nonce: tx.nonce };
+    const prev = this.sendQueues.get(wallet.address) ?? Promise.resolve({ hash: '', nonce: 0 });
+    const run = prev
+      .catch(() => {})
+      .then(() => this.doSend(wallet, to, amount, asset));
+    this.sendQueues.set(wallet.address, run);
+    return run;
   }
 
-  private nonceCache = new Map<string, number>();
+  private async doSend(
+    wallet: ethers.Wallet,
+    to: string,
+    amount: bigint,
+    asset: AssetSymbol
+  ): Promise<{ hash: string; nonce: number }> {
+    const provider = await this.resolveProvider();
+    const signer = wallet.connect(provider);
+    const nonce = await this.getNextNonce(wallet.address, provider);
+
+    try {
+      const tx = await this.broadcast(signer, to, amount, asset, nonce);
+      return { hash: tx.hash, nonce: tx.nonce };
+    } catch (err) {
+      const msg = ((err as Error).message ?? '').toLowerCase();
+      const isNonceError =
+        msg.includes('gapped') ||
+        msg.includes('nonce') ||
+        msg.includes('already known') ||
+        msg.includes('replacement transaction');
+
+      if (isNonceError) {
+        logger.warn(`Nonce rejection from ${wallet.address} — refetching and retrying once.`);
+        await new Promise((r) => setTimeout(r, 4000));
+        const fresh = await this.getNextNonce(wallet.address, provider);
+        const tx = await this.broadcast(signer, to, amount, asset, fresh);
+        return { hash: tx.hash, nonce: tx.nonce };
+      }
+      throw err;
+    }
+  }
+
+  private async broadcast(
+    signer: ethers.Wallet,
+    to: string,
+    amount: bigint,
+    asset: AssetSymbol,
+    nonce: number
+  ): Promise<ethers.TransactionResponse> {
+    if (asset === 'BNB') {
+      return await signer.sendTransaction({ to, value: amount, nonce });
+    }
+
+    const assetConfig = ASSETS[asset];
+    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
+
+    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, signer);
+    return (await contract.transfer(to, amount, { nonce })) as ethers.TransactionResponse;
+  }
 
   /**
-   * Returns the next usable nonce for `address`, preferring the local cache
-   * when it is ahead of the network (avoids nonce gaps during rapid sends).
+   * Live pending nonce — no in-memory cache. Combined with the send queue
+   * this is race-free: our previous tx is visible in the mempool before the
+   * next one asks for a nonce.
    */
-  private async getNextNonce(address: string): Promise<number> {
-    const provider = await this.resolveProvider();
-    const networkNonce = await provider.getTransactionCount(address, 'pending');
-    const cached = this.nonceCache.get(address);
-
-    const nextNonce = cached !== undefined && cached >= networkNonce ? cached : networkNonce;
-    this.nonceCache.set(address, nextNonce + 1);
-    return nextNonce;
+  private async getNextNonce(address: string, provider: ethers.JsonRpcProvider): Promise<number> {
+    return await provider.getTransactionCount(address, 'pending');
   }
 
   async getTransactionReceipt(hash: string): Promise<ethers.TransactionReceipt | null> {
@@ -169,7 +201,6 @@ class BlockchainService {
 
     while (Date.now() - startTime < timeoutMs) {
       const receipt = await provider.getTransactionReceipt(hash);
-      // Compare the awaited numeric confirmation count, not a function/promise.
       if (receipt && (await receipt.confirmations()) >= requiredConfirmations) {
         return receipt;
       }
@@ -193,11 +224,7 @@ class BlockchainService {
     const provider = await this.resolveProvider();
 
     if (asset === 'BNB') {
-      return await provider.estimateGas({
-        from,
-        to,
-        value: amount,
-      });
+      return await provider.estimateGas({ from, to, value: amount });
     }
 
     const assetConfig = ASSETS[asset];
@@ -220,7 +247,7 @@ class BlockchainService {
     fromBlock: number,
     toBlock: number
   ): Promise<Array<{ from: string; to: string; amount: bigint; txHash: string; blockNumber: number }>> {
-    if (asset === 'BNB') return []; // Native transfers need a different approach
+    if (asset === 'BNB') return [];
 
     const provider = await this.resolveProvider();
     const assetConfig = ASSETS[asset];
@@ -242,4 +269,4 @@ class BlockchainService {
 }
 
 export const blockchain = new BlockchainService();
-    
+                             
