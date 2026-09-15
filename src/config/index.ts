@@ -21,6 +21,10 @@ const envSchema = z.object({
   
   WALLET_ENCRYPTION_KEY: z.string().min(32),
   PLATFORM_FEE_WALLET: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  // Encrypted private key of the operator/admin wallet (same wallet as
+  // PLATFORM_FEE_WALLET): supplies tiny BNB gas at giveaway creation and
+  // during fee sweeps.
+  OPERATOR_WALLET_KEY: z.string().optional(),
   
   PLATFORM_FEE_PERCENT: z.string().default('1.0').transform(Number),
   MINIMUM_AMOUNT_USD: z.string().default('0.1').transform(Number),
