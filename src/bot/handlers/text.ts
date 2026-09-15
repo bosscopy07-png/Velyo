@@ -12,6 +12,11 @@ import { isValidEVMAddress, normalizeAddress, isValidAmount, hashIdempotencyKey 
 import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
 
+/** 1% creation fee (matches PLATFORM_FEE_PERCENT default) for display purposes */
+function displayFee(amount: number): number {
+  return config.ENABLE_FEES ? Number((amount * (config.PLATFORM_FEE_PERCENT / 100)).toFixed(6)) : 0;
+}
+
 export function registerTextHandlers(bot: any): void {
   bot.on('text', async (ctx: Context) => {
     const from = ctx.from;
@@ -21,12 +26,9 @@ export function registerTextHandlers(bot: any): void {
     const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
     const session = await getUserSession(telegramId);
 
-    // Always delete the user's message — the bot edits its own main message instead
     try {
       await ctx.deleteMessage();
-    } catch {
-      // message already gone or not deletable — non-fatal
-    }
+    } catch {}
 
     if (!session?.state) {
       return;
@@ -65,6 +67,8 @@ export function registerTextHandlers(bot: any): void {
             maxClaimers: 1,
           });
 
+          const fee = displayFee(amount);
+          const total = amount + fee;
           const usdValue = await pricing.convertToUSD(asset, amount);
           const ngnValue = await pricing.convertToNGN(asset, amount);
 
@@ -75,6 +79,7 @@ export function registerTextHandlers(bot: any): void {
             `<b>Total Reward:</b> ${amount} ${asset}\n` +
             `<b>Claimers:</b> 1 User\n` +
             `<b>Reward Per User:</b> ${amount} ${asset}\n` +
+            (fee > 0 ? `<b>Platform Fee (1%):</b> ${fee} ${asset}\n<b>Total Cost:</b> ${total.toFixed(6)} ${asset}\n` : '') +
             `<b>Estimated Value:</b> ${pricing.formatUSD(usdValue)}\n` +
             `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n\n` +
             `<b>Status:</b> Ready`,
@@ -168,7 +173,7 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === REDEEM CODE (flow kept for compatibility; no UI button anymore) ===
+        // === REDEEM CODE ===
         case 'redeem_code': {
           const code = text.trim().toUpperCase();
           const user = await prisma.user.findUnique({ where: { telegramId } });
@@ -183,22 +188,18 @@ export function registerTextHandlers(bot: any): void {
             await editMainMessage(ctx, `${e('warning')} Invalid code. Please check and try again.`, backKeyboard('main'));
             return;
           }
-
           if (redeemCode.status !== 'ACTIVE') {
             await editMainMessage(ctx, `${e('warning')} This code is no longer active.`, backKeyboard('main'));
             return;
           }
-
           if (redeemCode.expiresAt && redeemCode.expiresAt < new Date()) {
             await editMainMessage(ctx, `${e('warning')} This code has expired.`, backKeyboard('main'));
             return;
           }
-
           if (redeemCode.redemptions.length >= redeemCode.maxRedemptions) {
             await editMainMessage(ctx, `${e('warning')} This code has reached its maximum redemptions.`, backKeyboard('main'));
             return;
           }
-
           const alreadyRedeemed = redeemCode.redemptions.some((r) => r.userId === user.id);
           if (alreadyRedeemed) {
             await editMainMessage(ctx, `${e('warning')} You already redeemed this code.`, backKeyboard('main'));
@@ -215,11 +216,7 @@ export function registerTextHandlers(bot: any): void {
             });
             await tx.balance.upsert({
               where: { userId_asset: { userId: user.id, asset: redeemCode.asset } },
-              create: {
-                userId: user.id,
-                asset: redeemCode.asset,
-                availableBalance: Number(redeemCode.rewardAmount),
-              },
+              create: { userId: user.id, asset: redeemCode.asset, availableBalance: Number(redeemCode.rewardAmount) },
               update: { availableBalance: { increment: Number(redeemCode.rewardAmount) } },
             });
             await tx.transaction.create({
@@ -267,8 +264,6 @@ export function registerTextHandlers(bot: any): void {
             `<b>Network:</b> BNB Smart Chain\n` +
             `<b>Asset:</b> ${asset} BEP20\n` +
             `<b>Address:</b> <code>${normalized}</code>`,
-            // NOTE: callback_data has a 64-byte limit — the address is stored
-            // in the session, NOT embedded in the button payload.
             Markup.inlineKeyboard([
               [Markup.button.callback(`${eb('check')} Confirm Address`, `payout:confirm:${claimId}`)],
               [Markup.button.callback(`${eb('edit')} Change Address`, `payout:change:${claimId}`)],
@@ -338,7 +333,6 @@ export function registerTextHandlers(bot: any): void {
             );
             return;
           }
-
           if (!target.wallet) {
             await editMainMessage(
               ctx,
@@ -405,6 +399,8 @@ export function registerTextHandlers(bot: any): void {
       expiryHours,
     });
 
+    const fee = displayFee(amount);
+    const total = amount + fee;
     const usdValue = await pricing.convertToUSD(asset, amount);
     const ngnValue = await pricing.convertToNGN(asset, amount);
     const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
@@ -415,6 +411,7 @@ export function registerTextHandlers(bot: any): void {
       `<b>Total Amount:</b> ${amount} ${asset}\n` +
       `<b>Total Claimers:</b> ${maxClaimers}\n` +
       `<b>Reward Per User:</b> ${amountPerUser.toFixed(6)} ${asset}\n` +
+      (fee > 0 ? `<b>Platform Fee (1%):</b> ${fee} ${asset}\n<b>Total Cost:</b> ${total.toFixed(6)} ${asset}\n` : '') +
       `<b>Estimated Reward:</b> ≈ ${pricing.formatUSD(usdPerUser)} per user\n` +
       `<b>Total Value:</b> ≈ ${pricing.formatUSD(usdValue)}\n` +
       `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n` +
@@ -428,9 +425,7 @@ export function registerTextHandlers(bot: any): void {
     await ctx.answerCbQuery();
   });
 
-  // === PAYOUT CONFIRMATION ===
-  // The address is read from the session (stored when the user sent it) —
-  // embedding it in callback_data would exceed Telegram's 64-byte button limit.
+  // === PAYOUT CONFIRMATION (address comes from the session — 64-byte button limit) ===
   bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
@@ -494,7 +489,6 @@ export function registerTextHandlers(bot: any): void {
       where: { id: claimId },
       include: { giveaway: true },
     });
-
     if (!claim) return;
 
     await setUserSession(from.id.toString(), {
@@ -517,5 +511,4 @@ export function registerTextHandlers(bot: any): void {
     await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
-            }
-            
+}
