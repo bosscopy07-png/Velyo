@@ -1,8 +1,13 @@
 import { prisma } from '../database';
 import { redis, acquireLock, releaseLock, trackGiveawayView } from './redis';
+import { blockchain } from './blockchain';
+import { config } from '../config';
 import { generateSecureCode } from '../utils/validation';
 import { logger } from '../utils/logger';
 import type { AssetSymbol } from '../config';
+
+/** Exact gas for one BEP20 payout (~0.0000017 BNB) + safety rounding = 0.000002 */
+const GAS_SEED_PER_PAYOUT = 2000000000n; // wei
 
 class GiveawayService {
   async createGiveaway(data: {
@@ -16,25 +21,32 @@ class GiveawayService {
     const secureCode = generateSecureCode(20);
     const { hashIdempotencyKey } = await import('../utils/encryption');
 
-    // Everything in ONE transaction: lock funds + create giveaway + record tx.
-    // A failure midway now rolls back the lock — no orphaned locked funds.
+    // Platform fee: 1% of the total, charged at creation (accumulates in the
+    // creator's custodial wallet for the admin fee sweep — never forwarded here).
+    const fee = config.ENABLE_FEES
+      ? Number((data.totalAmount * (config.PLATFORM_FEE_PERCENT / 100)).toFixed(6))
+      : 0;
+    const totalCost = data.totalAmount + fee;
+
+    // Everything in ONE transaction: lock funds + charge fee + create giveaway.
     const giveaway = await prisma.$transaction(async (tx) => {
       const balance = await tx.balance.findUnique({
         where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
       });
       const available = Number(balance?.availableBalance ?? 0);
-      if (available < data.totalAmount) {
+      if (available < totalCost) {
         throw new Error(
           `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
-          `need ${data.totalAmount} ${data.asset}. Deposit more ${data.asset} first.`
+          `need ${totalCost.toFixed(6)} ${data.asset} (amount ${data.totalAmount} + fee ${fee.toFixed(6)}). ` +
+          `Deposit more ${data.asset} first.`
         );
       }
 
       await tx.balance.update({
         where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
         data: {
-          availableBalance: { decrement: data.totalAmount },
-          lockedBalance: { increment: data.totalAmount },
+          availableBalance: { decrement: totalCost },
+          lockedBalance: { increment: data.totalAmount }, // only the reward is locked
         },
       });
 
@@ -57,7 +69,7 @@ class GiveawayService {
           type: 'GIVEAWAY_CREATED',
           asset: data.asset,
           amount: data.totalAmount,
-          fee: 0,
+          fee,
           netAmount: -data.totalAmount,
           status: 'CONFIRMED',
           idempotencyKey: hashIdempotencyKey('giveaway', g.id),
@@ -65,11 +77,73 @@ class GiveawayService {
         },
       });
 
+      if (fee > 0) {
+        const feeTx = await tx.transaction.create({
+          data: {
+            userId: data.creatorId,
+            type: 'PLATFORM_FEE',
+            asset: data.asset,
+            amount: fee,
+            fee: 0,
+            netAmount: fee,
+            status: 'CONFIRMED',
+            metadata: { giveawayId: g.id, kind: 'creation_fee' },
+            idempotencyKey: hashIdempotencyKey('creation-fee', g.id),
+          },
+        });
+        await tx.platformFee.create({
+          data: {
+            transactionId: feeTx.id,
+            asset: data.asset,
+            amount: fee,
+            feeWallet: config.PLATFORM_FEE_WALLET,
+            // sweptAt stays null → appears in the admin Fee Sweep
+          },
+        });
+      }
+
       return g;
     });
 
-    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset})`);
+    // Seed exactly enough BNB for each expected claim's payout gas.
+    // One of only TWO places BNB ever moves to a user wallet.
+    await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers);
+
+    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
+  }
+
+  /**
+   * Sends the creator's wallet just enough BNB to cover payout gas
+   * (0.000002 BNB per expected claimer). Snapshot-style: only tops up the deficit.
+   */
+  private async seedPayoutGas(creatorId: string, giveawayId: string, claimers: number): Promise<void> {
+    try {
+      const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+      if (!wallet) return;
+
+      const needed = BigInt(claimers) * GAS_SEED_PER_PAYOUT;
+      const current = await blockchain.getBalance(wallet.address, 'BNB');
+      if (current >= needed) return;
+
+      if (!config.OPERATOR_WALLET_KEY) {
+        logger.warn(`OPERATOR_WALLET_KEY not set — cannot seed gas for giveaway ${giveawayId}`);
+        return;
+      }
+
+      const { hashIdempotencyKey } = await import('../utils/encryption');
+      const { hash } = await blockchain.sendTransaction(
+        config.OPERATOR_WALLET_KEY,
+        wallet.address,
+        needed - current + GAS_SEED_PER_PAYOUT, // deficit + one payout buffer
+        'BNB',
+        hashIdempotencyKey('create-seed', giveawayId)
+      );
+      logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash}`);
+    } catch (err) {
+      // Non-fatal: giveaway exists, payout may fail later without gas
+      logger.error(`Gas seed failed for giveaway ${giveawayId}: ${(err as Error).message}`);
+    }
   }
 
   async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
@@ -103,9 +177,7 @@ class GiveawayService {
         return { success: false, reason: 'Giveaway is full' };
       }
 
-      // Atomic increment using raw query for true concurrency safety.
-      // NOTE: Prisma created camelCase columns (no @map in schema), so they
-      // MUST be double-quoted in raw SQL.
+      // Atomic increment — Prisma made camelCase columns, quote them in raw SQL
       const result = await prisma.$queryRaw<{ claimedCount: number }[]>`
         UPDATE giveaways
         SET "claimedCount" = "claimedCount" + 1,
@@ -165,6 +237,7 @@ class GiveawayService {
       return { success: false, reason: 'Cannot cancel: payouts already sent' };
     }
 
+    // Fee is non-refundable (platform earned it at creation); refund unclaimed reward only
     const unclaimedAmount = Number(giveaway.totalAmount) -
       (giveaway.claims.filter((c) => c.status === 'PAID').length * Number(giveaway.amountPerUser));
 
@@ -248,4 +321,3 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-                
