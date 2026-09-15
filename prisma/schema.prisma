@@ -185,6 +185,7 @@ model PlatformFee {
   asset         String
   amount        Decimal     @db.Decimal(36, 18)
   feeWallet     String
+  sweptAt       DateTime?   // ← NEW: set when the admin sweep collects this fee
   createdAt     DateTime    @default(now())
 
   @@index([transactionId])
