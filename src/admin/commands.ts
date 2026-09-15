@@ -6,8 +6,14 @@ import { e, eb } from '../utils/emoji';
 import { editMainMessage } from '../bot/utils/editMainMessage';
 import { backKeyboard } from '../bot/keyboards/main';
 import { decrypt } from '../utils/encryption';
-import { setUserSession } from '../services/redis';
+import { redis, setUserSession } from '../services/redis';
+import { blockchain } from '../services/blockchain';
+import { config } from '../config';
 import { formatAddress } from '../utils/validation';
+
+/** Exact gas for one BEP20 forward (~0.0000017) + rounding, per your log analysis */
+const SWEEP_GAS_SEED = 2000000000n; // 0.000002 BNB
+const SWEEP_THRESHOLD_USDT = 0.5;
 
 const adminPanelKeyboard = Markup.inlineKeyboard([
   [
@@ -16,7 +22,7 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   ],
   [
     Markup.button.callback(`${eb('chart')} Fees`, 'admin:fees'),
-    Markup.button.callback(`${eb('people')} Broadcast`, 'admin:broadcast'),
+    Markup.button.callback(`${eb('money')} Fee Sweep`, 'admin:sweep'),
   ],
   [
     Markup.button.callback(`${eb('diamond')} Create Code`, 'admin:code:create'),
@@ -60,24 +66,45 @@ export function registerAdminCommands(bot: any): void {
       const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
       text += `@${u.username || 'N/A'} | <code>${u.telegramId}</code> | $${bal.toFixed(2)}\n`;
     }
-    text += `\n<i>Need a user's key? Use 🔑 Recover Key in the admin panel.</i>`;
+    text += `\n<i>Need a user's key? Use 🔒 Recover Key in the admin panel.</i>`;
 
     await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
-  // === KEY RECOVERY FLOW ===
+  // === FEE SWEEP ===
+  bot.action('admin:sweep', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+    await renderSweepDashboard(ctx);
+  });
 
+  bot.action('admin:sweep:run', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery('Sweep started — running in the background.');
+
+    const lock = await redis.set('sweep:running', '1', 'EX', 1800, 'NX');
+    if (!lock) {
+      await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
+      return;
+    }
+
+    try {
+      await runSweep(ctx);
+    } finally {
+      await redis.del('sweep:running');
+    }
+  });
+
+  // === KEY RECOVERY ===
   bot.action('admin:findkey', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-
     await setUserSession(ctx.from!.id.toString(), { state: 'admin_find_key' });
-
     await editMainMessage(
       ctx,
       `${e('lock')} <b>RECOVER USER KEY</b>\n\n` +
       `Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
-      `<i>Every reveal is audit-logged. Only do this when the user explicitly requests recovery.</i>`,
+      `<i>Every reveal is audit-logged.</i>`,
       backKeyboard('admin')
     );
   });
@@ -89,24 +116,19 @@ export function registerAdminCommands(bot: any): void {
     const walletId = (ctx as any).match[1];
     const kind = (ctx as any).match[2];
 
-    const wallet = await prisma.wallet.findUnique({
-      where: { id: walletId },
-      include: { user: true },
-    });
+    const wallet = await prisma.wallet.findUnique({ where: { id: walletId }, include: { user: true } });
     if (!wallet) {
       await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
       return;
     }
 
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
-
     await editMainMessage(
       ctx,
       `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n\n` +
       `User: <code>${wallet.user.telegramId}</code> (@${wallet.user.username || 'N/A'})\n` +
       `Wallet: <code>${formatAddress(wallet.address)}</code>\n\n` +
-      `You are about to display the <b>${label}</b>.\n` +
-      `This action will be written to the audit log.`,
+      `You are about to display the <b>${label}</b>. This will be audit-logged.`,
       Markup.inlineKeyboard([
         [Markup.button.callback(`⚠️ Yes, show the ${label}`, `admin:revealconfirm:${walletId}:${kind}`)],
         [Markup.button.callback(`${eb('back')} Cancel`, 'admin')],
@@ -121,10 +143,7 @@ export function registerAdminCommands(bot: any): void {
     const walletId = (ctx as any).match[1];
     const kind = (ctx as any).match[2];
 
-    const wallet = await prisma.wallet.findUnique({
-      where: { id: walletId },
-      include: { user: true },
-    });
+    const wallet = await prisma.wallet.findUnique({ where: { id: walletId }, include: { user: true } });
     if (!wallet) {
       await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
       return;
@@ -158,16 +177,12 @@ export function registerAdminCommands(bot: any): void {
     logger.warn(`Admin ${ctx.from!.id} revealed ${kind} for wallet ${wallet.address}`);
 
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
-
     await editMainMessage(
       ctx,
       `${e('lock')} <b>${label} — @${wallet.user.username || wallet.user.telegramId}</b>\n\n` +
       `<code>${secret}</code>\n\n` +
-      `⚠️ This was displayed because the user requested recovery. ` +
-      `Never share it in any chat. This access has been logged.`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
-      ])
+      `⚠️ Access has been logged. Never share this in any chat.`,
+      Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
     );
   });
 
@@ -203,9 +218,9 @@ export function registerAdminCommands(bot: any): void {
     let total = 0;
     for (const f of fees) {
       total += Number(f.amount);
-      text += `${f.amount} ${f.asset} | ${f.createdAt.toLocaleDateString()}\n`;
+      text += `${f.amount} ${f.asset} | ${f.createdAt.toLocaleDateString()}${f.sweptAt ? ' | swept' : ' | pending'}\n`;
     }
-    text += `\n<b>Total Collected:</b> $${total.toFixed(2)}`;
+    text += `\n<b>Total Collected:</b> $${total.toFixed(2)}\n<i>Use Fee Sweep to pull pending fees on-chain.</i>`;
 
     await editMainMessage(ctx, text, backKeyboard('admin'));
   });
@@ -216,8 +231,7 @@ export function registerAdminCommands(bot: any): void {
     await editMainMessage(
       ctx,
       `${e('diamond')} <b>CREATE REDEEM CODE</b>\n\n` +
-      `Send a message in this format:\n` +
-      `<code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
+      `Send: <code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
       `Example: <code>VEYLO2026|USDT|10|100|7</code>`,
       backKeyboard('admin')
     );
@@ -226,7 +240,6 @@ export function registerAdminCommands(bot: any): void {
   bot.action('admin:emergency', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-
     await editMainMessage(
       ctx,
       `${e('warning')} <b>EMERGENCY CONTROLS</b>\n\nUse these carefully. All actions are logged.`,
@@ -285,6 +298,122 @@ export function registerAdminCommands(bot: any): void {
       backKeyboard('admin')
     );
   });
+}
+
+// === FEE SWEEP HELPERS ===
+
+async function getUnsweptFees(): Promise<Array<{ userId: string; total: number }>> {
+  const rows = await prisma.platformFee.findMany({
+    where: { sweptAt: null, asset: 'USDT' },
+    include: { transaction: true },
+  });
+  const byUser = new Map<string, number>();
+  for (const r of rows) {
+    const uid = r.transaction.userId;
+    byUser.set(uid, (byUser.get(uid) ?? 0) + Number(r.amount));
+  }
+  return [...byUser.entries()].map(([userId, total]) => ({ userId, total }));
+}
+
+async function renderSweepDashboard(ctx: Context): Promise<void> {
+  const fees = await getUnsweptFees();
+  const eligible = fees.filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
+  const pending = fees.length - eligible.length;
+
+  let text = `${e('money')} <b>FEE SWEEP</b>\n\n`;
+  text += `<b>${eligible.length} user(s)</b> passed $${SWEEP_THRESHOLD_USDT}\n`;
+  text += `<b>${pending} user(s)</b> yet to pass $${SWEEP_THRESHOLD_USDT}\n\n`;
+
+  if (eligible.length > 0) {
+    text += `<b>Ready to pull:</b>\n`;
+    for (const f of eligible.slice(0, 15)) {
+      const u = await prisma.user.findUnique({ where: { id: f.userId } });
+      text += `• @${u?.username || u?.telegramId} — ${f.total.toFixed(4)} USDT\n`;
+    }
+    if (eligible.length > 15) text += `…and ${eligible.length - 15} more\n`;
+  }
+
+  const keyboard = eligible.length > 0
+    ? Markup.inlineKeyboard([
+        [Markup.button.callback(`💰 Pull Out All (${eligible.length})`, 'admin:sweep:run')],
+        [Markup.button.callback(`${eb('back')} Back`, 'admin')],
+      ])
+    : Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Back`, 'admin')]]);
+
+  await editMainMessage(ctx, text, keyboard);
+}
+
+/**
+ * Sweeps one user's accumulated fee USDT.
+ * Snapshot-based: records BNB balance BEFORE seeding, seeds only the tiny
+ * deficit (0.000002 BNB), forwards the fee. The user's own BNB is never touched.
+ */
+async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
+  const wallet = await prisma.wallet.findUnique({ where: { userId } });
+  if (!wallet) throw new Error('no wallet');
+
+  // 1. Snapshot baseline (protects the user's own BNB)
+  const baseline = await blockchain.getBalance(wallet.address, 'BNB');
+
+  // 2. Seed only the deficit of the exact gas amount
+  if (baseline < SWEEP_GAS_SEED) {
+    if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
+    await blockchain.sendTransaction(
+      config.OPERATOR_WALLET_KEY,
+      wallet.address,
+      SWEEP_GAS_SEED - baseline + 500000000n, // deficit + ~0.0000005 buffer
+      'BNB',
+      `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
+    );
+  }
+
+  // 3. Forward the accumulated fee USDT
+  const rawFee = BigInt(Math.floor(amountUSDT * 1e18));
+  const { hash } = await blockchain.sendTransaction(
+    wallet.encryptedPrivateKey,
+    config.PLATFORM_FEE_WALLET,
+    rawFee,
+    'USDT',
+    `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
+  );
+
+  // 4. Mark swept
+  await prisma.platformFee.updateMany({
+    where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
+    data: { sweptAt: new Date() },
+  });
+
+  return hash;
+}
+
+async function runSweep(ctx: Context): Promise<void> {
+  const eligible = (await getUnsweptFees()).filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
+  let done = 0;
+  let failed = 0;
+
+  for (const f of eligible) {
+    try {
+      await sweepOne(f.userId, f.total);
+      done++;
+    } catch (err) {
+      failed++;
+      logger.error(`Sweep failed for user ${f.userId}: ${(err as Error).message}`);
+    }
+    try {
+      await editMainMessage(
+        ctx,
+        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n\nProcessed: ${done + failed}/${eligible.length}\n✅ Done: ${done}\n❌ Failed: ${failed}`,
+        Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
+      );
+    } catch {}
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+
+  await editMainMessage(
+    ctx,
+    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n\nPulled from: ${done} wallet(s)\nFailed: ${failed}`,
+    Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
+  );
 }
 
 async function renderDashboard(ctx: Context): Promise<void> {
@@ -350,5 +479,4 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-      }
-      
+}
