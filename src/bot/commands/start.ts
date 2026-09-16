@@ -177,19 +177,20 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       return;
     }
 
-    await editMainMessage(
-      ctx,
-      `${e('party')} <b>SPOT SECURED!</b>\n\nReward: <b>${giveaway.amountPerUser} ${giveaway.asset}</b>\n\nYour reward will be sent after you provide your ${giveaway.asset} BEP20 address.`,
-      mainKeyboard(false)
-    );
+    const claim = await prisma.giveawayClaim.findUnique({
+      where: { giveawayId_userId: { giveawayId: giveaway.id, userId } },
+    });
 
+    // Set the session BEFORE rendering so the screen and state are atomic
     await setUserSession(ctx.from!.id.toString(), {
       state: 'awaiting_payout_address',
-      claimId: (await prisma.giveawayClaim.findUnique({
-        where: { giveawayId_userId: { giveawayId: giveaway.id, userId } },
-      }))!.id,
+      claimId: claim!.id,
       asset: giveaway.asset,
     });
+
+    // Single clean screen: SPOT SECURED + address prompt + ONLY a Back button.
+    // No main menu to mis-tap while the bot waits for the address.
+    await promptForAddress(ctx, giveaway.asset, claim!.id);
   } catch (err) {
     logger.error('Giveaway deep link error:', err);
     await editMainMessage(ctx, `${e('warning')} Unable to process giveaway claim.`, mainKeyboard(false));
@@ -197,9 +198,9 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
 }
 
 /**
- * Address prompt — shows ONLY a Back button. The shared editMainMessage
- * helper clears any stale keyboard when one isn't provided, but here we
- * pass Back explicitly so users have an escape hatch mid-flow.
+ * Address prompt — SPOT SECURED celebration + instructions with ONLY a Back
+ * button. Stale keyboards are cleared by editMainMessage when none is given,
+ * but we pass Back explicitly so users have an escape hatch mid-flow.
  */
 async function promptForAddress(ctx: Context, asset: string, claimId: string): Promise<void> {
   await setUserSession(ctx.from!.id.toString(), {
@@ -210,9 +211,12 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
 
   await editMainMessage(
     ctx,
+    `${e('party')} <b>SPOT SECURED!</b>\n\n` +
+    `Reward: <b>${asset}</b> payout pending.\n\n` +
     `${e('deposit')} <b>SEND YOUR ${asset} BEP20 WALLET ADDRESS</b>\n\n` +
     `Type or paste the address below.\n\n` +
     `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
   );
 }
+  
