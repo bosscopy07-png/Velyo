@@ -22,6 +22,10 @@ function isNotModifiedError(err: unknown): boolean {
  *   3. delete + send new    (ONLY when editing is genuinely impossible)
  *
  * "message is not modified" counts as SUCCESS at every step.
+ *
+ * IMPORTANT: an edit WITHOUT reply_markup leaves old buttons in place.
+ * When no keyboard is provided we pass an EMPTY keyboard so stale buttons
+ * are always cleared.
  */
 export async function editMainMessage(
   ctx: Context,
@@ -40,12 +44,15 @@ export async function editMainMessage(
     return;
   }
 
+  // Empty inline keyboard clears existing buttons; provided keyboard wins
+  const markup = (keyboard?.reply_markup ?? { inline_keyboard: [] }) as any;
+
   // No main message on record — nothing to edit, must create one
   if (!user?.mainMessageId) {
     const msg = await ctx.telegram.sendPhoto(chatId, VEYLO_IMAGE, {
       caption,
       parse_mode: 'HTML',
-      reply_markup: keyboard?.reply_markup as any,
+      reply_markup: markup,
     });
     if (user) {
       await prisma.user.update({
@@ -65,7 +72,7 @@ export async function editMainMessage(
       messageId,
       undefined,
       caption,
-      { parse_mode: 'HTML', reply_markup: keyboard?.reply_markup as any }
+      { parse_mode: 'HTML', reply_markup: markup }
     );
     return;
   } catch (err) {
@@ -80,7 +87,7 @@ export async function editMainMessage(
       messageId,
       undefined,
       { type: 'photo', media: VEYLO_IMAGE, caption, parse_mode: 'HTML' },
-      { reply_markup: keyboard?.reply_markup as any }
+      { reply_markup: markup }
     );
     return;
   } catch (err) {
@@ -88,7 +95,7 @@ export async function editMainMessage(
     logger.warn(`editMainMessage: media edit failed for ${telegramId} (msg ${messageId}): ${(err as any)?.response?.description ?? (err as Error).message}`);
   }
 
-  // 3. Editing genuinely impossible — delete old, send new, remember ID
+  // 3. Editing genuinely impossible — delete old, send new, remember the new ID
   logger.warn(`editMainMessage: falling back to delete+resend for ${telegramId} (msg ${messageId})`);
   try {
     await ctx.telegram.deleteMessage(chatId, messageId);
@@ -100,7 +107,7 @@ export async function editMainMessage(
     const msg = await ctx.telegram.sendPhoto(chatId, VEYLO_IMAGE, {
       caption,
       parse_mode: 'HTML',
-      reply_markup: keyboard?.reply_markup as any,
+      reply_markup: markup,
     });
     await prisma.user.update({
       where: { id: user.id },
@@ -109,5 +116,5 @@ export async function editMainMessage(
   } catch (err) {
     logger.error('editMainMessage: failed to send replacement message:', err);
   }
-  }
-    
+      }
+      
