@@ -2,7 +2,7 @@ import { Context } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { clearUserSession, setUserSession } from '../../services/redis';
-import { mainKeyboard } from '../keyboards/main';
+import { mainKeyboard, backKeyboard } from '../keyboards/main';
 import { formatWelcomeMessage } from '../messages';
 import { editMainMessage, VEYLO_IMAGE } from '../utils/editMainMessage';
 import { logger } from '../../utils/logger';
@@ -137,9 +137,13 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         );
       } else if (existingClaim.status === 'ADDRESS_CONFIRMED' || existingClaim.status === 'QUEUED' || existingClaim.status === 'PROCESSING') {
         await editMainMessage(ctx, `${e('clock')} Your reward is being processed. Please wait.`, mainKeyboard(false));
-      } else if (existingClaim.status === 'RESERVED' || existingClaim.status === 'ADDRESS_PENDING') {
-        // Crashed/interrupted before payout was queued — let the user RESUME
-        // by submitting their address again. (Was a dead-end "already secured".)
+      } else if (
+        existingClaim.status === 'RESERVED' ||
+        existingClaim.status === 'ADDRESS_PENDING' ||
+        existingClaim.status === 'FAILED'
+      ) {
+        // Interrupted before payout completed — let the user RESUME by
+        // submitting their address again (was a dead-end before).
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
       } else {
         await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, mainKeyboard(false));
@@ -175,7 +179,7 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
 
     await editMainMessage(
       ctx,
-      `${e('party')} <b>SPOT SECURED!</b>\n\nReward: <b>${giveaway.amountPerUser} ${giveaway.asset}</b>\n\nYour reward will be sent after you provide your ${giveaway.asset} BEP20 address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
+      `${e('party')} <b>SPOT SECURED!</b>\n\nReward: <b>${giveaway.amountPerUser} ${giveaway.asset}</b>\n\nYour reward will be sent after you provide your ${giveaway.asset} BEP20 address.`,
       mainKeyboard(false)
     );
 
@@ -192,6 +196,11 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
   }
 }
 
+/**
+ * Address prompt — shows ONLY a Back button. The shared editMainMessage
+ * helper clears any stale keyboard when one isn't provided, but here we
+ * pass Back explicitly so users have an escape hatch mid-flow.
+ */
 async function promptForAddress(ctx: Context, asset: string, claimId: string): Promise<void> {
   await setUserSession(ctx.from!.id.toString(), {
     state: 'awaiting_payout_address',
@@ -201,7 +210,9 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
 
   await editMainMessage(
     ctx,
-    `📥 Send your ${asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
-    { reply_markup: undefined }
+    `${e('deposit')} <b>SEND YOUR ${asset} BEP20 WALLET ADDRESS</b>\n\n` +
+    `Type or paste the address below.\n\n` +
+    `⚠️ Must support BNB Smart Chain (BEP20)`,
+    backKeyboard('main')
   );
-  }
+}
