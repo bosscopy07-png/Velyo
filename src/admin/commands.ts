@@ -11,8 +11,8 @@ import { blockchain } from '../services/blockchain';
 import { config } from '../config';
 import { formatAddress } from '../utils/validation';
 
-/** 0.000002 BNB = 2×10^15 wei (NOT 2×10^9 — 10^18 wei per BNB) */
-const SWEEP_GAS_SEED = 2000000000000000n;
+/** 0.000002 BNB = 2×10^12 wei (2,000,000,000,000) */
+const SWEEP_GAS_SEED = 2000000000000n;
 const SWEEP_THRESHOLD_USDT = 0.5;
 
 const adminPanelKeyboard = Markup.inlineKeyboard([
@@ -359,7 +359,7 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
     await blockchain.sendTransaction(
       config.OPERATOR_WALLET_KEY,
       wallet.address,
-      SWEEP_GAS_SEED - baseline + 500000000000000n, // deficit + ~0.0000005 buffer
+      SWEEP_GAS_SEED - baseline + 500000000000n, // deficit + 5×10^11 wei (0.0000005) buffer
       'BNB',
       `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
     );
@@ -475,5 +475,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-      }
-    
+  }
+                                                
