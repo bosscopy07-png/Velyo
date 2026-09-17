@@ -36,7 +36,7 @@ export function registerTextHandlers(bot: any): void {
 
     try {
       switch (session.state) {
-        // === GIVEAWAY SINGLE: AMOUNT (asset already chosen via buttons) ===
+        // === GIVEAWAY SINGLE: AMOUNT ===
         case 'giveaway_single_amount': {
           const asset = ((session as any).asset || 'USDT') as string;
           const amountStr = text.trim().split(' ')[0];
@@ -44,7 +44,7 @@ export function registerTextHandlers(bot: any): void {
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Invalid amount for ${asset}. Please enter a valid number.\n\nExample: <code>10</code>`,
+              `${e('warning')} <b>INVALID AMOUNT</b>\n\n${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\nEnter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -54,7 +54,7 @@ export function registerTextHandlers(bot: any): void {
           if (amount <= 0) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Amount must be greater than 0.`,
+              `${e('warning')} <b>AMOUNT TOO SMALL</b>\n\nAmount must be greater than 0.`,
               backKeyboard('giveaway')
             );
             return;
@@ -74,15 +74,19 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n\n` +
-            `<b>Asset:</b> ${asset}\n` +
-            `<b>Total Reward:</b> ${amount} ${asset}\n` +
-            `<b>Claimers:</b> 1 User\n` +
-            `<b>Reward Per User:</b> ${amount} ${asset}\n` +
-            (fee > 0 ? `<b>Platform Fee (1%):</b> ${fee} ${asset}\n<b>Total Cost:</b> ${total.toFixed(6)} ${asset}\n` : '') +
-            `<b>Estimated Value:</b> ${pricing.formatUSD(usdValue)}\n` +
-            `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n\n` +
-            `<b>Status:</b> Ready`,
+            `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('coin')} Asset: <b>${asset}</b>\n` +
+            `${e('gift')} Total Reward: <b>${amount} ${asset}</b>\n` +
+            `${e('person')} Claimers: <b>1 User</b>\n` +
+            `${e('star')} Reward Per User: <b>${amount} ${asset}</b>\n` +
+            (fee > 0
+              ? `${e('card')} Platform Fee (1%): <b>${fee} ${asset}</b>\n` +
+                `${e('money')} Total Cost: <b>${total.toFixed(6)} ${asset}</b>\n`
+              : '') +
+            `${e('chart')} Estimated Value: <b>${pricing.formatUSD(usdValue)}</b>\n` +
+            `${e('naira')} Estimated Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n\n` +
+            `${e('check')} <b>Status: Ready</b>`,
             confirmCancelKeyboard(
               `giveaway:confirm:single|${asset}|${amount}|1|0`,
               'giveaway'
@@ -91,7 +95,7 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === GIVEAWAY MULTI: AMOUNT (asset already chosen via buttons) ===
+        // === GIVEAWAY MULTI: AMOUNT ===
         case 'giveaway_multi_amount': {
           const asset = ((session as any).asset || 'USDT') as string;
           const amountStr = text.trim().split(' ')[0];
@@ -99,7 +103,7 @@ export function registerTextHandlers(bot: any): void {
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Invalid amount for ${asset}. Please enter a valid number.\n\nExample: <code>10</code>`,
+              `${e('warning')} <b>INVALID AMOUNT</b>\n\nEnter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -109,7 +113,7 @@ export function registerTextHandlers(bot: any): void {
           if (amount <= 0) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Amount must be greater than 0.`,
+              `${e('warning')} <b>AMOUNT TOO SMALL</b>\n\nAmount must be greater than 0.`,
               backKeyboard('giveaway')
             );
             return;
@@ -123,9 +127,12 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('people')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n\n` +
-            `Asset: <b>${asset}</b> | Total: <b>${amount} ${asset}</b>\n\n` +
-            `How many people should claim this giveaway?\n\nEnter a number (e.g., 5)`,
+            `${e('people')} <b>MULTIPLE CLAIM GIVEAWAY</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('coin')} Asset: <b>${asset}</b>\n` +
+            `${e('gift')} Total Pool: <b>${amount} ${asset}</b>\n\n` +
+            `${e('person')} How many people should claim this giveaway?\n\n` +
+            `${e('edit')} Enter a number (e.g., <code>5</code>)`,
             backKeyboard('giveaway:multiple')
           );
           break;
@@ -137,7 +144,7 @@ export function registerTextHandlers(bot: any): void {
           if (isNaN(claimers) || claimers < 1) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Please enter a valid number of claimers.`,
+              `${e('warning')} <b>INVALID NUMBER</b>\n\nPlease enter a valid number of claimers.`,
               backKeyboard('giveaway:multiple')
             );
             return;
@@ -160,7 +167,12 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('clock')} <b>SELECT EXPIRY</b>\n\nTotal: ${amount} ${asset} | ${claimers} claimers | ${amountPerUser.toFixed(6)} ${asset} each`,
+            `${e('clock')} <b>SELECT EXPIRY</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('gift')} Total: <b>${amount} ${asset}</b>\n` +
+            `${e('people')} Claimers: <b>${claimers}</b>\n` +
+            `${e('star')} Each gets: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n\n` +
+            `${e('clock')} How long should the giveaway run?`,
             Markup.inlineKeyboard([
               ...buttons.reduce((rows: any[][], btn, i) => {
                 if (i % 2 === 0) rows.push([btn]);
@@ -185,24 +197,24 @@ export function registerTextHandlers(bot: any): void {
           });
 
           if (!redeemCode) {
-            await editMainMessage(ctx, `${e('warning')} Invalid code. Please check and try again.`, backKeyboard('main'));
+            await editMainMessage(ctx, `${e('warning')} <b>INVALID CODE</b>\n\nPlease check the code and try again.`, backKeyboard('main'));
             return;
           }
           if (redeemCode.status !== 'ACTIVE') {
-            await editMainMessage(ctx, `${e('warning')} This code is no longer active.`, backKeyboard('main'));
+            await editMainMessage(ctx, `${e('warning')} <b>CODE INACTIVE</b>\n\nThis code is no longer active.`, backKeyboard('main'));
             return;
           }
           if (redeemCode.expiresAt && redeemCode.expiresAt < new Date()) {
-            await editMainMessage(ctx, `${e('warning')} This code has expired.`, backKeyboard('main'));
+            await editMainMessage(ctx, `${e('warning')} <b>CODE EXPIRED</b>\n\nThis code has expired.`, backKeyboard('main'));
             return;
           }
           if (redeemCode.redemptions.length >= redeemCode.maxRedemptions) {
-            await editMainMessage(ctx, `${e('warning')} This code has reached its maximum redemptions.`, backKeyboard('main'));
+            await editMainMessage(ctx, `${e('warning')} <b>CODE DEPLETED</b>\n\nThis code has reached its maximum redemptions.`, backKeyboard('main'));
             return;
           }
           const alreadyRedeemed = redeemCode.redemptions.some((r) => r.userId === user.id);
           if (alreadyRedeemed) {
-            await editMainMessage(ctx, `${e('warning')} You already redeemed this code.`, backKeyboard('main'));
+            await editMainMessage(ctx, `${e('warning')} <b>ALREADY REDEEMED</b>\n\nYou already redeemed this code.`, backKeyboard('main'));
             return;
           }
 
@@ -236,7 +248,10 @@ export function registerTextHandlers(bot: any): void {
           await clearUserSession(telegramId);
           await editMainMessage(
             ctx,
-            `${e('party')} <b>CODE REDEEMED!</b>\n\nYou received <b>${redeemCode.rewardAmount} ${redeemCode.asset}</b>!`,
+            `${e('party')} <b>CODE REDEEMED!</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('gift')} You received <b>${redeemCode.rewardAmount} ${redeemCode.asset}</b>!\n\n` +
+            `${e('check')} Credited to your VEYLO wallet.`,
             backKeyboard('main')
           );
           break;
@@ -250,7 +265,7 @@ export function registerTextHandlers(bot: any): void {
           if (!isValidEVMAddress(address)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} Invalid address. Please send a valid BEP20 address.\n\nExample: <code>0x1234...abcd</code>`,
+              `${e('warning')} <b>INVALID ADDRESS</b>\n\nPlease send a valid BEP20 address.\n\n${e('edit')} Example: <code>0x1234...abcd</code>`,
               backKeyboard('main')
             );
             return;
@@ -260,10 +275,11 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('shield')} <b>Confirm Your Wallet Address</b>\n\n` +
-            `<b>Network:</b> BNB Smart Chain\n` +
-            `<b>Asset:</b> ${asset} BEP20\n` +
-            `<b>Address:</b> <code>${normalized}</code>`,
+            `${e('shield')} <b>CONFIRM YOUR WALLET ADDRESS</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('globe')} Network: <b>BNB Smart Chain</b>\n` +
+            `${e('coin')} Asset: <b>${asset} BEP20</b>\n` +
+            `${e('wallet')} Address: <code>${normalized}</code>`,
             Markup.inlineKeyboard([
               [Markup.button.callback(`${eb('check')} Confirm Address`, `payout:confirm:${claimId}`)],
               [Markup.button.callback(`${eb('edit')} Change Address`, `payout:change:${claimId}`)],
@@ -307,7 +323,10 @@ export function registerTextHandlers(bot: any): void {
           await clearUserSession(telegramId);
           await editMainMessage(
             ctx,
-            `${e('check')} <b>BROADCAST COMPLETE</b>\n\nDelivered: ${sent}\nFailed/blocked: ${failed}`,
+            `${e('check')} <b>BROADCAST COMPLETE</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('people')} Delivered: <b>${sent}</b>\n` +
+            `${e('cancel')} Failed/blocked: <b>${failed}</b>`,
             backKeyboard('admin')
           );
           break;
@@ -328,7 +347,7 @@ export function registerTextHandlers(bot: any): void {
           if (!target) {
             await editMainMessage(
               ctx,
-              `${e('warning')} No user found for "<code>${query}</code>".\n\nSend a Telegram ID (digits) or @username.`,
+              `${e('warning')} <b>USER NOT FOUND</b>\n\nNo user matches "<code>${query}</code>".\n\nSend a Telegram ID (digits) or @username.`,
               backKeyboard('admin')
             );
             return;
@@ -336,7 +355,7 @@ export function registerTextHandlers(bot: any): void {
           if (!target.wallet) {
             await editMainMessage(
               ctx,
-              `${e('warning')} User <code>${target.telegramId}</code> has no wallet.`,
+              `${e('warning')} <b>NO WALLET</b>\n\nUser <code>${target.telegramId}</code> has no wallet.`,
               backKeyboard('admin')
             );
             return;
@@ -354,9 +373,10 @@ export function registerTextHandlers(bot: any): void {
 
           await editMainMessage(
             ctx,
-            `${e('lock')} <b>USER WALLET</b>\n\n` +
-            `<b>User:</b> <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
-            `<b>Address:</b> <code>${target.wallet.address}</code>\n\n` +
+            `${e('lock')} <b>USER WALLET</b>\n` +
+            `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+            `${e('person')} User: <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
+            `${e('wallet')} Address: <code>${target.wallet.address}</code>\n\n` +
             `<i>Select what to recover. Access is audit-logged.</i>`,
             Markup.inlineKeyboard(rows)
           );
@@ -407,16 +427,20 @@ export function registerTextHandlers(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n\n` +
-      `<b>Total Amount:</b> ${amount} ${asset}\n` +
-      `<b>Total Claimers:</b> ${maxClaimers}\n` +
-      `<b>Reward Per User:</b> ${amountPerUser.toFixed(6)} ${asset}\n` +
-      (fee > 0 ? `<b>Platform Fee (1%):</b> ${fee} ${asset}\n<b>Total Cost:</b> ${total.toFixed(6)} ${asset}\n` : '') +
-      `<b>Estimated Reward:</b> ≈ ${pricing.formatUSD(usdPerUser)} per user\n` +
-      `<b>Total Value:</b> ≈ ${pricing.formatUSD(usdValue)}\n` +
-      `<b>Estimated Naira:</b> ${pricing.formatNGN(ngnValue)}\n` +
-      `<b>Expiry:</b> ${hours === 0 ? 'No Expiry' : `${hours} Hours`}\n\n` +
-      `Ready to create?`,
+      `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n` +
+      `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+      `${e('gift')} Total Amount: <b>${amount} ${asset}</b>\n` +
+      `${e('people')} Total Claimers: <b>${maxClaimers}</b>\n` +
+      `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
+      (fee > 0
+        ? `${e('card')} Platform Fee (1%): <b>${fee} ${asset}</b>\n` +
+          `${e('money')} Total Cost: <b>${total.toFixed(6)} ${asset}</b>\n`
+        : '') +
+      `${e('chart')} Estimated Reward: ≈ ${pricing.formatUSD(usdPerUser)} per user\n` +
+      `${e('chart')} Total Value: ≈ ${pricing.formatUSD(usdValue)}\n` +
+      `${e('naira')} Estimated Naira: ${pricing.formatNGN(ngnValue)}\n` +
+      `${e('clock')} Expiry: <b>${hours === 0 ? 'No Expiry' : `${hours} Hours`}</b>\n\n` +
+      `${e('check')} Ready to create?`,
       confirmCancelKeyboard(
         `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
         'giveaway'
@@ -425,7 +449,7 @@ export function registerTextHandlers(bot: any): void {
     await ctx.answerCbQuery();
   });
 
-  // === PAYOUT CONFIRMATION (address comes from the session — 64-byte button limit) ===
+  // === PAYOUT CONFIRMATION ===
   bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
@@ -441,7 +465,7 @@ export function registerTextHandlers(bot: any): void {
     if (!address) {
       await editMainMessage(
         ctx,
-        `${e('warning')} Session expired. Please send your wallet address again.`,
+        `${e('warning')} <b>SESSION EXPIRED</b>\n\nPlease send your wallet address again.`,
         backKeyboard('main')
       );
       return;
@@ -453,7 +477,7 @@ export function registerTextHandlers(bot: any): void {
     });
 
     if (!claim || claim.status !== 'RESERVED') {
-      await editMainMessage(ctx, `${e('warning')} Invalid or expired claim.`, backKeyboard('main'));
+      await editMainMessage(ctx, `${e('warning')} <b>INVALID CLAIM</b>\n\nThis claim is no longer valid.`, backKeyboard('main'));
       return;
     }
 
@@ -474,9 +498,10 @@ export function registerTextHandlers(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `${e('check')} <b>REWARD QUEUED</b>\n\n` +
-      `Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward has been queued for payout.\n\n` +
-      `You will receive a notification once it's sent.`,
+      `${e('check')} <b>REWARD QUEUED</b>\n` +
+      `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+      `${e('gift')} Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward has been queued for payout.\n\n` +
+      `${e('clock')} You will receive a notification once it's sent.`,
       backKeyboard('main')
     );
   });
@@ -499,7 +524,9 @@ export function registerTextHandlers(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `📥 Send your ${claim.giveaway.asset} BEP20 wallet address.\n\n⚠️ Must support BNB Smart Chain (BEP20)`,
+      `${e('deposit')} <b>SEND YOUR ${claim.giveaway.asset} BEP20 WALLET ADDRESS</b>\n\n` +
+      `Type or paste the address below.\n\n` +
+      `⚠️ Must support BNB Smart Chain (BEP20)`,
       backKeyboard('main')
     );
     await ctx.answerCbQuery();
@@ -508,7 +535,7 @@ export function registerTextHandlers(bot: any): void {
   bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
     const from = ctx.from!;
     await clearUserSession(from.id.toString());
-    await editMainMessage(ctx, `${e('cancel')} Payout cancelled.`, backKeyboard('main'));
+    await editMainMessage(ctx, `${e('cancel')} <b>Payout cancelled.</b>`, backKeyboard('main'));
     await ctx.answerCbQuery();
   });
 }
