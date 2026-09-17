@@ -47,7 +47,6 @@ export function registerCallbacks(bot: any): void {
 
     if (!user?.wallet) return;
 
-    // Spendable balance comes from the DB — includes deposits AND internal credits
     const balances = (['BNB', 'USDT'] as const).map((asset) => {
       const db = user!.balances.find((b) => b.asset === asset);
       return {
@@ -100,10 +99,14 @@ export function registerCallbacks(bot: any): void {
       text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
     }
 
-    // One action row per cancellable giveaway (FULL included — claims that
-    // never paid out are refunded on cancel)
+    // Cancel only while nothing has been paid out; after a payout the giveaway
+    // shows Stats alone (cancelGiveaway would refuse anyway).
     const rows: any[] = giveaways
-      .filter((g) => g.status === 'ACTIVE' || g.status === 'FULL')
+      .filter(
+        (g) =>
+          (g.status === 'ACTIVE' || g.status === 'FULL') &&
+          g.claims.every((c) => c.status !== 'PAID')
+      )
       .map((g) => [
         Markup.button.callback(
           `${eb('cancel')} Cancel ${g.totalAmount} ${g.asset}`,
@@ -111,6 +114,12 @@ export function registerCallbacks(bot: any): void {
         ),
         Markup.button.callback(`${eb('chart')} Stats`, `giveaway:stats:${g.id}`),
       ]);
+    // Paid-out giveaways still get a Stats button
+    for (const g of giveaways) {
+      if (g.claims.some((c) => c.status === 'PAID') && !rows.some((r) => (r[1] as any)?.callback_data === `giveaway:stats:${g.id}`)) {
+        rows.unshift([Markup.button.callback(`${eb('chart')} Stats — ${g.totalAmount} ${g.asset}`, `giveaway:stats:${g.id}`)]);
+      }
+    }
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
@@ -404,12 +413,11 @@ export function registerCallbacks(bot: any): void {
       `• Create giveaways to share crypto with your community.\n\n` +
       `<b>Deposits</b>\n` +
       `• Only send BEP20 tokens to your deposit address.\n` +
-      `• Deposits require blockchain confirmations.\n` +
-      `• A 1% platform fee applies to deposits.\n\n` +
+      `• Deposits require blockchain confirmations.\n\n` +
       `<b>Giveaways</b>\n` +
       `• Create single or multiple claim giveaways.\n` +
-      `• Funds are locked until claimed or cancelled.\n` +
-      `• Claim links are unique and secure.\n\n` +
+      `• A 1% platform fee applies at creation.\n` +
+      `• Funds are locked until claimed or cancelled.\n\n` +
       `<b>Support</b>\n` +
       `For assistance, contact @VeyloSupport`,
       backKeyboard('main')
@@ -439,13 +447,20 @@ export function registerCallbacks(bot: any): void {
 
       const amountPerUser = amount / maxClaimers;
 
+      // Share URL opens Telegram's chat picker — the recipient gets the link
+      // as a normal message, so tapping it opens the bot profile FRESH and the
+      // ?start= payload is actually delivered (tapping links inside an existing
+      // bot chat silently drops the payload).
+      const claimUrl = `https://t.me/${BOT_USERNAME}?start=giveaway_${secureCode}`;
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(claimUrl)}&text=${encodeURIComponent(`🎁 Giveaway: ${amount} ${asset} on VEYLO — tap to claim!`)}`;
+
       await editMainMessage(
         ctx,
         formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode),
         Markup.inlineKeyboard([
+          [Markup.button.url(`${eb('gift')} Share Giveaway`, shareUrl)],
           [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
           [Markup.button.callback(`${eb('chart')} View Stats`, `giveaway:stats:${secureCode}`)],
-          // FIX: cancelGiveaway expects the giveaway ID, not the secure code
           [Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${giveawayId}`)],
           [Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine')],
         ])
@@ -462,5 +477,4 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-      }
-                
+}
