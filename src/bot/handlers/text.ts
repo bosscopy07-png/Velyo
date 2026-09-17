@@ -1,7 +1,7 @@
 import { Context } from 'telegraf';
 import { Markup } from 'telegraf';
 import { prisma } from '../../database';
-import { giveawayService } from '../../services/giveaway';
+import { giveawayService, estimateCreationCost } from '../../services/giveaway';
 import { getUserSession, setUserSession, clearUserSession } from '../../services/redis';
 import { pricing } from '../../services/pricing';
 import { queuePayout } from '../../queues';
@@ -11,11 +11,6 @@ import { logger } from '../../utils/logger';
 import { isValidEVMAddress, normalizeAddress, isValidAmount, hashIdempotencyKey } from '../../utils/validation';
 import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
-
-/** 1% creation fee (matches PLATFORM_FEE_PERCENT default) for display purposes */
-function displayFee(amount: number): number {
-  return config.ENABLE_FEES ? Number((amount * (config.PLATFORM_FEE_PERCENT / 100)).toFixed(6)) : 0;
-}
 
 export function registerTextHandlers(bot: any): void {
   bot.on('text', async (ctx: Context) => {
@@ -44,7 +39,8 @@ export function registerTextHandlers(bot: any): void {
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} <b>INVALID AMOUNT</b>\n\n${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\nEnter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
+              `${e('warning')} <b>INVALID AMOUNT</b>\n\n${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+              `Enter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -67,8 +63,7 @@ export function registerTextHandlers(bot: any): void {
             maxClaimers: 1,
           });
 
-          const fee = displayFee(amount);
-          const total = amount + fee;
+          const cost = await estimateCreationCost(amount, 1);
           const usdValue = await pricing.convertToUSD(asset, amount);
           const ngnValue = await pricing.convertToNGN(asset, amount);
 
@@ -80,9 +75,10 @@ export function registerTextHandlers(bot: any): void {
             `${e('gift')} Total Reward: <b>${amount} ${asset}</b>\n` +
             `${e('person')} Claimers: <b>1 User</b>\n` +
             `${e('star')} Reward Per User: <b>${amount} ${asset}</b>\n` +
-            (fee > 0
-              ? `${e('card')} Platform Fee (1%): <b>${fee} ${asset}</b>\n` +
-                `${e('money')} Total Cost: <b>${total.toFixed(6)} ${asset}</b>\n`
+            (cost.fee > 0
+              ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+                `${e('fire')} Network Gas (1 claim): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
+                `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
               : '') +
             `${e('chart')} Estimated Value: <b>${pricing.formatUSD(usdValue)}</b>\n` +
             `${e('naira')} Estimated Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n\n` +
@@ -296,7 +292,7 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === ADMIN BROADCAST ===
+                          // === ADMIN BROADCAST ===
         case 'admin_broadcast': {
           if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
             await clearUserSession(telegramId);
@@ -419,8 +415,7 @@ export function registerTextHandlers(bot: any): void {
       expiryHours,
     });
 
-    const fee = displayFee(amount);
-    const total = amount + fee;
+    const cost = await estimateCreationCost(amount, maxClaimers);
     const usdValue = await pricing.convertToUSD(asset, amount);
     const ngnValue = await pricing.convertToNGN(asset, amount);
     const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
@@ -429,18 +424,20 @@ export function registerTextHandlers(bot: any): void {
       ctx,
       `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n` +
       `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n` +
+      `${e('coin')} Asset: <b>${asset}</b>\n` +
       `${e('gift')} Total Amount: <b>${amount} ${asset}</b>\n` +
-      `${e('people')} Total Claimers: <b>${maxClaimers}</b>\n` +
+      `${e('people')} Claimers: <b>${maxClaimers}</b>\n` +
       `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
-      (fee > 0
-        ? `${e('card')} Platform Fee (1%): <b>${fee} ${asset}</b>\n` +
-          `${e('money')} Total Cost: <b>${total.toFixed(6)} ${asset}</b>\n`
+      (cost.fee > 0
+        ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+          `${e('fire')} Network Gas (${maxClaimers} claim${maxClaimers > 1 ? 's' : ''}): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
+          `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
         : '') +
-      `${e('chart')} Estimated Reward: ≈ ${pricing.formatUSD(usdPerUser)} per user\n` +
-      `${e('chart')} Total Value: ≈ ${pricing.formatUSD(usdValue)}\n` +
-      `${e('naira')} Estimated Naira: ${pricing.formatNGN(ngnValue)}\n` +
+      `${e('chart')} Per User: <b>≈ ${pricing.formatUSD(usdPerUser)}</b>\n` +
+      `${e('chart')} Total Value: <b>≈ ${pricing.formatUSD(usdValue)}</b>\n` +
+      `${e('naira')} Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n` +
       `${e('clock')} Expiry: <b>${hours === 0 ? 'No Expiry' : `${hours} Hours`}</b>\n\n` +
-      `${e('check')} Ready to create?`,
+      `${e('check')} <b>Ready to create?</b>`,
       confirmCancelKeyboard(
         `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
         'giveaway'
@@ -535,7 +532,11 @@ export function registerTextHandlers(bot: any): void {
   bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
     const from = ctx.from!;
     await clearUserSession(from.id.toString());
-    await editMainMessage(ctx, `${e('cancel')} <b>Payout cancelled.</b>`, backKeyboard('main'));
+    await editMainMessage(
+      ctx,
+      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
+      backKeyboard('main')
+    );
     await ctx.answerCbQuery();
   });
-}
+            }
