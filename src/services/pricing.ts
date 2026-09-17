@@ -26,6 +26,9 @@ interface ExchangeRatesResponse {
 class PricingService {
   private readonly CACHE_TTL = 600; // 10 minutes — halves request volume vs 5
 
+  // CoinGecko demo API key (demo tier) to avoid rate limits.
+  private readonly COINGECKO_API_KEY = 'CG-7862auKMZss4YewdQQB2XpXG';
+
   async getPrice(asset: string): Promise<PriceCache> {
     const cacheKey = `price:${asset.toLowerCase()}`;
     const cached = await redis.get(cacheKey);
@@ -45,9 +48,8 @@ class PricingService {
       const coinId = this.getCoinGeckoId(asset);
 
       // ONE request for both assets (BNB + USDT) — cuts CoinGecko calls in half
-      const cgResponse = await fetch(
-        `${config.PRICE_API_URL}/simple/price?ids=binancecoin,tether&vs_currencies=usd`
-      );
+      const cgUrl = `${config.PRICE_API_URL}/simple/price?ids=binancecoin,tether&vs_currencies=usd&x_cg_pro_api_key=${this.COINGECKO_API_KEY}`;
+      const cgResponse = await fetch(cgUrl);
       if (!cgResponse.ok) {
         throw new Error(`CoinGecko request failed with ${cgResponse.status}`);
       }
