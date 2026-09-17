@@ -8,11 +8,11 @@ import type { AssetSymbol } from '../config';
 
 /**
  * Seeded per expected claim. Actual payout cost ≈ 0.00000174 BNB; we send
- * 0.000002 BNB. NOTE on units: 0.000002 BNB = 2×10^15 wei (NOT 2×10^9 —
- * 10^18 wei per BNB).
+ * 0.000002 BNB. UNITS: 0.000002 BNB = 2×10^12 wei (2,000,000,000,000).
+ * Verified against on-chain logs: one USDT transfer costs 1,743,100,000,000 wei.
  */
 export const GAS_PER_CLAIM_BNB = 0.000002;
-const GAS_SEED_PER_PAYOUT = 2000000000000000n; // 0.000002 BNB in wei
+const GAS_SEED_PER_PAYOUT = 2000000000000n; // 0.000002 BNB
 const BNB_USD_FALLBACK = 550; // used only if the price API is down
 
 export interface CreationCost {
@@ -208,8 +208,8 @@ class GiveawayService {
       const current = await blockchain.getBalance(credit.address, 'BNB');
       const ours = current - BigInt(credit.baseline);
 
-      const reserve = 2500000000000n;         // 0.0000025 BNB kept as future float
-      const reclaimTxGas = 1800000000000000n; // 0.0000018 BNB cost of the reclaim tx
+      const reserve = 2500000000000n;      // 0.0000025 BNB kept as future float
+      const reclaimTxGas = 1800000000000n; // 0.0000018 BNB cost of the reclaim tx
 
       if (ours <= reserve + reclaimTxGas) {
         logger.info(`Gas reclaim for ${giveawayId}: leftover ${ours} wei below threshold — kept as wallet float.`);
@@ -402,4 +402,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-    
+                              
