@@ -15,8 +15,13 @@ export async function handleStart(ctx: Context): Promise<void> {
   if (!from) return;
 
   const telegramId = from.id.toString();
-  const startPayload = (ctx as any).startPayload as string | undefined;
   const isAdmin = config.ADMIN_TELEGRAM_IDS.includes(telegramId);
+
+  // Payload from Telegraf, with a raw-text fallback (belt and braces — covers
+  // any client/Telegraf quirk where startPayload isn't populated)
+  const text = ctx.message && 'text' in ctx.message ? (ctx.message.text as string) : '';
+  const m = text.match(/^\/start(?:@\w+)?\s+(\S+)/);
+  const startPayload = ((ctx as any).startPayload as string | undefined) ?? m?.[1];
 
   // Debug: proves what Telegram delivered (settles deep-link questions)
   logger.info(`[start] payload="${startPayload ?? ''}" from ${telegramId}`);
@@ -66,7 +71,6 @@ export async function handleStart(ctx: Context): Promise<void> {
     // Handle deep links (giveaway claim)
     if (startPayload?.startsWith('giveaway_')) {
       const code = startPayload.replace('giveaway_', '');
-      // Delete the old main message first — the claim flow renders its own
       await deleteMainMessage(ctx, user!);
       await handleGiveawayDeepLink(ctx, user!.id, code);
       return;
@@ -78,8 +82,6 @@ export async function handleStart(ctx: Context): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
 
-    // Always delete the old main message and send a fresh one — a clean
-    // screen for every /start, deep link, or /claim arrival.
     await deleteMainMessage(ctx, user!);
 
     const msg = await ctx.replyWithPhoto(VEYLO_IMAGE, {
@@ -142,8 +144,6 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         existingClaim.status === 'ADDRESS_PENDING' ||
         existingClaim.status === 'FAILED'
       ) {
-        // Interrupted before payout completed — let the user RESUME by
-        // submitting their address again (was a dead-end before).
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
       } else {
         await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, mainKeyboard(false));
@@ -181,15 +181,13 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       where: { giveawayId_userId: { giveawayId: giveaway.id, userId } },
     });
 
-    // Set the session BEFORE rendering so the screen and state are atomic
     await setUserSession(ctx.from!.id.toString(), {
       state: 'awaiting_payout_address',
       claimId: claim!.id,
       asset: giveaway.asset,
     });
 
-    // Single clean screen: SPOT SECURED + address prompt + ONLY a Back button.
-    // No main menu to mis-tap while the bot waits for the address.
+    // Single clean screen: SPOT SECURED + address prompt + ONLY a Back button
     await promptForAddress(ctx, giveaway.asset, claim!.id);
   } catch (err) {
     logger.error('Giveaway deep link error:', err);
@@ -199,8 +197,7 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
 
 /**
  * Address prompt — SPOT SECURED celebration + instructions with ONLY a Back
- * button. Stale keyboards are cleared by editMainMessage when none is given,
- * but we pass Back explicitly so users have an escape hatch mid-flow.
+ * button. No main menu to mis-tap while the bot waits for the address.
  */
 async function promptForAddress(ctx: Context, asset: string, claimId: string): Promise<void> {
   await setUserSession(ctx.from!.id.toString(), {
@@ -219,4 +216,3 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     backKeyboard('main')
   );
 }
-  
