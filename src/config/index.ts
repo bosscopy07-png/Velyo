@@ -32,6 +32,7 @@ const envSchema = z.object({
   
   PRICE_API_URL: z.string().default('https://api.coingecko.com/api/v3'),
   NGN_RATE_API_URL: z.string().default('https://api.exchangerate-api.com/v4/latest/USD'),
+  COINGECKO_API_KEY: process.env.COINGECKO_API_KEY || 'CG-7862auKMZss4YewdQQB2XpXG',
   
   QUEUE_CONCURRENCY: z.string().default('5').transform(Number),
   PAYOUT_RETRY_DELAY_MS: z.string().default('30000').transform(Number),
