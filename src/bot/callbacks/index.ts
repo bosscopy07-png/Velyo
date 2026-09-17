@@ -330,6 +330,7 @@ export function registerCallbacks(bot: any): void {
     }
   }));
 
+  // Replaced giveaway stats handler with enhanced formatting
   bot.action(/giveaway:stats:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -337,14 +338,21 @@ export function registerCallbacks(bot: any): void {
 
     const text = [
       `${e('chart')} <b>GIVEAWAY STATISTICS</b>`,
+      `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`,
       '',
-      `<b>Total Reward:</b> ${stats.totalReward}`,
-      `<b>Total Slots:</b> ${stats.totalSlots}`,
-      `<b>Link Opens:</b> ${stats.linkOpens}`,
-      `<b>Claim Attempts:</b> ${stats.claimAttempts}`,
-      `<b>Spots Secured:</b> ${stats.spotsSecured}`,
-      `<b>Payouts Completed:</b> ${stats.payoutsCompleted}`,
-      `<b>Remaining Slots:</b> ${stats.remainingSlots}`,
+      `${e('gift')} <b>Total Reward</b>          <code>${stats.totalReward}</code>`,
+      `${e('target')} <b>Total Slots</b>            <code>${stats.totalSlots}</code>`,
+      `${e('link')} <b>Link Opens</b>           <code>${stats.linkOpens}</code>`,
+      `${e('people')} <b>Claim Attempts</b>       <code>${stats.claimAttempts}</code>`,
+      `${e('party')} <b>Spots Secured</b>        <code>${stats.spotsSecured}</code>`,
+      `${e('check')} <b>Payouts Completed</b>    <code>${stats.payoutsCompleted}</code>`,
+      `${e('clock')} <b>Remaining Slots</b>      <code>${stats.remainingSlots}</code>`,
+      '',
+      stats.remainingSlots === 0
+        ? `${e('fire')} <b>ALL SLOTS FILLED</b>`
+        : stats.payoutsCompleted > 0
+          ? `${e('rocket')} <b>Payouts in progress…</b>`
+          : `${e('lightning')} <b>GIVEAWAY LIVE</b>`,
     ].join('\n');
 
     await editMainMessage(ctx, text, backKeyboard('giveaway:mine'));
