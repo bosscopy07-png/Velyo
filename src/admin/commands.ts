@@ -11,8 +11,8 @@ import { blockchain } from '../services/blockchain';
 import { config } from '../config';
 import { formatAddress } from '../utils/validation';
 
-/** Exact gas for one BEP20 forward (~0.0000017) + rounding, per your log analysis */
-const SWEEP_GAS_SEED = 2000000000n; // 0.000002 BNB
+/** 0.000002 BNB = 2×10^15 wei (NOT 2×10^9 — 10^18 wei per BNB) */
+const SWEEP_GAS_SEED = 2000000000000000n;
 const SWEEP_THRESHOLD_USDT = 0.5;
 
 const adminPanelKeyboard = Markup.inlineKeyboard([
@@ -352,22 +352,19 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
   const wallet = await prisma.wallet.findUnique({ where: { userId } });
   if (!wallet) throw new Error('no wallet');
 
-  // 1. Snapshot baseline (protects the user's own BNB)
   const baseline = await blockchain.getBalance(wallet.address, 'BNB');
 
-  // 2. Seed only the deficit of the exact gas amount
   if (baseline < SWEEP_GAS_SEED) {
     if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
     await blockchain.sendTransaction(
       config.OPERATOR_WALLET_KEY,
       wallet.address,
-      SWEEP_GAS_SEED - baseline + 500000000n, // deficit + ~0.0000005 buffer
+      SWEEP_GAS_SEED - baseline + 500000000000000n, // deficit + ~0.0000005 buffer
       'BNB',
       `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
     );
   }
 
-  // 3. Forward the accumulated fee USDT
   const rawFee = BigInt(Math.floor(amountUSDT * 1e18));
   const { hash } = await blockchain.sendTransaction(
     wallet.encryptedPrivateKey,
@@ -377,7 +374,6 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
     `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
   );
 
-  // 4. Mark swept
   await prisma.platformFee.updateMany({
     where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
     data: { sweptAt: new Date() },
@@ -479,4 +475,5 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-}
+      }
+    
