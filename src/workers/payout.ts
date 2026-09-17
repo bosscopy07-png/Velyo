@@ -22,6 +22,7 @@ const worker = new Worker('payouts', async (job) => {
     const receipt = await blockchain.getTransactionReceipt(claim.payoutTransactionHash);
     if (receipt && receipt.status === 1) {
       await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, claim.payoutTransactionHash, idempotencyKey);
+      await maybeReclaimGas(claim.giveawayId, claim.giveaway.maxClaimers);
       return { status: 'completed', hash: claim.payoutTransactionHash };
     }
   }
@@ -32,14 +33,15 @@ const worker = new Worker('payouts', async (job) => {
   });
 
   try {
-    const platformWallet = await prisma.wallet.findFirst({
-      orderBy: { createdAt: 'asc' },
+    // Funds live in the CREATOR's wallet (and that's where gas was seeded)
+    const creatorWallet = await prisma.wallet.findUnique({
+      where: { userId: claim.giveaway.creatorId },
     });
-    if (!platformWallet) throw new Error('Platform wallet not found');
+    if (!creatorWallet) throw new Error('Creator wallet not found');
 
-    const gasBal = await blockchain.getBalance(platformWallet.address, 'BNB');
+    const gasBal = await blockchain.getBalance(creatorWallet.address, 'BNB');
     if (gasBal < 1500000000000000n) {
-      logger.warn(`Hot wallet ${platformWallet.address} low on BNB (${gasBal} wei). Payout gas was seeded at creation — if this fails, re-check.`);
+      logger.warn(`Creator wallet ${creatorWallet.address} low on BNB (${gasBal} wei). Payout gas was seeded at creation — if this fails, re-check.`);
     }
 
     const assetConfig = ASSETS[asset as keyof typeof ASSETS];
@@ -47,7 +49,7 @@ const worker = new Worker('payouts', async (job) => {
     const amountBigInt = BigInt(Math.floor(amount * Number(decimals)));
 
     const { hash } = await blockchain.sendTransaction(
-      platformWallet.encryptedPrivateKey,
+      creatorWallet.encryptedPrivateKey,
       address,
       amountBigInt,
       asset as keyof typeof ASSETS,
@@ -65,6 +67,8 @@ const worker = new Worker('payouts', async (job) => {
     }
 
     await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, hash, idempotencyKey);
+    await maybeReclaimGas(claim.giveawayId, claim.giveaway.maxClaimers);
+
     logger.info(`Payout completed: ${hash} for claim ${claimId}`);
     return { status: 'completed', hash };
   } catch (err) {
@@ -79,6 +83,21 @@ const worker = new Worker('payouts', async (job) => {
   connection: bullmqConnection,
   concurrency: config.QUEUE_CONCURRENCY,
 });
+
+/** Once every claim is PAID, sweep unused seeded gas back to the admin wallet. */
+async function maybeReclaimGas(giveawayId: string, maxClaimers: number): Promise<void> {
+  try {
+    const paidCount = await prisma.giveawayClaim.count({
+      where: { giveawayId, status: 'PAID' },
+    });
+    if (paidCount >= maxClaimers) {
+      const { giveawayService } = await import('../services/giveaway');
+      await giveawayService.reclaimGas(giveawayId);
+    }
+  } catch (err) {
+    logger.error(`Post-payout gas reclaim check failed: ${(err as Error).message}`);
+  }
+}
 
 async function finalizePaid(
   claimId: string,
@@ -95,8 +114,6 @@ async function finalizePaid(
     data: { status: 'PAID', payoutTransactionHash: hash },
   });
 
-  // CRITICAL: the reward left the creator's wallet on-chain — deduct it from
-  // their locked balance so DB accounting matches chain reality.
   await prisma.balance.update({
     where: { userId_asset: { userId: creatorId, asset } },
     data: { lockedBalance: { decrement: amount } },
@@ -127,3 +144,4 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info('Payout worker started');
+  
