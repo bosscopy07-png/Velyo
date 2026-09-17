@@ -6,10 +6,14 @@ import { generateSecureCode } from '../utils/validation';
 import { logger } from '../utils/logger';
 import type { AssetSymbol } from '../config';
 
-/** Seeded per expected claim: actual cost ~0.0000018 BNB, we send 0.000002 (safety rounding) */
+/**
+ * Seeded per expected claim. Actual payout cost ≈ 0.00000174 BNB; we send
+ * 0.000002 BNB. NOTE on units: 0.000002 BNB = 2×10^15 wei (NOT 2×10^9 —
+ * 10^18 wei per BNB).
+ */
 export const GAS_PER_CLAIM_BNB = 0.000002;
-const GAS_SEED_PER_PAYOUT = 2000000000n; // 0.000002 BNB in wei
-const BNB_USD_FALLBACK = 1000; // used only if the price API is down
+const GAS_SEED_PER_PAYOUT = 2000000000000000n; // 0.000002 BNB in wei
+const BNB_USD_FALLBACK = 550; // used only if the price API is down
 
 export interface CreationCost {
   platformFee: number;
@@ -52,8 +56,6 @@ class GiveawayService {
     const secureCode = generateSecureCode(20);
     const { hashIdempotencyKey } = await import('../utils/encryption');
 
-    // Fee = 1% platform fee + gas for all expected claims (priced in USDT,
-    // charged in the giveaway asset — amounts are tiny, rounding is negligible).
     const cost = await estimateCreationCost(data.totalAmount, data.maxClaimers);
     const fee = cost.fee;
     const totalCost = data.totalAmount + fee;
@@ -133,7 +135,6 @@ class GiveawayService {
       return g;
     });
 
-    // Seed gas from the admin wallet + record baseline for later reclaim
     await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers);
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
@@ -167,7 +168,7 @@ class GiveawayService {
             'BNB',
             hashIdempotencyKey('create-seed', giveawayId)
           );
-          logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash} (${seeded} wei)`);
+          logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash} (${seeded} wei = ${Number(seeded) / 1e18} BNB)`);
         }
       }
 
@@ -207,8 +208,8 @@ class GiveawayService {
       const current = await blockchain.getBalance(credit.address, 'BNB');
       const ours = current - BigInt(credit.baseline);
 
-      const reserve = 2500000000000n;      // ~0.0000025 kept as future float
-      const reclaimTxGas = 1800000000000n; // ~0.0000018 cost of the reclaim tx
+      const reserve = 2500000000000n;         // 0.0000025 BNB kept as future float
+      const reclaimTxGas = 1800000000000000n; // 0.0000018 BNB cost of the reclaim tx
 
       if (ours <= reserve + reclaimTxGas) {
         logger.info(`Gas reclaim for ${giveawayId}: leftover ${ours} wei below threshold — kept as wallet float.`);
@@ -321,7 +322,6 @@ class GiveawayService {
       return { success: false, reason: 'Cannot cancel: payouts already sent' };
     }
 
-    // Fee is non-refundable (platform earned it at creation); refund unclaimed reward only
     const unclaimedAmount = Number(giveaway.totalAmount) -
       (giveaway.claims.filter((c) => c.status === 'PAID').length * Number(giveaway.amountPerUser));
 
@@ -402,3 +402,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
+    
