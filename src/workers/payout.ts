@@ -8,7 +8,6 @@ import { logger } from '../utils/logger';
 const worker = new Worker('payouts', async (job) => {
   const { claimId, userId, address, amount, asset, idempotencyKey } = job.data;
 
-  // Idempotency via CLAIM STATE — failed jobs must be able to retry
   const claim = await prisma.giveawayClaim.findUnique({
     where: { id: claimId },
     include: { giveaway: true },
@@ -20,10 +19,9 @@ const worker = new Worker('payouts', async (job) => {
     return { status: 'already_paid', hash: claim.payoutTransactionHash };
   }
   if (claim.status === 'PROCESSING' && claim.payoutTransactionHash) {
-    // Previous attempt broadcast the tx but crashed before confirming — resume
     const receipt = await blockchain.getTransactionReceipt(claim.payoutTransactionHash);
     if (receipt && receipt.status === 1) {
-      await finalizePaid(claimId, userId, asset, amount, address, claim.payoutTransactionHash, idempotencyKey);
+      await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, claim.payoutTransactionHash, idempotencyKey);
       return { status: 'completed', hash: claim.payoutTransactionHash };
     }
   }
@@ -34,15 +32,13 @@ const worker = new Worker('payouts', async (job) => {
   });
 
   try {
-    // Hot wallet: first wallet in the DB (the operator/creator wallet).
-    // Gas was seeded at giveaway creation — this worker never sends BNB.
     const platformWallet = await prisma.wallet.findFirst({
       orderBy: { createdAt: 'asc' },
     });
     if (!platformWallet) throw new Error('Platform wallet not found');
 
     const gasBal = await blockchain.getBalance(platformWallet.address, 'BNB');
-    if (gasBal < 1500000000000000n) { // < 0.0015 BNB
+    if (gasBal < 1500000000000000n) {
       logger.warn(`Hot wallet ${platformWallet.address} low on BNB (${gasBal} wei). Payout gas was seeded at creation — if this fails, re-check.`);
     }
 
@@ -58,7 +54,6 @@ const worker = new Worker('payouts', async (job) => {
       idempotencyKey
     );
 
-    // Record hash immediately so a crash after broadcast is resumable
     await prisma.giveawayClaim.update({
       where: { id: claimId },
       data: { payoutTransactionHash: hash },
@@ -69,7 +64,7 @@ const worker = new Worker('payouts', async (job) => {
       throw new Error('Transaction failed on chain');
     }
 
-    await finalizePaid(claimId, userId, asset, amount, address, hash, idempotencyKey);
+    await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, hash, idempotencyKey);
     logger.info(`Payout completed: ${hash} for claim ${claimId}`);
     return { status: 'completed', hash };
   } catch (err) {
@@ -78,7 +73,7 @@ const worker = new Worker('payouts', async (job) => {
       where: { id: claimId },
       data: { status: 'FAILED', failedReason: (err as Error).message },
     });
-    throw err; // BullMQ retry
+    throw err;
   }
 }, {
   connection: bullmqConnection,
@@ -88,6 +83,7 @@ const worker = new Worker('payouts', async (job) => {
 async function finalizePaid(
   claimId: string,
   userId: string,
+  creatorId: string,
   asset: string,
   amount: number,
   address: string,
@@ -97,6 +93,13 @@ async function finalizePaid(
   await prisma.giveawayClaim.update({
     where: { id: claimId },
     data: { status: 'PAID', payoutTransactionHash: hash },
+  });
+
+  // CRITICAL: the reward left the creator's wallet on-chain — deduct it from
+  // their locked balance so DB accounting matches chain reality.
+  await prisma.balance.update({
+    where: { userId_asset: { userId: creatorId, asset } },
+    data: { lockedBalance: { decrement: amount } },
   });
 
   await prisma.transaction.create({
