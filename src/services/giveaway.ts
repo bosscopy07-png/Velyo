@@ -1,5 +1,5 @@
 import { prisma } from '../database';
-import { redis, acquireLock, releaseLock, trackGiveawayView } from './redis';
+import { redis, acquireLock, releaseLock } from './redis';
 import { blockchain } from './blockchain';
 import { config } from '../config';
 import { generateSecureCode } from '../utils/validation';
@@ -106,7 +106,6 @@ class GiveawayService {
     });
 
     // Seed exactly enough BNB for each expected claim's payout gas.
-    // One of only TWO places BNB ever moves to a user wallet.
     await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers);
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
@@ -135,13 +134,12 @@ class GiveawayService {
       const { hash } = await blockchain.sendTransaction(
         config.OPERATOR_WALLET_KEY,
         wallet.address,
-        needed - current + GAS_SEED_PER_PAYOUT, // deficit + one payout buffer
+        needed - current + GAS_SEED_PER_PAYOUT,
         'BNB',
         hashIdempotencyKey('create-seed', giveawayId)
       );
       logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash}`);
     } catch (err) {
-      // Non-fatal: giveaway exists, payout may fail later without gas
       logger.error(`Gas seed failed for giveaway ${giveawayId}: ${(err as Error).message}`);
     }
   }
@@ -297,9 +295,11 @@ class GiveawayService {
 
     if (!giveaway) throw new Error('Giveaway not found');
 
-    const linkOpens = await trackGiveawayView(giveawayId).then(() =>
-      redis.get(`giveaway:views:${giveawayId}`).then((v) => parseInt(v || '0'))
-    );
+    // READ-ONLY: viewing stats must never increment the counter
+    // (the real increments happen in handleGiveawayDeepLink via trackAttempt)
+    const linkOpens = await redis
+      .get(`giveaway:views:${giveawayId}`)
+      .then((v) => parseInt(v || '0'));
 
     return {
       totalReward: Number(giveaway.totalAmount),
