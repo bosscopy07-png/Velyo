@@ -4,17 +4,23 @@ import { redis } from './redis';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
+import cron from 'node-cron';
 
 const ASSET_DECIMALS: Record<string, number> = { BNB: 18, USDT: 18 };
-const MAX_LOG_WINDOW = 500; // cap getLogs range — public RPCs reject huge ranges
+const MAX_LOG_WINDOW = 500;
+
+/** Deposits below these are ignored entirely (dust/spam protection) */
+const MIN_DEPOSIT: Record<string, number> = {
+  BNB: 0.0001,
+  USDT: config.MINIMUM_AMOUNT_USD, // default 0.1 ($0.1)
+};
 
 class DepositMonitorService {
   private isRunning = false;
 
   start(): void {
-    // Every 60s (was 30s) — halves request volume
     cron.schedule('0 * * * * *', () => void this.scanDeposits());
-    logger.info('Deposit monitor started (credit-efficient mode)');
+    logger.info('Deposit monitor started (credit-efficient, dust-filtered)');
   }
 
   private async scanDeposits(): Promise<void> {
@@ -31,14 +37,12 @@ class DepositMonitorService {
       const provider = await blockchain.getProvider();
       const currentBlock = await provider.getBlockNumber();
 
-      // Resume from where we last scanned (per-instance cursor in Redis)
       const cursorKey = 'monitor:lastBlock';
       const cached = await redis.get(cursorKey);
       const lastScanned = cached ? parseInt(cached) : currentBlock - 20;
       const fromBlock = Math.max(lastScanned + 1, currentBlock - MAX_LOG_WINDOW);
 
       for (const wallet of wallets) {
-        // USDT: event logs over only the NEW blocks since last scan
         try {
           if (fromBlock <= currentBlock) {
             const events = await blockchain.getTokenTransferEvents(
@@ -59,7 +63,6 @@ class DepositMonitorService {
           logger.error(`Error scanning USDT for ${wallet.address}:`, err);
         }
 
-        // BNB: cheap balance-diff instead of fetching full blocks
         try {
           await this.checkNativeBalance(wallet, currentBlock);
         } catch (err) {
@@ -67,7 +70,6 @@ class DepositMonitorService {
         }
       }
 
-      // Advance cursor only after a full pass
       await redis.set(cursorKey, currentBlock.toString());
     } catch (err) {
       logger.error('Deposit scan error:', err);
@@ -85,15 +87,14 @@ class DepositMonitorService {
     const current = Number(raw) / 1e18;
 
     const prevStr = await redis.get(key);
-    await redis.set(key, current.toFixed(8));
+    await redis.set(key, current.toFixed(12)); // finer precision for BNB dust detection
 
-    if (!prevStr) return; // first sighting — establish baseline, don't credit
+    if (!prevStr) return;
 
     const prev = parseFloat(prevStr);
     const diff = current - prev;
-    if (diff <= 0) return; // no new deposit (fee forwards/payouts decrease — ignored)
+    if (diff <= 0) return;
 
-    // Synthetic-but-stable idempotency key for diff-based crediting
     await this.processDeposit(wallet, 'BNB', {
       from: '',
       amount: BigInt(Math.floor(diff * 1e18)),
@@ -111,6 +112,17 @@ class DepositMonitorService {
     asset: string,
     event: { from: string; amount: bigint; txHash: string }
   ): Promise<void> {
+    const decimals = ASSET_DECIMALS[asset] ?? 18;
+    const amount = Number(event.amount) / 10 ** decimals;
+
+    // DUST FILTER: ignore anything below the minimum — no credit, no record,
+    // no notification. The BNB baseline already advanced, so it won't re-alert.
+    const minAmount = MIN_DEPOSIT[asset] ?? 0.1;
+    if (amount < minAmount) {
+      logger.info(`Ignoring dust ${asset} deposit of ${amount} (< min ${minAmount}) for ${wallet.address}`);
+      return;
+    }
+
     const existing = await prisma.transaction.findFirst({
       where: { transactionHash: event.txHash },
     });
@@ -121,10 +133,8 @@ class DepositMonitorService {
     });
     if (seen?.status === 'PROCESSED') return;
 
-    // getLogs events are already confirmed; balance-diff deposits are too
-    const decimals = ASSET_DECIMALS[asset] ?? 18;
-    const amount = Number(event.amount) / 10 ** decimals;
-    if (amount <= 0) return;
+    const receipt = await blockchain.getTransactionReceipt(event.txHash);
+    if (!receipt || receipt.status !== 1) return;
 
     const feePercent = config.ENABLE_FEES ? config.PLATFORM_FEE_PERCENT : 0;
     const fee = amount * (feePercent / 100);
@@ -161,6 +171,8 @@ class DepositMonitorService {
       });
       depositTxId = depositTx.id;
 
+      // Fee ACCUMULATES as an unswept platformFee row — collected later by the
+      // admin Fee Sweep (no per-deposit on-chain movement).
       if (fee > 0) {
         await tx.platformFee.create({
           data: {
@@ -180,64 +192,47 @@ class DepositMonitorService {
 
     logger.info(`Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 20)}...)`);
 
-    // Forward the fee ON-CHAIN (needs a little BNB for gas in the wallet)
-    if (fee > 0) {
-      try {
-        const rawFee = BigInt(Math.floor(fee * 1e18));
-        const { hash } = await blockchain.sendTransaction(
-          wallet.encryptedPrivateKey,
-          config.PLATFORM_FEE_WALLET,
-          rawFee,
-          asset as 'BNB' | 'USDT',
-          hashIdempotencyKey('fee-forward', event.txHash)
-        );
-
-        await prisma.transaction.create({
-          data: {
-            userId: wallet.userId,
-            type: 'PLATFORM_FEE',
-            asset,
-            amount: fee,
-            fee: 0,
-            netAmount: fee,
-            status: 'CONFIRMED',
-            transactionHash: hash,
-            toAddress: config.PLATFORM_FEE_WALLET,
-            metadata: { depositTxId, depositTxHash: event.txHash },
-            idempotencyKey: hashIdempotencyKey('fee-forward-tx', event.txHash),
-          },
-        });
-
-        logger.info(`Fee forwarded: ${fee} ${asset} → fee wallet`);
-      } catch (err) {
-        logger.error(`Fee forward failed for ${event.txHash} (recorded for manual sweep): ${(err as Error).message}`);
-      }
-    }
-
     if (wallet.user.chatId) {
       await this.notify(
         wallet.user.chatId,
-        `🟢 <b>DEPOSIT RECEIVED</b>\n\n<b>Amount:</b> ${amount} ${asset}\n` +
+        `${'🟢'} <b>DEPOSIT RECEIVED</b>\n\n` +
+        `<b>Amount:</b> ${amount} ${asset}\n` +
         (fee > 0 ? `<b>Fee:</b> ${fee.toFixed(6)} ${asset}\n<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n` : '') +
-        `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`
+        `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`,
+        30000 // auto-delete after 30 seconds
       );
     }
   }
 
-  private async notify(chatId: string, html: string): Promise<void> {
+  /**
+   * Sends a notification and deletes it after `ttlMs` — keeps the chat clean
+   * while still alerting the user. Best-effort; deletion failure is ignored.
+   */
+  private async notify(chatId: string, html: string, ttlMs = 30000): Promise<void> {
     try {
-      await fetch(`https://api.telegram.org/bot${config.BOT_TOKEN}/sendMessage`, {
+      const res = await fetch(`https://api.telegram.org/bot${config.BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text: html, parse_mode: 'HTML' }),
       });
+      const data = (await res.json()) as { ok: boolean; result?: { message_id: number } };
+      const messageId = data?.result?.message_id;
+
+      if (messageId) {
+        const timer = setTimeout(() => {
+          fetch(`https://api.telegram.org/bot${config.BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+          }).catch(() => {});
+        }, ttlMs);
+        timer.unref?.();
+      }
     } catch (err) {
       logger.error('Deposit notify failed:', err);
     }
   }
 }
 
-import cron from 'node-cron';
-
 export const depositMonitor = new DepositMonitorService();
-                                        
+      
