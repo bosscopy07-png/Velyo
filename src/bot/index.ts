@@ -62,7 +62,7 @@ function startBackgroundJobs(): void {
   // In-process background jobs (single service deployment, e.g. Render)
   depositMonitor.start();
   claimExpiry.start();
-  // balanceSync.start();  // DISABLED — wrongly adjusts balances (gas seeds & old fee rows)
+  balanceSync.start();  // DISABLED — wrongly adjusts balances (gas seeds & old fee rows)
 }
 
 async function shutdown(signal: string): Promise<void> {
