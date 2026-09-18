@@ -7,8 +7,8 @@ import cron from 'node-cron';
 
 /** Ignore differences smaller than this (chain dust / rounding) */
 const SYNC_TOLERANCE: Record<string, number> = {
-  USDT: 0.000001,
-  BNB: 0.0000001,
+  USDT: 0.1,
+  BNB: 0.00001,
 };
 
 const SYNC_ASSETS = ['USDT', 'BNB'] as const;
