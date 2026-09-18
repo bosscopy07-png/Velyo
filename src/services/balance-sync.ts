@@ -26,6 +26,7 @@ interface SyncContext {
   locked: number;
   unsweptFees: number;
   redeemCredits: number;
+  gasRefunds: number;
 }
 
 class BalanceSyncService {
@@ -69,20 +70,23 @@ class BalanceSyncService {
   }
 
   /**
-   * expectedOnChain = available + locked + unsweptFees − redeemCredits
+   * expectedOnChain = available + locked + unsweptFees − redeemCredits − gasRefunds
    *
    *   available     → user's spendable balance (what they could withdraw)
    *   locked        → giveaway escrow held for the creator
    *   unsweptFees   → USDT fees owed to platform, still sitting in the wallet
    *   redeemCredits → USDT credited to the user's app balance via redeem codes,
    *                   NOT yet funded on-chain (code redemptions are app-side)
+   *   gasRefunds    → USDT refunded to the creator for unused seeded BNB
+   *                   (giveaway.reclaimGas) — app credit, no on-chain movement
    *
    * Anything beyond tolerance = a movement the deposit monitor missed → self-heal.
    */
   private async syncOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
     const ctx = await this.gatherState(userId, address, asset);
 
-    const expected = ctx.available + ctx.locked + ctx.unsweptFees - ctx.redeemCredits;
+    const expected =
+      ctx.available + ctx.locked + ctx.unsweptFees - ctx.redeemCredits - ctx.gasRefunds;
     const diff = ctx.onChain - expected;
 
     if (Math.abs(diff) < (SYNC_TOLERANCE[asset] ?? 0.000001)) return;
@@ -104,13 +108,24 @@ class BalanceSyncService {
       where: { userId_asset: { userId, asset } },
     });
 
-    const [feesAgg, redeemAgg] = await Promise.all([
+    const [feesAgg, redeemAgg, gasRefundAgg] = await Promise.all([
       prisma.platformFee.aggregate({
         where: { sweptAt: null, asset, transaction: { userId } },
         _sum: { amount: true },
       }),
       prisma.codeRedemption.aggregate({
         where: { userId, code: { asset } },
+        _sum: { amount: true },
+      }),
+      // Gas refunds (kind: 'gas_refund') are app-credit USDT — subtract them
+      // from the expectation just like redeem credits.
+      prisma.transaction.aggregate({
+        where: {
+          userId,
+          asset,
+          type: 'REFUND',
+          metadata: { path: ['kind'], equals: 'gas_refund' },
+        },
         _sum: { amount: true },
       }),
     ]);
@@ -124,6 +139,7 @@ class BalanceSyncService {
       locked: Number(balance?.lockedBalance ?? 0),
       unsweptFees: Number(feesAgg._sum.amount ?? 0),
       redeemCredits: Number(redeemAgg._sum.amount ?? 0),
+      gasRefunds: Number(gasRefundAgg._sum.amount ?? 0),
     };
   }
 
@@ -134,8 +150,7 @@ class BalanceSyncService {
    * Idempotency: two adjustments for the same user+asset inside the same
    * 2-minute window share a bucket key. If a collision occurs (rare — drift
    * is normally one-shot per missed event), the insert fails on the unique
-   * constraint; we swallow that specific error and retry next run, since the
-   * balance row itself is already correct (upsert-based increment).
+   * constraint; we log and rethrow so the next tick retries cleanly.
    */
   private async applyAdjustment(ctx: SyncContext, expected: number, diff: number): Promise<void> {
     const bucket = String(Math.floor(Date.now() / SYNC_KEY_WINDOW_MS));
@@ -175,9 +190,6 @@ class BalanceSyncService {
         });
       });
     } catch (err) {
-      // Unique-constraint collision on idempotencyKey — the balance row was
-      // already adjusted above (transaction rolled back together though, so
-      // retry cleanly on the next sync tick instead).
       logger.warn(
         `Balance sync adjustment for ${ctx.address} ${ctx.asset} deferred: ${(err as Error).message}`
       );
