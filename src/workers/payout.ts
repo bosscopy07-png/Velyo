@@ -7,7 +7,10 @@ import { logger } from '../utils/logger';
 
 const MIN_GAS_WEI = 1500000000000000n; // 0.0015 BNB
 const CONFIRMATIONS = 15;
-const CONFIRM_TIMEOUT_MS = 300000;
+const CONFIRM_TIMEOUT_MS = 300_000;
+
+/** Claim states that are allowed to enter PROCESSING (terminal states excluded) */
+const PAYOUTABLE_STATUSES = ['QUEUED', 'RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'PROCESSING'] as const;
 
 /** Errors where retrying is pointless — the tx will revert identically every time. */
 function isPermanentRevert(err: unknown): boolean {
@@ -16,7 +19,7 @@ function isPermanentRevert(err: unknown): boolean {
     msg.includes('transfer amount exceeds balance') ||
     msg.includes('insufficient funds') ||
     msg.includes('INSUFFICIENT_FUNDS') ||
-    msg.includes('execution reverted') && msg.includes('BEP20')
+    (msg.includes('execution reverted') && msg.includes('BEP20'))
   );
 }
 
@@ -38,28 +41,34 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   });
 
   if (!claim) throw new UnrecoverableError('Claim not found');
+
   if (claim.status === 'PAID') {
     logger.info(`Claim ${claimId} already PAID (tx ${claim.payoutTransactionHash})`);
     return { status: 'already_paid', hash: claim.payoutTransactionHash };
   }
 
-  // Crash-recovery: we broadcast a tx previously but never finalized.
-  if (claim.status === 'PROCESSING' && claim.payoutTransactionHash) {
-    const receipt = await blockchain.getTransactionReceipt(claim.payoutTransactionHash);
-    if (receipt?.status === 1) {
-      await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, claim.payoutTransactionHash, idempotencyKey);
-      await maybeReclaimGas(claim.giveawayId);
-      return { status: 'completed', hash: claim.payoutTransactionHash };
+  // ── Crash recovery: broadcast previously but never finalized ──
+  if (claim.status === 'PROCESSING') {
+    if (claim.payoutTransactionHash) {
+      const receipt = await blockchain.getTransactionReceipt(claim.payoutTransactionHash);
+      if (receipt?.status === 1) {
+        await finalizePaid(claim, userId, address, amount, idempotencyKey, claim.payoutTransactionHash);
+        await maybeReclaimGas(claim.giveawayId);
+        return { status: 'completed', hash: claim.payoutTransactionHash };
+      }
+      // Dropped or reverted on-chain — clear the stale hash and rebroadcast below
+      logger.warn(`Stale PROCESSING hash ${claim.payoutTransactionHash} for claim ${claimId} — will rebroadcast`);
+      await prisma.giveawayClaim.update({
+        where: { id: claimId },
+        data: { payoutTransactionHash: null },
+      });
+    } else {
+      // PROCESSING with no hash = worker died before broadcasting — safe to retry
+      logger.info(`Claim ${claimId} stuck PROCESSING without hash — retrying`);
     }
-    // Tx dropped or reverted on-chain — clear the stale hash and fall through to resend
-    logger.warn(`Stale PROCESSING hash ${claim.payoutTransactionHash} for claim ${claimId} — will rebroadcast`);
-    await prisma.giveawayClaim.update({
-      where: { id: claimId },
-      data: { payoutTransactionHash: null },
-    });
   }
 
-  // ── Preflight: verify on-chain funds BEFORE broadcasting ──────────────
+  // ── Preflight: verify on-chain funds BEFORE broadcasting ──
   const creatorWallet = await prisma.wallet.findUnique({
     where: { userId: claim.giveaway.creatorId },
   });
@@ -85,13 +94,12 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
     logger.warn(`Creator wallet ${creatorWallet.address} low on BNB (${gasBal} wei) — payout may fail`);
   }
 
-  // ── Mark PROCESSING (idempotent, only from a non-terminal state) ──────
+  // ── Mark PROCESSING (guarded — only one worker wins per claim) ──
   const marked = await prisma.giveawayClaim.updateMany({
-    where: { id: claimId, status: { in: ['QUEUED', 'RESERVED', 'ADDRESS_CONFIRMED', 'PROCESSING'] } },
+    where: { id: claimId, status: { in: [...PAYOUTABLE_STATUSES] } },
     data: { status: 'PROCESSING' },
   });
   if (marked.count === 0) {
-    // Another worker picked it up concurrently — let it win
     return { status: 'concurrent_skip' };
   }
 
@@ -114,7 +122,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
       throw new Error('Transaction failed on chain');
     }
 
-    await finalizePaid(claimId, userId, claim.giveaway.creatorId, asset, amount, address, hash, idempotencyKey);
+    await finalizePaid(claim, userId, address, amount, idempotencyKey, hash);
     await maybeReclaimGas(claim.giveawayId);
 
     logger.info(`Payout completed: ${hash} for claim ${claimId}`);
@@ -128,7 +136,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
       throw new UnrecoverableError(`Permanent payout failure for claim ${claimId}: ${msg}`);
     }
 
-    // Transient (RPC, network, timeout) — revert to QUEUED so the retry is clean
+    // Transient (RPC, network, timeout) — revert to QUEUED for a clean retry
     logger.error(`Transient payout failure for claim ${claimId}: ${msg} — will retry`);
     await prisma.giveawayClaim.update({
       where: { id: claimId },
@@ -143,8 +151,8 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
 /**
  * A payout that can never succeed: return the locked slice to the creator's
- * available balance and mark the claim terminal. Idempotent — safe to call
- * once per claim (guarded by the FAILED transition).
+ * available balance and mark the claim terminal. Idempotent — guarded by the
+ * FAILED transition so a double-call never double-refunds.
  */
 async function unwindFailedPayout(
   claimId: string,
@@ -155,7 +163,7 @@ async function unwindFailedPayout(
 ): Promise<void> {
   const res = await prisma.giveawayClaim.updateMany({
     where: { id: claimId, status: { notIn: ['PAID', 'FAILED'] } },
-    data: { status: 'FAILED', failedReason: reason },
+    data: { status: 'FAILED', failedReason: reason.slice(0, 500) },
   });
   if (res.count === 0) return; // already terminal — don't double-refund
 
@@ -171,14 +179,14 @@ async function unwindFailedPayout(
     await tx.transaction.create({
       data: {
         userId: creatorId,
-        type: 'GIVEAWAY_REFUND',
+        type: 'REFUND',
         asset,
         amount,
         fee: 0,
         netAmount: amount,
         status: 'CONFIRMED',
         idempotencyKey: `payout-unwind-${claimId}`,
-        metadata: { claimId, reason },
+        metadata: { kind: 'payout_unwind', claimId, reason },
       },
     });
   });
@@ -188,8 +196,7 @@ async function unwindFailedPayout(
 
 /**
  * Reclaim seeded gas once every claim is in a terminal state (PAID or FAILED).
- * Previously this required ALL claims PAID — one permanent failure meant the
- * BNB seed sat in the wallet forever.
+ * Requiring ALL claims PAID would strand the BNB seed forever when one fails.
  */
 async function maybeReclaimGas(giveawayId: string): Promise<void> {
   try {
@@ -208,34 +215,37 @@ async function maybeReclaimGas(giveawayId: string): Promise<void> {
   }
 }
 
+/**
+ * Finalize a confirmed payout: guarded PAID transition, release the creator's
+ * locked slice, record the reward tx, and link it to the claim via the
+ * schema's payoutTransactionId relation.
+ */
 async function finalizePaid(
-  claimId: string,
+  claim: { id: string; giveaway: { creatorId: string; asset: string } },
   userId: string,
-  creatorId: string,
-  asset: string,
-  amount: number,
   address: string,
-  hash: string,
-  idempotencyKey: string
+  amount: number,
+  idempotencyKey: string,
+  hash: string
 ): Promise<void> {
   // Guarded transition: only one finalize ever runs per claim
   const res = await prisma.giveawayClaim.updateMany({
-    where: { id: claimId, status: { not: 'PAID' } },
+    where: { id: claim.id, status: { not: 'PAID' } },
     data: { status: 'PAID', payoutTransactionHash: hash },
   });
   if (res.count === 0) return;
 
   await prisma.$transaction(async (tx) => {
     await tx.balance.update({
-      where: { userId_asset: { userId: creatorId, asset } },
+      where: { userId_asset: { userId: claim.giveaway.creatorId, asset: claim.giveaway.asset } },
       data: { lockedBalance: { decrement: amount } },
     });
 
-    await tx.transaction.create({
+    const payoutTx = await tx.transaction.create({
       data: {
         userId,
         type: 'GIVEAWAY_REWARD',
-        asset,
+        asset: claim.giveaway.asset,
         amount,
         fee: 0,
         netAmount: amount,
@@ -244,6 +254,11 @@ async function finalizePaid(
         toAddress: address,
         idempotencyKey: `${idempotencyKey}_tx`,
       },
+    });
+
+    await tx.giveawayClaim.update({
+      where: { id: claim.id },
+      data: { payoutTransactionId: payoutTx.id },
     });
   });
 }
@@ -261,4 +276,4 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info('Payout worker started');
-                                         
+             
