@@ -536,4 +536,148 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
  * deficit, forwards the fee. The user's own BNB is never touched.
  */
 async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
-  const wallet = await prisma.wallet.findUnique({ where: {
+  const wallet = await prisma.wallet.findUnique({ where: { userId } });
+  if (!wallet) throw new Error('no wallet');
+
+  const baseline = await blockchain.getBalance(wallet.address, 'BNB');
+
+  if (baseline < SWEEP_GAS_SEED) {
+    if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
+    const seedAmount = SWEEP_GAS_SEED - baseline + SWEEP_SEED_BUFFER_WEI; // deficit + buffer
+    await blockchain.sendTransaction(
+      config.OPERATOR_WALLET_KEY,
+      wallet.address,
+      seedAmount,
+      'BNB',
+      `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
+    );
+    // Admin's app balance reflects the seed BNB that left their wallet
+    await walletService.adjustOperatorBalance('BNB', -Number(seedAmount) / 1e18);
+  }
+
+  const rawFee = BigInt(Math.floor(amountUSDT * 1e18));
+  const { hash } = await blockchain.sendTransaction(
+    wallet.encryptedPrivateKey,
+    config.PLATFORM_FEE_WALLET,
+    rawFee,
+    'USDT',
+    `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
+  );
+
+  await prisma.platformFee.updateMany({
+    where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
+    data: { sweptAt: new Date() },
+  });
+
+  // The fee arrived in the admin wallet on-chain — reflect it in the app balance
+  await walletService.adjustOperatorBalance('USDT', amountUSDT);
+
+  return hash;
+}
+
+async function runSweep(ctx: Context): Promise<void> {
+  const eligible = (await getUnsweptFees()).filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
+  let done = 0;
+  let failed = 0;
+
+  for (const f of eligible) {
+    try {
+      await sweepOne(f.userId, f.total);
+      done++;
+    } catch (err) {
+      failed++;
+      logger.error(`Sweep failed for user ${f.userId}: ${(err as Error).message}`);
+    }
+
+    try {
+      await editMainMessage(
+        ctx,
+        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n` +
+        `${DIVIDER}\n\n` +
+        `${e('people')} Processed: <b>${done + failed}/${eligible.length}</b>\n` +
+        `${e('check')} Done: <b>${done}</b>\n` +
+        `${e('cancel')} Failed: <b>${failed}</b>`,
+        Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
+      );
+    } catch { /* message may be too old to edit — ignore */ }
+
+    await new Promise((r) => setTimeout(r, SWEEP_STAGGER_MS));
+  }
+
+  await editMainMessage(
+    ctx,
+    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n` +
+    `${DIVIDER}\n\n` +
+    `${e('money')} Pulled from: <b>${done}</b> wallet(s)\n` +
+    `${e('cancel')} Failed: <b>${failed}</b>`,
+    Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
+  );
+}
+
+// ─────────────────────────── DASHBOARD ───────────────────────────
+
+async function renderDashboard(ctx: Context): Promise<void> {
+  const stats = await getAdminStats();
+
+  await editMainMessage(
+    ctx,
+    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n` +
+    `${DIVIDER}\n\n` +
+    `${e('people')} <b>Users</b>\n` +
+    `└ Total: <b>${stats.totalUsers}</b>\n` +
+    `└ New Today: <b>${stats.newUsersToday}</b>\n` +
+    `└ Active Today: <b>${stats.activeUsersToday}</b>\n\n` +
+    `${e('money')} <b>Finance</b>\n` +
+    `└ Total Deposits: <b>${stats.totalDeposits}</b>\n` +
+    `└ Fees Collected: <b>$${stats.totalFees}</b>\n` +
+    `└ USDT Held: <b>$${stats.totalUSDT}</b>\n` +
+    `└ BNB Held: <b>${stats.totalBNB}</b>\n\n` +
+    `${e('gift')} <b>Giveaways</b>\n` +
+    `└ Total: <b>${stats.totalGiveaways}</b>\n` +
+    `└ Active: <b>${stats.activeGiveaways}</b>\n` +
+    `└ Pending Payouts: <b>${stats.pendingPayouts}</b>`,
+    adminPanelKeyboard
+  );
+}
+
+async function getAdminStats() {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const [
+    totalUsers,
+    newUsersToday,
+    activeUsersToday,
+    totalDeposits,
+    totalFees,
+    totalUSDT,
+    totalBNB,
+    totalGiveaways,
+    activeGiveaways,
+    pendingPayouts,
+  ] = await Promise.all([
+    prisma.user.count(),
+    prisma.user.count({ where: { joinDate: { gte: today } } }),
+    prisma.user.count({ where: { lastActive: { gte: today } } }),
+    prisma.transaction.count({ where: { type: 'DEPOSIT', status: 'CONFIRMED' } }),
+    prisma.platformFee.aggregate({ _sum: { amount: true } }),
+    prisma.balance.aggregate({ where: { asset: 'USDT' }, _sum: { availableBalance: true } }),
+    prisma.balance.aggregate({ where: { asset: 'BNB' }, _sum: { availableBalance: true } }),
+    prisma.giveaway.count(),
+    prisma.giveaway.count({ where: { status: 'ACTIVE' } }),
+    prisma.giveawayClaim.count({ where: { status: { in: ['QUEUED', 'PROCESSING'] } } }),
+  ]);
+
+  return {
+    totalUsers,
+    newUsersToday,
+    activeUsersToday,
+    totalDeposits,
+    totalFees: Number(totalFees._sum.amount || 0).toFixed(2),
+    totalUSDT: Number(totalUSDT._sum.availableBalance || 0).toFixed(2),
+    totalBNB: Number(totalBNB._sum.availableBalance || 0).toFixed(6),
+    totalGiveaways,
+    activeGiveaways,
+    pendingPayouts,
+  };
+}
