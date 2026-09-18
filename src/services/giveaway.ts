@@ -67,6 +67,36 @@ class GiveawayService {
     const fee = cost.fee;
     const totalCost = data.totalAmount + fee;
 
+    // ── REAL-BALANCE GATE ──
+    // The DB ledger can hold phantom credits (redeem codes, gas refunds,
+    // historical miscredits). Only on-chain truth may fund a giveaway —
+    // payouts send real tokens from the creator's wallet.
+    const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
+    if (creatorWallet) {
+      const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
+      const onChain = Number(raw) / 1e18;
+
+      const [lockedRow, pendingFees] = await Promise.all([
+        prisma.balance.findUnique({
+          where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
+        }),
+        prisma.platformFee.aggregate({
+          where: { sweptAt: null, asset: data.asset, transaction: { userId: data.creatorId } },
+          _sum: { amount: true },
+        }),
+      ]);
+
+      const realAvailable =
+        onChain - Number(lockedRow?.lockedBalance ?? 0) - Number(pendingFees._sum.amount ?? 0);
+
+      if (realAvailable < totalCost) {
+        throw new Error(
+          `Insufficient ${data.asset} — your wallet holds ${realAvailable.toFixed(6)} ${data.asset} on-chain ` +
+          `(need ${totalCost.toFixed(6)} including fees). Deposit more ${data.asset} first.`
+        );
+      }
+    }
+
     const giveaway = await prisma.$transaction(async (tx) => {
       const balance = await tx.balance.findUnique({
         where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
@@ -75,8 +105,7 @@ class GiveawayService {
       if (available < totalCost) {
         throw new Error(
           `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
-          `need ${totalCost.toFixed(6)} ${data.asset} (amount ${data.totalAmount} + fee ${fee.toFixed(6)}). ` +
-          `Deposit more ${data.asset} first.`
+          `need ${totalCost.toFixed(6)}. Deposit more ${data.asset} first.`
         );
       }
 
@@ -255,9 +284,10 @@ class GiveawayService {
       logger.info(`Gas reclaimed for ${giveawayId}: ${Number(sendBack) / 1e18} BNB → admin (tx ${hash})`);
       await walletService.adjustOperatorBalance('BNB', Number(sendBack) / 1e18);
 
-      // Refund the creator the USDT value of the reclaimed BNB
-      const units = Number(sendBack) / 1e18 / GAS_PER_CLAIM_BNB;
-      const refundUSDT = await estimateGasUSDT(units);
+      // Refund the creator the USDT value of the reclaimed BNB.
+      // kind: 'gas_refund' is REQUIRED — balance-sync subtracts these from
+      // the on-chain expectation; without it the refund gets clawed back.
+      const refundUSDT = await estimateGasUSDT(Number(sendBack) / 1e18 / GAS_PER_CLAIM_BNB);
       if (refundUSDT > 0) {
         await walletService.creditFunds(wallet.userId, 'USDT', refundUSDT);
         await prisma.transaction.create({
@@ -449,3 +479,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
+          
