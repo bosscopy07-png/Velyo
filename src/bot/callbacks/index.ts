@@ -3,7 +3,8 @@ import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
-import { setUserSession } from '../../services/redis';
+import { blockchain } from '../../services/blockchain';
+import { redis, setUserSession } from '../../services/redis';
 import { config } from '../../config';
 import { e, eb } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
@@ -14,7 +15,6 @@ import {
   depositKeyboard,
   giveawayTypeKeyboard,
   backKeyboard,
-  confirmCancelKeyboard,
   assetKeyboard,
 } from '../keyboards/main';
 import { formatAddress } from '../../utils/validation';
@@ -26,6 +26,41 @@ const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 export function registerCallbacks(bot: any): void {
   const isAdmin = (ctx: Context): boolean =>
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
+
+  /**
+   * Platform money sitting in the user's wallet that is NOT spendable:
+   *  - unswept USDT platform fees (owed to the platform until swept/forwarded)
+   *  - seeded BNB gas floats (recorded in Redis gas:credit:*, reclaimed later)
+   * These must be subtracted from what we display, or users see money they
+   * can't actually use (the giveaway creation gate subtracts them too).
+   */
+  async function getPlatformReserve(userId: string, address: string): Promise<{ USDT: number; BNB: number }> {
+    const reserve = { USDT: 0, BNB: 0 };
+
+    // Unswept fees owed on this user's deposits/giveaways
+    const feesAgg = await prisma.platformFee.aggregate({
+      where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
+      _sum: { amount: true },
+    });
+    reserve.USDT = Number(feesAgg._sum.amount ?? 0);
+
+    // Active seeded gas floats for this address (across all its giveaways)
+    try {
+      for await (const key of redis.scanIterator({ MATCH: 'gas:credit:*', COUNT: 200 })) {
+        const raw = await redis.get(key);
+        if (!raw) continue;
+        const credit = JSON.parse(raw) as { address: string; seeded: string };
+        if (credit.address === address && BigInt(credit.seeded) > 0n) {
+          reserve.BNB += Number(BigInt(credit.seeded)) / 1e18;
+        }
+      }
+    } catch (err) {
+      // Float lookup is best-effort — never block the wallet view on it
+      logger.warn(`Gas float lookup failed for ${address}: ${(err as Error).message}`);
+    }
+
+    return reserve;
+  }
 
   async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
@@ -46,14 +81,34 @@ export function registerCallbacks(bot: any): void {
 
     if (!user?.wallet) return;
 
-    const balances = (['BNB', 'USDT'] as const).map((asset) => {
-      const db = user!.balances.find((b) => b.asset === asset);
-      return {
-        asset,
-        available: Number(db?.availableBalance ?? 0),
-        locked: Number(db?.lockedBalance ?? 0),
-      };
-    });
+    // LIVE on-chain balances minus everything that's reserved:
+    //   locked          → giveaway escrow (DB is authoritative)
+    //   unswept fees    → platform's USDT, still in the wallet
+    //   gas floats      → seeded BNB, reclaimed by admin later
+    // The DB is only a fallback if the chain read fails.
+    const reserve = await getPlatformReserve(user.id, user.wallet.address);
+
+    const balances = await Promise.all(
+      (['BNB', 'USDT'] as const).map(async (asset) => {
+        const db = user!.balances.find((b) => b.asset === asset);
+        const locked = Number(db?.lockedBalance ?? 0);
+        const platformReserve = reserve[asset] ?? 0;
+
+        let onChain = Number(db?.availableBalance ?? 0);
+        try {
+          const raw = await blockchain.getBalance(user!.wallet!.address, asset);
+          onChain = Number(raw) / 1e18;
+        } catch (err) {
+          logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
+        }
+
+        return {
+          asset,
+          available: Math.max(0, onChain - locked - platformReserve),
+          locked,
+        };
+      })
+    );
 
     const caption = await formatWalletMessage(balances);
     await editMainMessage(ctx, caption, walletKeyboard);
@@ -125,10 +180,11 @@ export function registerCallbacks(bot: any): void {
       logger.error(`Callback error: ${(err as Error).message}`, err);
       try {
         await ctx.answerCbQuery('Something went wrong. Try again.', { show_alert: true });
-      } catch {}
+      } catch { /* ignore */ }
     }
   };
 
+  // === MAIN NAVIGATION ===
   bot.action('main', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await editMainMessage(
@@ -141,6 +197,7 @@ export function registerCallbacks(bot: any): void {
     );
   }));
 
+  // === ADMIN BROADCAST ===
   bot.action('admin:broadcast', guard(async (ctx: Context) => {
     if (!isAdmin(ctx)) {
       await ctx.answerCbQuery('Not authorized.', { show_alert: true });
@@ -155,6 +212,7 @@ export function registerCallbacks(bot: any): void {
     );
   }));
 
+  // === WALLET ===
   bot.action('wallet', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await renderWallet(ctx);
@@ -165,6 +223,7 @@ export function registerCallbacks(bot: any): void {
     await renderWallet(ctx);
   }));
 
+  // === DEPOSIT ===
   bot.action('wallet:deposit', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await editMainMessage(
@@ -224,6 +283,7 @@ export function registerCallbacks(bot: any): void {
     await renderHistory(ctx);
   }));
 
+  // === GIVEAWAY ===
   bot.action('giveaway', guard(async (ctx: Context) => {
     if (!config.ENABLE_GIVEAWAYS) {
       await ctx.answerCbQuery('Giveaways are temporarily disabled.', { show_alert: true });
@@ -293,6 +353,7 @@ export function registerCallbacks(bot: any): void {
     );
   }));
 
+  // === MY GIVEAWAYS ===
   bot.action('giveaway:mine', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
@@ -309,7 +370,7 @@ export function registerCallbacks(bot: any): void {
 
     const result = await giveawayService.cancelGiveaway(giveawayId, user.id);
     await ctx.answerCbQuery(
-      result.success ? 'Giveaway cancelled. Funds returned.' : result.reason,
+      result.success ? 'Giveaway cancelled. Funds returned.' : result.reason!,
       { show_alert: !result.success }
     );
     if (result.success) {
@@ -317,6 +378,7 @@ export function registerCallbacks(bot: any): void {
     }
   }));
 
+  // === GIVEAWAY STATISTICS ===
   bot.action(/giveaway:stats:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -344,11 +406,13 @@ export function registerCallbacks(bot: any): void {
     await editMainMessage(ctx, text, backKeyboard('giveaway:mine'));
   }));
 
+  // === HISTORY ===
   bot.action('history', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await renderHistory(ctx);
   }));
 
+  // === ACCOUNT ===
   bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
@@ -393,6 +457,7 @@ export function registerCallbacks(bot: any): void {
     await editMainMessage(ctx, caption, keyboard);
   }));
 
+  // === HELP ===
   bot.action('help', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await editMainMessage(
@@ -407,7 +472,7 @@ export function registerCallbacks(bot: any): void {
       `• Deposits require blockchain confirmations.\n\n` +
       `<b>Giveaways</b>\n` +
       `• Create single or multiple claim giveaways.\n` +
-      `• A 1% platform fee + network gas applies at creation.\n` +
+      `• A ${config.PLATFORM_FEE_PERCENT}% platform fee + network gas applies at creation.\n` +
       `• Funds are locked until claimed or cancelled.\n\n` +
       `<b>Support</b>\n` +
       `For assistance, contact @VeyloSupport`,
@@ -425,7 +490,12 @@ export function registerCallbacks(bot: any): void {
     if (!user) return;
 
     const amount = parseFloat(amountStr);
-    const maxClaimers = parseInt(claimersStr);
+    const maxClaimers = parseInt(claimersStr, 10);
+
+    if (!(amount > 0) || !(maxClaimers >= 1)) {
+      await ctx.answerCbQuery('Invalid giveaway parameters.', { show_alert: true });
+      return;
+    }
 
     try {
       const { giveawayId, secureCode } = await giveawayService.createGiveaway({
@@ -433,11 +503,14 @@ export function registerCallbacks(bot: any): void {
         asset: asset as any,
         totalAmount: amount,
         maxClaimers,
-        expiresAt: expiryHours ? new Date(Date.now() + parseInt(expiryHours) * 3600000) : undefined,
+        expiresAt: expiryHours ? new Date(Date.now() + parseInt(expiryHours, 10) * 3600000) : undefined,
       });
 
       const amountPerUser = amount / maxClaimers;
 
+      // Share URL opens Telegram's chat picker — the recipient gets the link
+      // as a normal message, so tapping it opens the bot FRESH and the
+      // ?start= payload is actually delivered.
       const claimUrl = `https://t.me/${BOT_USERNAME}?start=giveaway_${secureCode}`;
       const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(claimUrl)}&text=${encodeURIComponent(`🎁 Giveaway: ${amount} ${asset} on VEYLO — tap to claim!`)}`;
 
@@ -455,7 +528,7 @@ export function registerCallbacks(bot: any): void {
       await ctx.answerCbQuery('Giveaway created!');
     } catch (err) {
       logger.error('Giveaway creation error:', err);
-      await ctx.answerCbQuery((err as Error).message, { show_alert: true });
+      await ctx.answerCbQuery((err as Error).message.slice(0, 180), { show_alert: true });
     }
   }));
 
@@ -464,5 +537,4 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-                                       }
-                    
+}
