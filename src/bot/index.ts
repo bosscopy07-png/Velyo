@@ -1,21 +1,21 @@
 import { Telegraf } from 'telegraf';
 import express from 'express';
 import type { Server } from 'http';
-import { config } from './config';
-import { logger } from './utils/logger';
+import { config } from '../config';
+import { logger } from '../utils/logger';
 import { securityMiddleware } from './middleware/security';
 import { handleStart } from './commands/start';
 import { handleClaim } from './commands/claim';
 import { registerCallbacks } from './callbacks';
 import { registerTextHandlers } from './handlers/text';
-import { registerAdminCommands } from './admin/commands';
-import { depositMonitor } from './services/deposit-monitor';
-import { claimExpiry } from './services/claim-expiry';
-import { balanceSync } from './services/balance-sync';
-import { prisma } from './database';
-import { redis } from './services/redis';
-import './workers/payout';
-import './workers/cleanup';
+import { registerAdminCommands } from '../admin/commands';
+import { depositMonitor } from '../services/deposit-monitor';
+import { claimExpiry } from '../services/claim-expiry';
+import { balanceSync } from '../services/balance-sync';
+import { prisma } from '../database';
+import { redis } from '../services/redis';
+import '../workers/payout';
+import '../workers/cleanup';
 
 const bot = new Telegraf(config.BOT_TOKEN);
 
@@ -98,4 +98,3 @@ process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
 void main();
-  
