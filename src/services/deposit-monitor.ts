@@ -2,6 +2,8 @@ import cron from 'node-cron';
 import { prisma } from '../database';
 import { blockchain } from './blockchain';
 import { redis } from './redis';
+import { walletService } from './wallet';
+import { estimateGasUSDT } from './giveaway';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
@@ -9,10 +11,13 @@ import { hashIdempotencyKey } from '../utils/encryption';
 const ASSET_DECIMALS: Record<string, number> = { BNB: 18, USDT: 18 };
 const MAX_LOG_WINDOW = 500;
 
+/** 0.000002 BNB = 2×10^12 wei — enough for one BEP20 forward */
+const FORWARD_GAS_SEED = 2000000000000n;
+
 /** Deposits below these are ignored entirely (dust/spam protection) */
 const MIN_DEPOSIT: Record<string, number> = {
   BNB: 0.0001,
-  USDT: config.MINIMUM_AMOUNT_USD, // default 0.1 ($0.1)
+  USDT: config.MINIMUM_AMOUNT_USD,
 };
 
 const TG_API = `https://api.telegram.org/bot${config.BOT_TOKEN}`;
@@ -20,6 +25,7 @@ const TG_API = `https://api.telegram.org/bot${config.BOT_TOKEN}`;
 interface WalletRow {
   address: string;
   userId: string;
+  encryptedPrivateKey: string;
   user: { chatId: string | null; telegramId: string };
 }
 
@@ -35,7 +41,7 @@ class DepositMonitorService {
   start(): void {
     // Run every minute, at the top of the minute
     cron.schedule('0 * * * * *', () => void this.scanDeposits());
-    logger.info('Deposit monitor started (credit-efficient, dust-filtered)');
+    logger.info('Deposit monitor started (immediate fee forwarding mode)');
   }
 
   private async scanDeposits(): Promise<void> {
@@ -66,12 +72,7 @@ class DepositMonitorService {
         if (fromBlock > currentBlock) break;
 
         try {
-          const events = await blockchain.getTokenTransferEvents(
-            'USDT',
-            wallet.address,
-            fromBlock,
-            currentBlock,
-          );
+          const events = await blockchain.getTokenTransferEvents('USDT', wallet.address, fromBlock, currentBlock);
           for (const event of events) {
             await this.processDeposit(wallet, 'USDT', event);
           }
@@ -119,8 +120,8 @@ class DepositMonitorService {
     const decimals = ASSET_DECIMALS[asset] ?? 18;
     const amount = Number(event.amount) / 10 ** decimals;
 
-    // DUST FILTER: ignore anything below the minimum — no credit, no record,
-    // no notification. The BNB baseline already advanced, so it won't re-alert.
+    // DUST FILTER: below minimum — no credit, no record, no notification.
+    // The BNB baseline already advanced, so it won't re-alert.
     const minAmount = MIN_DEPOSIT[asset] ?? 0.1;
     if (amount < minAmount) {
       logger.info(`Ignoring dust ${asset} deposit of ${amount} (< min ${minAmount}) for ${wallet.address}`);
@@ -128,9 +129,7 @@ class DepositMonitorService {
     }
 
     // Idempotency: skip if we've already recorded this tx
-    const existing = await prisma.transaction.findFirst({
-      where: { transactionHash: event.txHash },
-    });
+    const existing = await prisma.transaction.findFirst({ where: { transactionHash: event.txHash } });
     if (existing) return;
 
     const seen = await prisma.depositMonitor.findUnique({
@@ -141,9 +140,12 @@ class DepositMonitorService {
     const receipt = await blockchain.getTransactionReceipt(event.txHash);
     if (!receipt || receipt.status !== 1) return;
 
+    // Fees: platform % + the BNB gas (priced in the asset) to forward it on-chain
     const feePercent = config.ENABLE_FEES ? config.PLATFORM_FEE_PERCENT : 0;
-    const fee = amount * (feePercent / 100);
-    const netAmount = amount - fee;
+    const platformFee = amount * (feePercent / 100);
+    const gasFee = platformFee > 0 ? await estimateGasUSDT(1) : 0;
+    const totalFee = platformFee + gasFee;
+    const netAmount = amount - totalFee;
 
     await prisma.depositMonitor.upsert({
       where: { txHash_address: { txHash: event.txHash, address: wallet.address } },
@@ -151,6 +153,7 @@ class DepositMonitorService {
       update: {},
     });
 
+    let feeRowId = '';
     await prisma.$transaction(async (tx) => {
       await tx.balance.upsert({
         where: { userId_asset: { userId: wallet.userId, asset } },
@@ -164,7 +167,7 @@ class DepositMonitorService {
           type: 'DEPOSIT',
           asset,
           amount,
-          fee,
+          fee: totalFee,
           netAmount,
           status: 'CONFIRMED',
           transactionHash: event.txHash,
@@ -174,17 +177,17 @@ class DepositMonitorService {
         },
       });
 
-      // Fee ACCUMULATES as an unswept platformFee row — collected later by the
-      // admin Fee Sweep (no per-deposit on-chain movement).
-      if (fee > 0) {
-        await tx.platformFee.create({
+      if (platformFee > 0) {
+        const feeRow = await tx.platformFee.create({
           data: {
             transactionId: depositTx.id,
             asset,
-            amount: fee,
+            amount: platformFee,
             feeWallet: config.PLATFORM_FEE_WALLET,
+            // sweptAt stays null until the on-chain forward below succeeds
           },
         });
+        feeRowId = feeRow.id;
       }
     });
 
@@ -193,19 +196,71 @@ class DepositMonitorService {
       data: { status: 'PROCESSED', processedAt: new Date() },
     });
 
-    logger.info(`Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 20)}...)`);
+    logger.info(`Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 16)}...)`);
+
+    // ── Immediate on-chain fee forwarding (USDT only) ──
+    if (platformFee > 0 && asset === 'USDT' && feeRowId) {
+      await this.forwardFee(wallet, event.txHash, platformFee, feeRowId, gasFee);
+    }
 
     if (wallet.user.chatId) {
       await this.notify(
         wallet.user.chatId,
         `🟢 <b>DEPOSIT RECEIVED</b>\n\n` +
         `<b>Amount:</b> ${amount} ${asset}\n` +
-        (fee > 0
-          ? `<b>Fee:</b> ${fee.toFixed(6)} ${asset}\n<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n`
-          : '') +
+        (platformFee > 0 ? `<b>Platform Fee (${feePercent}%):</b> ${platformFee.toFixed(6)} ${asset}\n` : '') +
+        (gasFee > 0 ? `<b>Network Gas:</b> ≈$${gasFee.toFixed(4)}\n` : '') +
+        `<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n` +
         `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`,
         30_000, // auto-delete after 30 seconds
       );
+    }
+  }
+
+  /**
+   * Sends the user's accumulated platform fee USDT to the fee wallet right
+   * away, seeding a gas deficit from the operator wallet first. Failures are
+   * non-fatal: the fee row stays unswept for the admin sweep.
+   */
+  private async forwardFee(
+    wallet: WalletRow,
+    txHash: string,
+    platformFee: number,
+    feeRowId: string,
+    gasFee: number
+  ): Promise<void> {
+    try {
+      const baseline = await blockchain.getBalance(wallet.address, 'BNB');
+      if (baseline < FORWARD_GAS_SEED) {
+        if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
+        const seedAmt = FORWARD_GAS_SEED - baseline;
+        await blockchain.sendTransaction(
+          config.OPERATOR_WALLET_KEY,
+          wallet.address,
+          seedAmt,
+          'BNB',
+          hashIdempotencyKey('fwd-seed', txHash)
+        );
+        await walletService.adjustOperatorBalance('BNB', -Number(seedAmt) / 1e18);
+      }
+
+      const rawFee = BigInt(Math.floor(platformFee * 1e18));
+      const { hash } = await blockchain.sendTransaction(
+        wallet.encryptedPrivateKey,
+        config.PLATFORM_FEE_WALLET,
+        rawFee,
+        'USDT',
+        hashIdempotencyKey('fee-forward', txHash)
+      );
+
+      await prisma.platformFee.update({
+        where: { id: feeRowId },
+        data: { sweptAt: new Date() },
+      });
+      await walletService.adjustOperatorBalance('USDT', platformFee);
+      logger.info(`Fee forwarded: ${platformFee} USDT → platform wallet (tx ${hash}, gas charge $${gasFee})`);
+    } catch (err) {
+      logger.error(`Fee forward failed for ${txHash} (fee stays pending for admin sweep): ${(err as Error).message}`);
     }
   }
 
@@ -240,4 +295,4 @@ class DepositMonitorService {
 }
 
 export const depositMonitor = new DepositMonitorService();
-        
+      
