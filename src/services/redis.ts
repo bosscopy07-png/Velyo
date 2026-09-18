@@ -32,21 +32,40 @@ bullmqConnection.on('connect', () => {
   logger.info('BullMQ Redis connected');
 });
 
-// Distributed lock for atomic giveaway claims
+// Graceful shutdown helper (wired into the SIGINT/SIGTERM handler)
+export async function closeConnections(): Promise<void> {
+  await Promise.allSettled([redis.quit(), bullmqConnection.quit()]);
+}
+
+// ─────────────────────────── Distributed locks ───────────────────────────
+
+/**
+ * Acquires a lock with an owner token. Returns the token on success, null if
+ * the lock is held by someone else. Caller MUST pass the token to releaseLock.
+ */
 export async function acquireLock(lockKey: string, ttlMs = 10000): Promise<string | null> {
   const token = `${Date.now()}-${Math.random()}`;
   const result = await redis.set(lockKey, token, 'PX', ttlMs, 'NX');
   return result === 'OK' ? token : null;
 }
 
+// Atomically "delete only if I still own it" — the naive get-then-del has a
+// race: if the lock expired and was re-acquired between GET and DEL, we'd
+// delete someone else's lock. Lua makes the check+delete atomic.
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+  else
+    return 0
+  end
+`;
+
 export async function releaseLock(lockKey: string, token: string): Promise<void> {
-  const current = await redis.get(lockKey);
-  if (current === token) {
-    await redis.del(lockKey);
-  }
+  await redis.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, token);
 }
 
-// Rate limiting
+// ─────────────────────────── Rate limiting ───────────────────────────
+
 export async function checkRateLimit(key: string, maxRequests: number, windowMs: number): Promise<boolean> {
   const windowKey = `ratelimit:${key}:${Math.floor(Date.now() / windowMs)}`;
   const current = await redis.incr(windowKey);
@@ -56,7 +75,8 @@ export async function checkRateLimit(key: string, maxRequests: number, windowMs:
   return current <= maxRequests;
 }
 
-// Session management
+// ─────────────────────────── Sessions ───────────────────────────
+
 export async function setUserSession(telegramId: string, data: Record<string, unknown>, ttl = 300): Promise<void> {
   await redis.setex(`session:${telegramId}`, ttl, JSON.stringify(data));
 }
@@ -70,7 +90,8 @@ export async function clearUserSession(telegramId: string): Promise<void> {
   await redis.del(`session:${telegramId}`);
 }
 
-// RPC fallback state
+// ─────────────────────────── RPC failover ───────────────────────────
+
 export async function markPrimaryRPCFailed(): Promise<void> {
   await redis.setex('rpc:primary:failed', 60, '1');
 }
@@ -80,18 +101,28 @@ export async function isPrimaryRPCFailed(): Promise<boolean> {
   return failed === '1';
 }
 
-// Giveaway claim tracking
+// ─────────────────────────── Giveaway tracking ───────────────────────────
+
 export async function trackGiveawayView(giveawayId: string): Promise<void> {
   await redis.incr(`giveaway:views:${giveawayId}`);
 }
 
 export async function getGiveawayViews(giveawayId: string): Promise<number> {
   const views = await redis.get(`giveaway:views:${giveawayId}`);
-  return parseInt(views || '0');
+  return parseInt(views || '0', 10);
 }
 
-// Idempotency for payouts
-export async function checkIdempotency(key: string): Promise<boolean> {
-  const exists = await redis.set(`idempotency:${key}`, '1', 'EX', 86400, 'NX');
-  return exists === 'OK';
-                                }
+// ─────────────────────────── Idempotency ───────────────────────────
+
+/**
+ * Claims an idempotency key. Returns TRUE if this is the FIRST time the key
+ * has been seen (caller should proceed), FALSE if it was already claimed
+ * (caller should abort as a duplicate).
+ *
+ * Note: this is the opposite of what a "check" returning boolean might imply
+ * — the old doc-less version caused bugs where callers inverted the logic.
+ */
+export async function claimIdempotencyKey(key: string, ttlSec = 86400): Promise<boolean> {
+  const result = await redis.set(`idempotency:${key}`, '1', 'EX', ttlSec, 'NX');
+  return result === 'OK';
+  }
