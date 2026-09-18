@@ -8,16 +8,22 @@ import { backKeyboard } from '../bot/keyboards/main';
 import { decrypt } from '../utils/encryption';
 import { redis, setUserSession } from '../services/redis';
 import { blockchain } from '../services/blockchain';
+import { walletService } from '../services/wallet';
 import { config } from '../config';
 import { formatAddress } from '../utils/validation';
 
 /** 0.000002 BNB = 2×10^12 wei (2,000,000,000,000) */
 const SWEEP_GAS_SEED = 2000000000000n;
+const SWEEP_SEED_BUFFER_WEI = 500000000000n; // 0.0000005 BNB buffer on top of deficit
 const SWEEP_THRESHOLD_USDT = 0.5;
 
 const USERS_PER_PAGE = 10;
 const FEES_PER_PAGE = 10;
 const GIVEAWAYS_PER_PAGE = 10;
+
+const SWEEP_LOCK_KEY = 'sweep:running';
+const SWEEP_LOCK_TTL_SEC = 1800;
+const SWEEP_STAGGER_MS = 3000;
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
 
@@ -50,10 +56,12 @@ function pager(prefix: string, page: number, totalPages: number, totalLabel: str
   return row;
 }
 
+// ─────────────────────────── REGISTRATION ───────────────────────────
+
 export function registerAdminCommands(bot: any): void {
   bot.command('admin', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
-    try { await ctx.deleteMessage(); } catch {}
+    try { await ctx.deleteMessage(); } catch { /* ignore */ }
     await renderDashboard(ctx);
   });
 
@@ -110,7 +118,7 @@ export function registerAdminCommands(bot: any): void {
   bot.action('admin:sweep:run', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
 
-    const lock = await redis.set('sweep:running', '1', 'EX', 1800, 'NX');
+    const lock = await redis.set(SWEEP_LOCK_KEY, '1', 'EX', SWEEP_LOCK_TTL_SEC, 'NX');
     if (!lock) {
       await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
       return;
@@ -120,7 +128,7 @@ export function registerAdminCommands(bot: any): void {
     try {
       await runSweep(ctx);
     } finally {
-      await redis.del('sweep:running');
+      await redis.del(SWEEP_LOCK_KEY);
     }
   });
 
@@ -315,7 +323,7 @@ export function registerAdminCommands(bot: any): void {
 
   bot.hears(/^[A-Z0-9]+\|(BNB|USDT)\|[\d.]+(\|\d+)?(\|\d+)?$/i, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
-    try { await ctx.deleteMessage(); } catch {}
+    try { await ctx.deleteMessage(); } catch { /* ignore */ }
 
     const text = (ctx.message as any).text as string;
     const [code, asset, amountStr, maxRedemptions = '1', expiryDays = '30'] = text.split('|');
@@ -325,8 +333,8 @@ export function registerAdminCommands(bot: any): void {
         code: code.toUpperCase(),
         asset: asset.toUpperCase(),
         rewardAmount: parseFloat(amountStr),
-        maxRedemptions: parseInt(maxRedemptions),
-        expiresAt: new Date(Date.now() + parseInt(expiryDays) * 86400000),
+        maxRedemptions: parseInt(maxRedemptions, 10),
+        expiresAt: new Date(Date.now() + parseInt(expiryDays, 10) * 86400000),
         createdBy: ctx.from!.id.toString(),
       },
     });
@@ -497,9 +505,17 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
 
   if (eligible.length > 0) {
     text += `<b>Ready to pull:</b>\n`;
+
+    // Single query instead of N+1 per-user lookups
+    const users = await prisma.user.findMany({
+      where: { id: { in: eligible.map((f) => f.userId) } },
+      select: { id: true, username: true, telegramId: true },
+    });
+    const userMap = new Map(users.map((u) => [u.id, u]));
+
     for (const f of eligible.slice(0, 15)) {
-      const u = await prisma.user.findUnique({ where: { id: f.userId } });
-      text += `• @${u?.username || u?.telegramId} — ${f.total.toFixed(4)} USDT\n`;
+      const u = userMap.get(f.userId);
+      text += `• @${u?.username || u?.telegramId || 'unknown'} — ${f.total.toFixed(4)} USDT\n`;
     }
     if (eligible.length > 15) text += `…and ${eligible.length - 15} more\n`;
   }
@@ -516,142 +532,8 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
 
 /**
  * Sweeps one user's accumulated fee USDT.
- * Snapshot-based: records BNB balance BEFORE seeding, seeds only the tiny
- * deficit (0.000002 BNB), forwards the fee. The user's own BNB is never touched.
+ * Snapshot-based: reads BNN balance BEFORE seeding, seeds only the tiny
+ * deficit, forwards the fee. The user's own BNB is never touched.
  */
 async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
-  const wallet = await prisma.wallet.findUnique({ where: { userId } });
-  if (!wallet) throw new Error('no wallet');
-
-  const baseline = await blockchain.getBalance(wallet.address, 'BNB');
-
-  if (baseline < SWEEP_GAS_SEED) {
-    if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
-    await blockchain.sendTransaction(
-      config.OPERATOR_WALLET_KEY,
-      wallet.address,
-      SWEEP_GAS_SEED - baseline + 500000000000n, // deficit + 5×10^11 wei (0.0000005) buffer
-      'BNB',
-      `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
-    );
-  }
-
-  const rawFee = BigInt(Math.floor(amountUSDT * 1e18));
-  const { hash } = await blockchain.sendTransaction(
-    wallet.encryptedPrivateKey,
-    config.PLATFORM_FEE_WALLET,
-    rawFee,
-    'USDT',
-    `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
-  );
-
-  await prisma.platformFee.updateMany({
-    where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
-    data: { sweptAt: new Date() },
-  });
-
-  return hash;
-}
-
-async function runSweep(ctx: Context): Promise<void> {
-  const eligible = (await getUnsweptFees()).filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
-  let done = 0;
-  let failed = 0;
-
-  for (const f of eligible) {
-    try {
-      await sweepOne(f.userId, f.total);
-      done++;
-    } catch (err) {
-      failed++;
-      logger.error(`Sweep failed for user ${f.userId}: ${(err as Error).message}`);
-    }
-    try {
-      await editMainMessage(
-        ctx,
-        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n` +
-        `${DIVIDER}\n\n` +
-        `${e('people')} Processed: <b>${done + failed}/${eligible.length}</b>\n` +
-        `${e('check')} Done: <b>${done}</b>\n` +
-        `${e('cancel')} Failed: <b>${failed}</b>`,
-        Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
-      );
-    } catch {}
-    await new Promise((r) => setTimeout(r, 3000));
-  }
-
-  await editMainMessage(
-    ctx,
-    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n` +
-    `${DIVIDER}\n\n` +
-    `${e('money')} Pulled from: <b>${done}</b> wallet(s)\n` +
-    `${e('cancel')} Failed: <b>${failed}</b>`,
-    Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
-  );
-}
-
-async function renderDashboard(ctx: Context): Promise<void> {
-  const stats = await getAdminStats();
-
-  await editMainMessage(
-    ctx,
-    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n` +
-    `${DIVIDER}\n\n` +
-    `${e('people')} <b>Users</b>\n` +
-    `└ Total: <b>${stats.totalUsers}</b>\n` +
-    `└ New Today: <b>${stats.newUsersToday}</b>\n` +
-    `└ Active Today: <b>${stats.activeUsersToday}</b>\n\n` +
-    `${e('money')} <b>Finance</b>\n` +
-    `└ Total Deposits: <b>${stats.totalDeposits}</b>\n` +
-    `└ Fees Collected: <b>$${stats.totalFees}</b>\n` +
-    `└ USDT Held: <b>$${stats.totalUSDT}</b>\n` +
-    `└ BNB Held: <b>${stats.totalBNB}</b>\n\n` +
-    `${e('gift')} <b>Giveaways</b>\n` +
-    `└ Total: <b>${stats.totalGiveaways}</b>\n` +
-    `└ Active: <b>${stats.activeGiveaways}</b>\n` +
-    `└ Pending Payouts: <b>${stats.pendingPayouts}</b>`,
-    adminPanelKeyboard
-  );
-}
-
-async function getAdminStats() {
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-  const [
-    totalUsers,
-    newUsersToday,
-    activeUsersToday,
-    totalDeposits,
-    totalFees,
-    totalUSDT,
-    totalBNB,
-    totalGiveaways,
-    activeGiveaways,
-    pendingPayouts,
-  ] = await Promise.all([
-    prisma.user.count(),
-    prisma.user.count({ where: { joinDate: { gte: today } } }),
-    prisma.user.count({ where: { lastActive: { gte: today } } }),
-    prisma.transaction.count({ where: { type: 'DEPOSIT', status: 'CONFIRMED' } }),
-    prisma.platformFee.aggregate({ _sum: { amount: true } }),
-    prisma.balance.aggregate({ where: { asset: 'USDT' }, _sum: { availableBalance: true } }),
-    prisma.balance.aggregate({ where: { asset: 'BNB' }, _sum: { availableBalance: true } }),
-    prisma.giveaway.count(),
-    prisma.giveaway.count({ where: { status: 'ACTIVE' } }),
-    prisma.giveawayClaim.count({ where: { status: { in: ['QUEUED', 'PROCESSING'] } } }),
-  ]);
-
-  return {
-    totalUsers,
-    newUsersToday,
-    activeUsersToday,
-    totalDeposits,
-    totalFees: Number(totalFees._sum.amount || 0).toFixed(2),
-    totalUSDT: Number(totalUSDT._sum.availableBalance || 0).toFixed(2),
-    totalBNB: Number(totalBNB._sum.availableBalance || 0).toFixed(6),
-    totalGiveaways,
-    activeGiveaways,
-    pendingPayouts,
-  };
-}
+  const wallet = await prisma.wallet.findUnique({ where: {
