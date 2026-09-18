@@ -15,6 +15,12 @@ import { formatAddress } from '../utils/validation';
 const SWEEP_GAS_SEED = 2000000000000n;
 const SWEEP_THRESHOLD_USDT = 0.5;
 
+const USERS_PER_PAGE = 10;
+const FEES_PER_PAGE = 10;
+const GIVEAWAYS_PER_PAGE = 10;
+
+const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
+
 const adminPanelKeyboard = Markup.inlineKeyboard([
   [
     Markup.button.callback(`${eb('people')} Users`, 'admin:users'),
@@ -26,13 +32,23 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   ],
   [
     Markup.button.callback(`${eb('diamond')} Create Code`, 'admin:code:create'),
-    Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
+    Markup.button.callback(`${eb('document')} Codes`, 'admin:codes'),
   ],
   [
+    Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
     Markup.button.callback(`${eb('warning')} Emergency`, 'admin:emergency'),
-    Markup.button.callback(`${eb('back')} Back`, 'main'),
   ],
+  [Markup.button.callback(`${eb('back')} Back`, 'main')],
 ]);
+
+/** Builds a Prev / page indicator / Next row. */
+function pager(prefix: string, page: number, totalPages: number, totalLabel: string) {
+  const row: any[] = [];
+  if (page > 0) row.push(Markup.button.callback('◀️ Prev', `${prefix}:${page - 1}`));
+  row.push(Markup.button.callback(`${page + 1}/${totalPages} · ${totalLabel}`, `${prefix}:noop`));
+  if (page < totalPages - 1) row.push(Markup.button.callback('Next ▶️', `${prefix}:${page + 1}`));
+  return row;
+}
 
 export function registerAdminCommands(bot: any): void {
   bot.command('admin', async (ctx: Context) => {
@@ -50,28 +66,41 @@ export function registerAdminCommands(bot: any): void {
     await renderDashboard(ctx);
   });
 
+  // Pager page-indicator buttons — just dismiss the loading spinner
+  bot.action(/admin:(users|fees|giveaways):noop/, async (ctx: Context) => {
+    await ctx.answerCbQuery();
+  });
+
+  // ─────────────────────────── USERS (paginated) ───────────────────────────
+
   bot.action('admin:users', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-
-    const users = await prisma.user.findMany({
-      take: 20,
-      orderBy: { joinDate: 'desc' },
-      include: { wallet: true, balances: true },
-    });
-
-    let text = `${e('people')} <b>RECENT USERS</b>\n\n`;
-    if (users.length === 0) text += 'No users yet.';
-    for (const u of users) {
-      const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
-      text += `@${u.username || 'N/A'} | <code>${u.telegramId}</code> | $${bal.toFixed(2)}\n`;
-    }
-    text += `\n<i>Need a user's key? Use 🔒 Recover Key in the admin panel.</i>`;
-
-    await editMainMessage(ctx, text, backKeyboard('admin'));
+    await renderUsersPage(ctx, 0);
   });
 
-  // === FEE SWEEP ===
+  bot.action(/admin:users:(\d+)/, async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+    await renderUsersPage(ctx, parseInt((ctx as any).match[1], 10));
+  });
+
+  // ─────────────────────────── FEES (paginated) ───────────────────────────
+
+  bot.action('admin:fees', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+    await renderFeesPage(ctx, 0);
+  });
+
+  bot.action(/admin:fees:(\d+)/, async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+    await renderFeesPage(ctx, parseInt((ctx as any).match[1], 10));
+  });
+
+  // ─────────────────────────── FEE SWEEP ───────────────────────────
+
   bot.action('admin:sweep', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
@@ -80,13 +109,13 @@ export function registerAdminCommands(bot: any): void {
 
   bot.action('admin:sweep:run', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
-    await ctx.answerCbQuery('Sweep started — running in the background.');
 
     const lock = await redis.set('sweep:running', '1', 'EX', 1800, 'NX');
     if (!lock) {
       await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
       return;
     }
+    await ctx.answerCbQuery('Sweep started — running in the background.');
 
     try {
       await runSweep(ctx);
@@ -95,16 +124,18 @@ export function registerAdminCommands(bot: any): void {
     }
   });
 
-  // === KEY RECOVERY ===
+  // ─────────────────────────── KEY RECOVERY ───────────────────────────
+
   bot.action('admin:findkey', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
     await setUserSession(ctx.from!.id.toString(), { state: 'admin_find_key' });
     await editMainMessage(
       ctx,
-      `${e('lock')} <b>RECOVER USER KEY</b>\n\n` +
-      `Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
-      `<i>Every reveal is audit-logged.</i>`,
+      `${e('lock')} <b>RECOVER USER KEY</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('person')} Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
+      `<i>${e('warning')} Every reveal is audit-logged.</i>`,
       backKeyboard('admin')
     );
   });
@@ -125,10 +156,12 @@ export function registerAdminCommands(bot: any): void {
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
     await editMainMessage(
       ctx,
-      `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n\n` +
-      `User: <code>${wallet.user.telegramId}</code> (@${wallet.user.username || 'N/A'})\n` +
-      `Wallet: <code>${formatAddress(wallet.address)}</code>\n\n` +
-      `You are about to display the <b>${label}</b>. This will be audit-logged.`,
+      `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('person')} User: <code>${wallet.user.telegramId}</code> (@${wallet.user.username || 'N/A'})\n` +
+      `${e('wallet')} Wallet: <code>${formatAddress(wallet.address)}</code>\n\n` +
+      `You are about to display the <b>${label}</b>.\n` +
+      `<i>This action will be written to the audit log.</i>`,
       Markup.inlineKeyboard([
         [Markup.button.callback(`⚠️ Yes, show the ${label}`, `admin:revealconfirm:${walletId}:${kind}`)],
         [Markup.button.callback(`${eb('back')} Cancel`, 'admin')],
@@ -159,7 +192,8 @@ export function registerAdminCommands(bot: any): void {
     if (!secret) {
       await editMainMessage(
         ctx,
-        `${e('warning')} No ${kind === 'mn' ? 'mnemonic' : 'private key'} stored for this wallet.`,
+        `${e('warning')} <b>NOT AVAILABLE</b>\n\n` +
+        `No ${kind === 'mn' ? 'mnemonic' : 'private key'} stored for this wallet.`,
         backKeyboard('admin')
       );
       return;
@@ -179,70 +213,77 @@ export function registerAdminCommands(bot: any): void {
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
     await editMainMessage(
       ctx,
-      `${e('lock')} <b>${label} — @${wallet.user.username || wallet.user.telegramId}</b>\n\n` +
+      `${e('lock')} <b>${label}</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('person')} @${wallet.user.username || wallet.user.telegramId}\n` +
+      `${e('wallet')} <code>${wallet.address}</code>\n\n` +
       `<code>${secret}</code>\n\n` +
-      `⚠️ Access has been logged. Never share this in any chat.`,
+      `${e('warning')} Access has been logged. Never share this in any chat.`,
       Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
     );
   });
 
+  // ─────────────────────────── GIVEAWAYS (paginated) ───────────────────────────
+
   bot.action('admin:giveaways', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-
-    const giveaways = await prisma.giveaway.findMany({
-      take: 20,
-      orderBy: { createdAt: 'desc' },
-      include: { creator: true, claims: true },
-    });
-
-    let text = `${e('gift')} <b>RECENT GIVEAWAYS</b>\n\n`;
-    if (giveaways.length === 0) text += 'No giveaways yet.';
-    for (const g of giveaways) {
-      text += `${g.status} | ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} | @${g.creator.username || 'N/A'}\n`;
-    }
-
-    await editMainMessage(ctx, text, backKeyboard('admin'));
+    await renderGiveawaysPage(ctx, 0);
   });
 
-  bot.action('admin:fees', async (ctx: Context) => {
+  bot.action(/admin:giveaways:(\d+)/, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-
-    const fees = await prisma.platformFee.findMany({
-      take: 20,
-      orderBy: { createdAt: 'desc' },
-    });
-
-    let text = `${e('chart')} <b>PLATFORM FEES</b>\n\n`;
-    let total = 0;
-    for (const f of fees) {
-      total += Number(f.amount);
-      text += `${f.amount} ${f.asset} | ${f.createdAt.toLocaleDateString()}${f.sweptAt ? ' | swept' : ' | pending'}\n`;
-    }
-    text += `\n<b>Total Collected:</b> $${total.toFixed(2)}\n<i>Use Fee Sweep to pull pending fees on-chain.</i>`;
-
-    await editMainMessage(ctx, text, backKeyboard('admin'));
+    await renderGiveawaysPage(ctx, parseInt((ctx as any).match[1], 10));
   });
+
+  // ─────────────────────────── REDEEM CODES ───────────────────────────
 
   bot.action('admin:code:create', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('diamond')} <b>CREATE REDEEM CODE</b>\n\n` +
-      `Send: <code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
-      `Example: <code>VEYLO2026|USDT|10|100|7</code>`,
+      `${e('diamond')} <b>CREATE REDEEM CODE</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('edit')} Send in this format:\n` +
+      `<code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
+      `${e('star')} Example: <code>VEYLO2026|USDT|10|100|7</code>`,
       backKeyboard('admin')
     );
   });
+
+  bot.action('admin:codes', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.answerCbQuery();
+    const codes = await prisma.redeemCode.findMany({
+      take: 15,
+      orderBy: { createdAt: 'desc' },
+    });
+    let text = `${e('diamond')} <b>REDEEM CODES</b>\n${DIVIDER}\n\n`;
+    if (codes.length === 0) {
+      text += 'No codes created yet.';
+    }
+    for (const c of codes) {
+      const used = `${c.redemptionCount}/${c.maxRedemptions}`;
+      const expired = c.expiresAt && c.expiresAt < new Date();
+      text += `<code>${c.code}</code>\n` +
+        `└ ${e('gift')} ${c.rewardAmount} ${c.asset} · ${e('people')} ${used} used · ` +
+        `${expired ? `${e('warning')} EXPIRED` : `${e('check')} active`}\n`;
+    }
+    await editMainMessage(ctx, text, backKeyboard('admin'));
+  });
+
+  // ─────────────────────────── EMERGENCY ───────────────────────────
 
   bot.action('admin:emergency', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n\nUse these carefully. All actions are logged.`,
+      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n` +
+      `${DIVIDER}\n\n` +
+      `<i>Use these carefully. All actions are logged.</i>`,
       Markup.inlineKeyboard([
         [Markup.button.callback('⛔ Pause Deposits', 'admin:pause:deposits')],
         [Markup.button.callback('⛔ Pause Giveaways', 'admin:pause:giveaways')],
@@ -294,13 +335,141 @@ export function registerAdminCommands(bot: any): void {
 
     await editMainMessage(
       ctx,
-      `${e('check')} <b>CODE CREATED</b>\n\n<code>${code.toUpperCase()}</code>\n${amountStr} ${asset.toUpperCase()} | ${maxRedemptions} redemptions | expires in ${expiryDays} days`,
-      backKeyboard('admin')
+      `${e('check')} <b>CODE CREATED</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('diamond')} <code>${code.toUpperCase()}</code>\n` +
+      `${e('gift')} ${amountStr} ${asset.toUpperCase()}\n` +
+      `${e('people')} ${maxRedemptions} redemptions\n` +
+      `${e('clock')} expires in ${expiryDays} days`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`${eb('diamond')} View Codes`, 'admin:codes')],
+        [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
+      ])
     );
   });
 }
 
-// === FEE SWEEP HELPERS ===
+// ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
+
+async function renderUsersPage(ctx: Context, page: number): Promise<void> {
+  const totalUsers = await prisma.user.count();
+  const totalPages = Math.max(1, Math.ceil(totalUsers / USERS_PER_PAGE));
+
+  const users = await prisma.user.findMany({
+    skip: page * USERS_PER_PAGE,
+    take: USERS_PER_PAGE,
+    orderBy: { joinDate: 'desc' },
+    include: { wallet: true, balances: true },
+  });
+
+  let text = `${e('people')} <b>USERS</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
+  if (users.length === 0) {
+    text += 'No users on this page.';
+  }
+  for (const u of users) {
+    const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
+    const active = u.lastActive && Date.now() - new Date(u.lastActive).getTime() < 86400000;
+    text += `${active ? e('check') : '⚪'} @${u.username || 'N/A'} | <code>${u.telegramId}</code> | $${bal.toFixed(2)}\n`;
+  }
+
+  const [usdtSum, bnbSum] = await Promise.all([
+    prisma.balance.aggregate({ where: { asset: 'USDT' }, _sum: { availableBalance: true } }),
+    prisma.balance.aggregate({ where: { asset: 'BNB' }, _sum: { availableBalance: true } }),
+  ]);
+  text += `\n${e('chart')} <b>Totals (all users)</b>\n`;
+  text += `${e('people')} ${totalUsers} users\n`;
+  text += `${e('money')} $${Number(usdtSum._sum.availableBalance || 0).toFixed(2)} USDT\n`;
+  text += `${e('coin')} ${Number(bnbSum._sum.availableBalance || 0).toFixed(4)} BNB`;
+
+  await editMainMessage(
+    ctx,
+    text,
+    Markup.inlineKeyboard([
+      pager('admin:users', page, totalPages, `${totalUsers} users`),
+      [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
+    ])
+  );
+}
+
+async function renderFeesPage(ctx: Context, page: number): Promise<void> {
+  const totalFeesCount = await prisma.platformFee.count();
+  const totalPages = Math.max(1, Math.ceil(totalFeesCount / FEES_PER_PAGE));
+
+  const fees = await prisma.platformFee.findMany({
+    skip: page * FEES_PER_PAGE,
+    take: FEES_PER_PAGE,
+    orderBy: { createdAt: 'desc' },
+  });
+
+  let text = `${e('chart')} <b>PLATFORM FEES</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
+  if (fees.length === 0) {
+    text += 'No fees on this page.';
+  }
+  for (const f of fees) {
+    const status = f.sweptAt
+      ? `${e('check')} swept ${f.sweptAt.toLocaleDateString()}`
+      : `${e('clock')} pending`;
+    text += `${e('money')} ${f.amount} ${f.asset} · ${f.createdAt.toLocaleDateString()} · ${status}\n`;
+  }
+
+  const [grandTotal, pendingAgg, sweptAgg] = await Promise.all([
+    prisma.platformFee.aggregate({ _sum: { amount: true } }),
+    prisma.platformFee.aggregate({ where: { sweptAt: null }, _sum: { amount: true } }),
+    prisma.platformFee.aggregate({ where: { sweptAt: { not: null } }, _sum: { amount: true } }),
+  ]);
+  const grand = Number(grandTotal._sum.amount || 0);
+  const pending = Number(pendingAgg._sum.amount || 0);
+  const swept = Number(sweptAgg._sum.amount || 0);
+
+  text += `\n${e('chart')} <b>Totals</b>\n`;
+  text += `${e('money')} All-time: $${grand.toFixed(2)}\n`;
+  text += `${e('clock')} Pending: $${pending.toFixed(2)}${pending > 0 ? ' — use Fee Sweep ↩️' : ''}\n`;
+  text += `${e('check')} Swept: $${swept.toFixed(2)}`;
+
+  await editMainMessage(
+    ctx,
+    text,
+    Markup.inlineKeyboard([
+      pager('admin:fees', page, totalPages, `${totalFeesCount} fees`),
+      [Markup.button.callback(`${eb('money')} Fee Sweep`, 'admin:sweep')],
+      [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
+    ])
+  );
+}
+
+async function renderGiveawaysPage(ctx: Context, page: number): Promise<void> {
+  const total = await prisma.giveaway.count();
+  const totalPages = Math.max(1, Math.ceil(total / GIVEAWAYS_PER_PAGE));
+
+  const giveaways = await prisma.giveaway.findMany({
+    skip: page * GIVEAWAYS_PER_PAGE,
+    take: GIVEAWAYS_PER_PAGE,
+    orderBy: { createdAt: 'desc' },
+    include: { creator: true, claims: true },
+  });
+
+  let text = `${e('gift')} <b>GIVEAWAYS</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
+  if (giveaways.length === 0) text += 'No giveaways on this page.';
+  for (const g of giveaways) {
+    const icon =
+      g.status === 'ACTIVE' ? e('lightning') :
+      g.status === 'COMPLETED' ? e('check') :
+      g.status === 'EXPIRED' ? e('clock') : e('warning');
+    text += `${icon} <b>${g.status}</b> · ${g.totalAmount} ${g.asset} · ${g.claimedCount}/${g.maxClaimers} · @${g.creator.username || 'N/A'}\n`;
+  }
+  text += `\n${e('chart')} <b>Total giveaways:</b> ${total}`;
+
+  await editMainMessage(
+    ctx,
+    text,
+    Markup.inlineKeyboard([
+      pager('admin:giveaways', page, totalPages, `${total} total`),
+      [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
+    ])
+  );
+}
+
+// ─────────────────────────── FEE SWEEP HELPERS ───────────────────────────
 
 async function getUnsweptFees(): Promise<Array<{ userId: string; total: number }>> {
   const rows = await prisma.platformFee.findMany({
@@ -319,10 +488,12 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
   const fees = await getUnsweptFees();
   const eligible = fees.filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
   const pending = fees.length - eligible.length;
+  const totalPullable = eligible.reduce((s, f) => s + f.total, 0);
 
-  let text = `${e('money')} <b>FEE SWEEP</b>\n\n`;
-  text += `<b>${eligible.length} user(s)</b> passed $${SWEEP_THRESHOLD_USDT}\n`;
-  text += `<b>${pending} user(s)</b> yet to pass $${SWEEP_THRESHOLD_USDT}\n\n`;
+  let text = `${e('money')} <b>FEE SWEEP</b>\n${DIVIDER}\n\n`;
+  text += `${e('money')} <b>Ready to pull: $${totalPullable.toFixed(4)} USDT</b>\n`;
+  text += `${e('check')} ${eligible.length} user(s) passed $${SWEEP_THRESHOLD_USDT}\n`;
+  text += `${e('clock')} ${pending} user(s) yet to pass\n\n`;
 
   if (eligible.length > 0) {
     text += `<b>Ready to pull:</b>\n`;
@@ -398,7 +569,11 @@ async function runSweep(ctx: Context): Promise<void> {
     try {
       await editMainMessage(
         ctx,
-        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n\nProcessed: ${done + failed}/${eligible.length}\n✅ Done: ${done}\n❌ Failed: ${failed}`,
+        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n` +
+        `${DIVIDER}\n\n` +
+        `${e('people')} Processed: <b>${done + failed}/${eligible.length}</b>\n` +
+        `${e('check')} Done: <b>${done}</b>\n` +
+        `${e('cancel')} Failed: <b>${failed}</b>`,
         Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
       );
     } catch {}
@@ -407,7 +582,10 @@ async function runSweep(ctx: Context): Promise<void> {
 
   await editMainMessage(
     ctx,
-    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n\nPulled from: ${done} wallet(s)\nFailed: ${failed}`,
+    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n` +
+    `${DIVIDER}\n\n` +
+    `${e('money')} Pulled from: <b>${done}</b> wallet(s)\n` +
+    `${e('cancel')} Failed: <b>${failed}</b>`,
     Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
   );
 }
@@ -417,20 +595,21 @@ async function renderDashboard(ctx: Context): Promise<void> {
 
   await editMainMessage(
     ctx,
-    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n\n` +
-    `<b>Users</b>\n` +
-    `Total: ${stats.totalUsers}\n` +
-    `New Today: ${stats.newUsersToday}\n` +
-    `Active Today: ${stats.activeUsersToday}\n\n` +
-    `<b>Finance</b>\n` +
-    `Total Deposits: ${stats.totalDeposits}\n` +
-    `Fees Collected: ${stats.totalFees}\n` +
-    `USDT Held: ${stats.totalUSDT}\n` +
-    `BNB Held: ${stats.totalBNB}\n\n` +
-    `<b>Giveaways</b>\n` +
-    `Total: ${stats.totalGiveaways}\n` +
-    `Active: ${stats.activeGiveaways}\n` +
-    `Pending Payouts: ${stats.pendingPayouts}`,
+    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n` +
+    `${DIVIDER}\n\n` +
+    `${e('people')} <b>Users</b>\n` +
+    `└ Total: <b>${stats.totalUsers}</b>\n` +
+    `└ New Today: <b>${stats.newUsersToday}</b>\n` +
+    `└ Active Today: <b>${stats.activeUsersToday}</b>\n\n` +
+    `${e('money')} <b>Finance</b>\n` +
+    `└ Total Deposits: <b>${stats.totalDeposits}</b>\n` +
+    `└ Fees Collected: <b>$${stats.totalFees}</b>\n` +
+    `└ USDT Held: <b>$${stats.totalUSDT}</b>\n` +
+    `└ BNB Held: <b>${stats.totalBNB}</b>\n\n` +
+    `${e('gift')} <b>Giveaways</b>\n` +
+    `└ Total: <b>${stats.totalGiveaways}</b>\n` +
+    `└ Active: <b>${stats.activeGiveaways}</b>\n` +
+    `└ Pending Payouts: <b>${stats.pendingPayouts}</b>`,
     adminPanelKeyboard
   );
 }
@@ -475,5 +654,4 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-  }
-                                                
+}
