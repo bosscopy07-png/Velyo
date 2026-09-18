@@ -44,16 +44,28 @@ export function registerCallbacks(bot: any): void {
     });
     reserve.USDT = Number(feesAgg._sum.amount ?? 0);
 
-    // Active seeded gas floats for this address (across all its giveaways)
+    // Active seeded gas floats for this address (across all its giveaways).
+    // Plain SCAN cursor loop — compatible with ioredis v4 AND v5.
     try {
-      for await (const key of redis.scanIterator({ MATCH: 'gas:credit:*', COUNT: 200 })) {
-        const raw = await redis.get(key);
-        if (!raw) continue;
-        const credit = JSON.parse(raw) as { address: string; seeded: string };
-        if (credit.address === address && BigInt(credit.seeded) > 0n) {
-          reserve.BNB += Number(BigInt(credit.seeded)) / 1e18;
+      let cursor = '0';
+      do {
+        const [next, keys] = (await redis.scan(
+          cursor,
+          'MATCH', 'gas:credit:*',
+          'COUNT', 200,
+        )) as unknown as [string, string[]];
+
+        for (const key of keys) {
+          const raw = await redis.get(key);
+          if (!raw) continue;
+          const credit = JSON.parse(raw) as { address: string; seeded: string };
+          if (credit.address === address && BigInt(credit.seeded) > 0n) {
+            reserve.BNB += Number(BigInt(credit.seeded)) / 1e18;
+          }
         }
-      }
+
+        cursor = next;
+      } while (cursor !== '0');
     } catch (err) {
       // Float lookup is best-effort — never block the wallet view on it
       logger.warn(`Gas float lookup failed for ${address}: ${(err as Error).message}`);
