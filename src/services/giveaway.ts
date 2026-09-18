@@ -1,6 +1,7 @@
 import { prisma } from '../database';
 import { redis, acquireLock, releaseLock } from './redis';
 import { blockchain } from './blockchain';
+import { walletService } from './wallet';
 import { config } from '../config';
 import { generateSecureCode } from '../utils/validation';
 import { logger } from '../utils/logger';
@@ -8,21 +9,19 @@ import type { AssetSymbol } from '../config';
 
 /**
  * Seeded per expected claim. Actual payout cost ≈ 0.00000174 BNB; we send
- * 0.000002 BNB. UNITS: 0.000002 BNB = 2×10^12 wei (2,000,000,000,000).
- * Verified against on-chain logs: one USDT transfer costs 1,743,100,000,000 wei.
+ * 0.000002 BNB = 2×10^12 wei (2,000,000,000,000).
  */
 export const GAS_PER_CLAIM_BNB = 0.000002;
-const GAS_SEED_PER_PAYOUT = 2000000000000n; // 0.000002 BNB
-const BNB_USD_FALLBACK = 550; // used only if the price API is down
+const GAS_SEED_PER_PAYOUT = 2000000000000n;
+const BNB_USD_FALLBACK = 550;
 
 export interface CreationCost {
   platformFee: number;
-  gasFee: number;      // BNB gas for all claims, priced in USDT
-  fee: number;         // total fee
-  total: number;       // amount + fee
+  gasFee: number;
+  fee: number;
+  total: number;
 }
 
-/** Total creation cost: 1% platform fee + gas for every expected claim (priced in USDT). */
 export async function estimateCreationCost(totalAmount: number, maxClaimers: number): Promise<CreationCost> {
   const platformFee = config.ENABLE_FEES
     ? Number((totalAmount * (config.PLATFORM_FEE_PERCENT / 100)).toFixed(6))
@@ -32,9 +31,7 @@ export async function estimateCreationCost(totalAmount: number, maxClaimers: num
   try {
     const { pricing } = await import('./pricing');
     gasFee = await pricing.convertToUSD('BNB', maxClaimers * GAS_PER_CLAIM_BNB);
-  } catch {
-    // price API down — use fallback rate
-  }
+  } catch {}
   if (!gasFee || gasFee <= 0) {
     gasFee = maxClaimers * GAS_PER_CLAIM_BNB * BNB_USD_FALLBACK;
   }
@@ -68,8 +65,8 @@ class GiveawayService {
       if (available < totalCost) {
         throw new Error(
           `Insufficient ${data.asset} balance — you have ${available.toFixed(6)} ${data.asset}, ` +
-          `need ${totalCost.toFixed(6)} ${data.asset} (amount ${data.totalAmount} + fee ${fee.toFixed(6)}: ` +
-          `1% platform + gas for ${data.maxClaimers} claim(s)). Deposit more ${data.asset} first.`
+          `need ${totalCost.toFixed(6)} ${data.asset} (amount ${data.totalAmount} + fee ${fee.toFixed(6)}). ` +
+          `Deposit more ${data.asset} first.`
         );
       }
 
@@ -141,11 +138,6 @@ class GiveawayService {
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
   }
 
-  /**
-   * Sends the creator's wallet exactly enough BNB for every expected claim's
-   * payout gas (0.000002 BNB × claimers) from the admin wallet, and records
-   * { baseline } in Redis so reclaimGas later returns ONLY what we added.
-   */
   private async seedPayoutGas(creatorId: string, giveawayId: string, claimers: number): Promise<void> {
     try {
       const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
@@ -160,7 +152,7 @@ class GiveawayService {
           logger.warn(`OPERATOR_WALLET_KEY not set — cannot seed gas for giveaway ${giveawayId}`);
         } else {
           const { hashIdempotencyKey } = await import('../utils/encryption');
-          seeded = needed - baseline + GAS_SEED_PER_PAYOUT; // deficit + one-claim buffer
+          seeded = needed - baseline + GAS_SEED_PER_PAYOUT;
           const { hash } = await blockchain.sendTransaction(
             config.OPERATOR_WALLET_KEY,
             wallet.address,
@@ -168,7 +160,9 @@ class GiveawayService {
             'BNB',
             hashIdempotencyKey('create-seed', giveawayId)
           );
-          logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash} (${seeded} wei = ${Number(seeded) / 1e18} BNB)`);
+          logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash} (${Number(seeded) / 1e18} BNB)`);
+          // Admin's app balance must reflect the BNB that left their wallet
+          await walletService.adjustOperatorBalance('BNB', -Number(seeded) / 1e18);
         }
       }
 
@@ -182,12 +176,6 @@ class GiveawayService {
     }
   }
 
-  /**
-   * Returns unused seeded BNB to the admin fee wallet.
-   * ours = currentBalance − baseline (snapshot BEFORE seeding), so the
-   * creator's own BNB is mathematically excluded. Keeps a small reserve
-   * (reclaim tx gas + dust float) in the wallet.
-   */
   async reclaimGas(giveawayId: string): Promise<void> {
     try {
       const raw = await redis.get(`gas:credit:${giveawayId}`);
@@ -208,8 +196,8 @@ class GiveawayService {
       const current = await blockchain.getBalance(credit.address, 'BNB');
       const ours = current - BigInt(credit.baseline);
 
-      const reserve = 2500000000000n;      // 0.0000025 BNB kept as future float
-      const reclaimTxGas = 1800000000000n; // 0.0000018 BNB cost of the reclaim tx
+      const reserve = 2500000000000n;
+      const reclaimTxGas = 1800000000000n;
 
       if (ours <= reserve + reclaimTxGas) {
         logger.info(`Gas reclaim for ${giveawayId}: leftover ${ours} wei below threshold — kept as wallet float.`);
@@ -225,7 +213,9 @@ class GiveawayService {
         'BNB',
         `gas-reclaim-${giveawayId}`
       );
-      logger.info(`Gas reclaimed for ${giveawayId}: ${sendBack} wei → admin wallet (tx ${hash})`);
+      logger.info(`Gas reclaimed for ${giveawayId}: ${Number(sendBack) / 1e18} BNB → admin wallet (tx ${hash})`);
+      // Admin's app balance must reflect the BNB that returned
+      await walletService.adjustOperatorBalance('BNB', Number(sendBack) / 1e18);
       await redis.del(`gas:credit:${giveawayId}`);
     } catch (err) {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
@@ -402,4 +392,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-                              
+    
