@@ -419,7 +419,7 @@ export function registerTextHandlers(bot: any): void {
       await clearUserSession(telegramId);
     }
   });
-                  // === EXPIRY SELECTION ===
+                                                                                                         // === EXPIRY SELECTION ===
   bot.action(/giveaway:expiry:(\d+)/, async (ctx: Context) => {
     const hours = parseInt((ctx as any).match[1], 10);
     const from = ctx.from!;
@@ -503,16 +503,18 @@ export function registerTextHandlers(bot: any): void {
       return;
     }
 
-    // Guarded transition: only the first confirm (from RESERVED) proceeds.
-    // A double-click lands on ADDRESS_CONFIRMED and skips re-queueing.
+    // Guarded transition: first confirm wins; a double-click lands on
+    // ADDRESS_CONFIRMED and skips re-queueing. FAILED is included so a
+    // resumed claim (after a payout failure) can re-confirm.
     const transitioned = await prisma.giveawayClaim.updateMany({
-      where: { id: claimId, status: 'RESERVED' },
+      where: { id: claimId, status: { in: ['RESERVED', 'FAILED'] } },
       data: { status: 'ADDRESS_CONFIRMED' },
     });
 
     if (transitioned.count === 0) {
-      // Already confirmed/queued — don't enqueue twice, just reassure
-      if (['ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING', 'PAID'].includes(claim.status)) {
+      // Refresh status for the message
+      const fresh = await prisma.giveawayClaim.findUnique({ where: { id: claimId } });
+      if (fresh && ['ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING', 'PAID'].includes(fresh.status!)) {
         await ctx.answerCbQuery('Already confirmed!');
         await editMainMessage(
           ctx,
@@ -599,5 +601,4 @@ export function registerTextHandlers(bot: any): void {
     );
     await ctx.answerCbQuery();
   });
-    }
-      
+}
