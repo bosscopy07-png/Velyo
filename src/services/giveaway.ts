@@ -179,14 +179,12 @@ class GiveawayService {
       return g;
     });
 
-    // 1) Seed BNB (payout gas + buffer + 1 unit for the fee-forward below).
-    //    Enqueued FIRST so the serialized send queue runs it before the forward.
-    await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers + GAS_BUFFER_UNITS);
+    // 1) Seed BNB (payout gas + buffer + 1 unit for the fee-forward below)
+    const seedHash = await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers + GAS_BUFFER_UNITS);
 
     // 2) Immediately forward the full creation fee on-chain to the platform
-    //    wallet — same flow as deposits. On failure the rows stay pending and
-    //    the admin Fee Sweep catches them later.
-    await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, fee);
+    //    wallet — waits for the seed to MINE first (cross-wallet ordering).
+    await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, fee, seedHash);
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
@@ -197,15 +195,24 @@ class GiveawayService {
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
    *
-   * No insufficient-funds retry here: the serialized send queue in
-   * blockchain.ts waits for the gas-seed tx to MINE before broadcasting
-   * this forward, so the seed-not-landed race this used to guard against
-   * can no longer happen.
+   * `seedHash`: the gas-seed tx hash from seedPayoutGas. The seed comes from
+   * the ADMIN wallet and this forward from the CREATOR wallet — different
+   * senders, so the per-address queue cannot order them. We must wait for
+   * the seed to mine explicitly, else the node validates the forward against
+   * a confirmed balance that doesn't include the seed (INSUFFICIENT_FUNDS).
    */
-  private async forwardCreationFee(giveawayId: string, creatorId: string, asset: AssetSymbol, amount: number): Promise<void> {
+  private async forwardCreationFee(
+    giveawayId: string,
+    creatorId: string,
+    asset: AssetSymbol,
+    amount: number,
+    seedHash: string | null
+  ): Promise<void> {
     if (amount <= 0) return;
 
     try {
+      if (seedHash) await blockchain.waitMined(seedHash, 60000);
+
       const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
       if (!wallet) return;
 
@@ -232,18 +239,20 @@ class GiveawayService {
     }
   }
 
-  private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<void> {
+  /** Seeds gas from the admin wallet; returns the seed tx hash (or null). */
+  private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<string | null> {
     try {
       let wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
       if (!wallet) {
         await walletService.createWallet(creatorId);
         wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
-        if (!wallet) return;
+        if (!wallet) return null;
       }
 
       const baseline = await blockchain.getBalance(wallet.address, 'BNB');
       const needed = BigInt(units) * GAS_SEED_PER_PAYOUT;
       let seeded = 0n;
+      let seedHash: string | null = null;
 
       if (baseline < needed) {
         if (!config.OPERATOR_WALLET_KEY) {
@@ -251,14 +260,15 @@ class GiveawayService {
         } else {
           const { hashIdempotencyKey } = await import('../utils/encryption');
           seeded = needed - baseline;
-          const { hash } = await blockchain.sendTransaction(
+          const sent = await blockchain.sendTransaction(
             config.OPERATOR_WALLET_KEY,
             wallet.address,
             seeded,
             'BNB',
             hashIdempotencyKey('create-seed', giveawayId)
           );
-          logger.info(`Gas seeded for giveaway ${giveawayId}: ${hash} (${Number(seeded) / 1e18} BNB for ${units} units)`);
+          seedHash = sent.hash;
+          logger.info(`Gas seeded for giveaway ${giveawayId}: ${seedHash} (${Number(seeded) / 1e18} BNB for ${units} units)`);
           await walletService.adjustOperatorBalance('BNB', -Number(seeded) / 1e18);
         }
       }
@@ -268,11 +278,13 @@ class GiveawayService {
         JSON.stringify({ address: wallet.address, baseline: baseline.toString(), seeded: seeded.toString() }),
         'EX', 60 * 60 * 24 * 30
       );
+      return seedHash;
     } catch (err) {
       logger.error(`Gas seed failed for giveaway ${giveawayId}: ${(err as Error).message}`);
+      return null;
     }
-        }
-    
+  }
+
   /**
    * After all claims are paid (or the giveaway is cancelled):
    * leftover seeded BNB → admin wallet, creator refunded the USDT value
@@ -505,3 +517,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
+        
