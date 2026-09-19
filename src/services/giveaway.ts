@@ -67,6 +67,8 @@ class GiveawayService {
     await walletService.createWallet(data.creatorId);
 
     // ── REAL-BALANCE GATE ──
+    // DB can hold phantom credits (old refunds, admin-era redeems). Only
+    // on-chain truth may fund a giveaway.
     const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
     if (creatorWallet) {
       const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
@@ -194,6 +196,11 @@ class GiveawayService {
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
+   *
+   * No insufficient-funds retry here: the serialized send queue in
+   * blockchain.ts waits for the gas-seed tx to MINE before broadcasting
+   * this forward, so the seed-not-landed race this used to guard against
+   * can no longer happen.
    */
   private async forwardCreationFee(giveawayId: string, creatorId: string, asset: AssetSymbol, amount: number): Promise<void> {
     if (amount <= 0) return;
@@ -264,8 +271,8 @@ class GiveawayService {
     } catch (err) {
       logger.error(`Gas seed failed for giveaway ${giveawayId}: ${(err as Error).message}`);
     }
-  }
-
+        }
+    
   /**
    * After all claims are paid (or the giveaway is cancelled):
    * leftover seeded BNB → admin wallet, creator refunded the USDT value
@@ -498,4 +505,3 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-              
