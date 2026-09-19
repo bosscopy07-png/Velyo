@@ -62,6 +62,10 @@ class GiveawayService {
     const fee = cost.fee;
     const totalCost = data.totalAmount + fee;
 
+    // Lazy wallet: creators need a real custodial wallet (their funds and the
+    // payout gas live there). Idempotent — returns instantly if one exists.
+    await walletService.createWallet(data.creatorId);
+
     // ── REAL-BALANCE GATE ──
     // DB can hold phantom credits (old refunds, admin-era redeems). Only
     // on-chain truth may fund a giveaway.
@@ -189,8 +193,13 @@ class GiveawayService {
 
   private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<void> {
     try {
-      const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
-      if (!wallet) return;
+      // Self-healing: if the creator somehow has no wallet yet, create one
+      let wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+      if (!wallet) {
+        await walletService.createWallet(creatorId);
+        wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+        if (!wallet) return;
+      }
 
       const baseline = await blockchain.getBalance(wallet.address, 'BNB');
       const needed = BigInt(units) * GAS_SEED_PER_PAYOUT;
@@ -282,7 +291,7 @@ class GiveawayService {
             netAmount: refundUSDT,
             status: 'CONFIRMED',
             idempotencyKey: hashIdempotencyKey('gas-refund', giveawayId),
-            metadata: { giveawayId, reclaimedBNB: Number(sendBack) / 1e18 },
+            metadata: { kind: 'gas_refund', giveawayId, reclaimedBNB: Number(sendBack) / 1e18 },
           },
         });
         logger.info(`Gas refund for ${giveawayId}: ${refundUSDT} USDT credited to creator`);
@@ -456,4 +465,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-      
+  
