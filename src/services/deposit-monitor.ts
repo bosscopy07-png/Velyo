@@ -410,9 +410,8 @@ class DepositMonitorService {
     } finally {
       await this.releaseScanLock();
     }
-  }
-
-  // ------------------------------------------------------------------
+        }
+    // ------------------------------------------------------------------
   // BNB native balance sweep (balance-delta method, preserved).
   //
   // EXISTING ISSUE + FIX (proper, not partial):
@@ -539,8 +538,8 @@ class DepositMonitorService {
           `bnb-diff:${wallet.address}:${currentBlock}`,
       }
     );
-    }
-    
+  }
+
   // ------------------------------------------------------------------
   // Deposit processing. Business logic unchanged (min amounts, fees,
   // crediting, fee forwarding, operator balance, notifications).
@@ -974,4 +973,4 @@ function sleep(
 
 export const depositMonitor =
   new DepositMonitorService();
-      
+        
