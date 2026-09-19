@@ -282,7 +282,7 @@ class BlockchainService {
   }
 
   /** Poll until a tx has at least 1 confirmation. Proceeds on timeout. */
-  private async waitMined(hash: string, timeoutMs: number): Promise<void> {
+  async waitMined(hash: string, timeoutMs: number): Promise<void> {
     const start = Date.now();
 
     while (Date.now() - start < timeoutMs) {
@@ -482,9 +482,8 @@ class BlockchainService {
     );
 
     return grouped.get(toAddress.toLowerCase()) ?? [];
-  }
-
-  /**
+      }
+    /**
    * =========================================================================
    * BLOCK-RANGE-FIRST USDT SCANNER
    * =========================================================================
@@ -568,7 +567,7 @@ class BlockchainService {
 
     return result;
   }
-  
+
   /**
    * Scan one 50-address batch across the block range with TWO adaptive
    * knobs:
@@ -911,4 +910,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const blockchain = new BlockchainService();
-  
+        
