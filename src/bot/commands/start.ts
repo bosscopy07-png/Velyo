@@ -1,6 +1,5 @@
 import { Context } from 'telegraf';
 import { prisma } from '../../database';
-import { walletService } from '../../services/wallet';
 import { clearUserSession, setUserSession } from '../../services/redis';
 import { mainKeyboard, backKeyboard } from '../keyboards/main';
 import { formatWelcomeMessage } from '../messages';
@@ -17,13 +16,11 @@ export async function handleStart(ctx: Context): Promise<void> {
   const telegramId = from.id.toString();
   const isAdmin = config.ADMIN_TELEGRAM_IDS.includes(telegramId);
 
-  // Payload from Telegraf, with a raw-text fallback (belt and braces — covers
-  // any client/Telegraf quirk where startPayload isn't populated)
+  // Payload from Telegraf, with a raw-text fallback
   const text = ctx.message && 'text' in ctx.message ? (ctx.message.text as string) : '';
   const m = text.match(/^\/start(?:@\w+)?\s+(\S+)/);
   const startPayload = ((ctx as any).startPayload as string | undefined) ?? m?.[1];
 
-  // Debug: proves what Telegram delivered (settles deep-link questions)
   logger.info(`[start] payload="${startPayload ?? ''}" from ${telegramId}`);
 
   try {
@@ -58,17 +55,10 @@ export async function handleStart(ctx: Context): Promise<void> {
       });
     }
 
-    // Always guarantee a wallet exists for this user
-    if (!user.wallet) {
-      await walletService.createWallet(user.id);
-      logger.info(`Wallet provisioned for existing user ${telegramId}`);
-      user = await prisma.user.findUnique({
-        where: { telegramId },
-        include: { wallet: true },
-      });
-    }
+    // NOTE: no eager wallet provisioning. Wallets are created lazily — only
+    // when the user taps Wallet/Deposit or creates a giveaway. Giveaway
+    // claimants never need one (rewards go to an address they provide).
 
-    // Handle deep links (giveaway claim)
     if (startPayload?.startsWith('giveaway_')) {
       const code = startPayload.replace('giveaway_', '');
       await deleteMainMessage(ctx, user!);
@@ -187,7 +177,6 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       asset: giveaway.asset,
     });
 
-    // Single clean screen: SPOT SECURED + address prompt + ONLY a Back button
     await promptForAddress(ctx, giveaway.asset, claim!.id);
   } catch (err) {
     logger.error('Giveaway deep link error:', err);
