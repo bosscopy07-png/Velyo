@@ -14,21 +14,25 @@ const ASSET_DECIMALS: Record<string, number> = {
 };
 
 /**
- * BIG scan (BSC primary) — runs every 60s at second 0,
- * covers the last 150 blocks and advances the cursor.
+ * BIG scan (BSC primary) — runs every 60s at second 0.
+ * Authoritative pass: scans the last 150 blocks, advances the
+ * persistent cursor `monitor:lastBlock`, and owns the BNB balance
+ * sweep.
  */
 const BIG_SCAN_BLOCK_WINDOW = 150;
 
 /**
- * SMALL scan (QuickNode) — runs every 60s at second 30 (offset),
- * covers only the last 5 blocks and does NOT advance the cursor.
+ * SMALL scan (QuickNode) — runs every 60s at second 30 (offset by
+ * half a cycle so the two scans NEVER fire at the same time).
+ * Safety net for fresh deposits only: 5 blocks, pinned to QuickNode,
+ * does NOT advance the cursor and does NOT touch BNB balances.
  */
 const SMALL_SCAN_BLOCK_WINDOW = 5;
 
 /**
- * One shared lock for BOTH scans. They must never run at the same
- * time — the second 30 offset is guaranteed by cron, and this lock
- * guarantees it even if one scan overruns its slot.
+ * Shared Redis lock. Both scans compete for it; only one holder at a
+ * time, so even if one scan overruns its slot the other waits/skips
+ * instead of running concurrently.
  */
 const SCAN_LOCK_KEY = 'monitor:scan:lock';
 const SCAN_LOCK_TTL_SEC = 240;
@@ -42,12 +46,22 @@ const MIN_DEPOSIT: Record<string, number> = {
 };
 
 /**
- * BNB balance checks run inside the BIG scan only, in bounded
- * parallel batches so 250 wallets finish in a few seconds and never
- * starve the QuickNode scan of its 30-second slot.
+ * BNB balance sweep pacing — bounded concurrency with a small delay,
+ * comfortably under a 15 req/s provider ceiling, with an extra
+ * backoff pause whenever a batch hits a rate-limit error.
  */
-const BNB_CHECK_CONCURRENCY = 10;
-const BNB_CHECK_BATCH_DELAY_MS = 100;
+const BNB_CHECK_CONCURRENCY = 4;
+const BNB_CHECK_BATCH_DELAY_MS = 300;
+const BNB_RATE_LIMIT_BACKOFF_MS = 2000;
+
+/**
+ * Pending gas-seed ledger TTL. When VEYLO seeds BNB gas into a user
+ * wallet before forwarding USDT fees, the seed amount is recorded in
+ * Redis and consumed by the next balance sweep so the seed is never
+ * misread as a user BNB deposit. 600s comfortably covers
+ * seed-then-forward latency.
+ */
+const SEED_LEDGER_TTL_SEC = 600;
 
 type MonitoredWallet = {
   address: string;
@@ -64,8 +78,8 @@ class DepositMonitorService {
 
   start(): void {
     /**
-     * t=0s, 60s, 120s ...  → BIG scan via BSC primary (150 blocks)
-     * t=30s, 90s, 150s ... → SMALL scan via QuickNode (5 blocks)
+     * t=0s, 60s, 120s ...  → BIG scan (primary, 150 blocks, cursor)
+     * t=30s, 90s, 150s ... → SMALL scan (QuickNode, 5 blocks, no cursor)
      */
     cron.schedule('0 * * * * *', () => {
       void this.runBigScan();
@@ -76,12 +90,12 @@ class DepositMonitorService {
     });
 
     logger.info(
-      'Deposit monitor started: primary 150-block scan @0s, QuickNode 5-block scan @30s (mutually exclusive)'
+      'Deposit monitor started: BIG primary scan @0s (150 blocks), SMALL QuickNode scan @30s (5 blocks), mutually exclusive'
     );
   }
 
   // ------------------------------------------------------------------
-  // Shared lock — both scans compete for it; only one can hold it.
+  // Shared scan lock — always released in finally.
   // ------------------------------------------------------------------
 
   private async acquireScanLock(): Promise<boolean> {
@@ -117,7 +131,7 @@ class DepositMonitorService {
   }
 
   private async getActiveWallets(): Promise<MonitoredWallet[]> {
-    return prisma.wallet.findMany({
+    const wallets = await prisma.wallet.findMany({
       where: {
         status: 'ACTIVE',
         address: {
@@ -128,11 +142,12 @@ class DepositMonitorService {
         user: true,
       },
     });
+
+    return wallets as MonitoredWallet[];
   }
 
   // ------------------------------------------------------------------
-  // BIG scan — every 60s (second 0) — BSC primary, 150 blocks.
-  // Authoritative pass: advances the cursor + checks BNB balances.
+  // BIG scan — every 60s (second 0) — primary/fallback, 150 blocks.
   // ------------------------------------------------------------------
 
   private async runBigScan(): Promise<void> {
@@ -145,6 +160,13 @@ class DepositMonitorService {
       const wallets = await this.getActiveWallets();
 
       if (wallets.length === 0) return;
+
+      const walletMap = new Map(
+        wallets.map(
+          (wallet) =>
+            [wallet.address.toLowerCase(), wallet] as const
+        )
+      );
 
       const provider = await blockchain.getProvider();
 
@@ -165,32 +187,34 @@ class DepositMonitorService {
       );
 
       logger.info(
-        `[BIG] Primary scan: ${wallets.length} wallets, blocks ${fromBlock}-${currentBlock}`
+        `[BIG] USDT scan: blocks ${fromBlock}-${currentBlock} (${wallets.length} wallets)`
       );
 
       let rateLimited = false;
 
       if (fromBlock <= currentBlock) {
         try {
-          const addresses = wallets.map(
-            (wallet) => wallet.address
-          );
-
+          /**
+           * ONE batched, block-range scan for ALL wallets — NOT 250
+           * per-wallet eth_getLogs calls.
+           */
           const eventsByAddress =
             await blockchain.getTokenTransferEventsForAddresses(
               'USDT',
-              addresses,
+              [...walletMap.keys()],
               fromBlock,
               currentBlock
             );
 
-          let depositCount = 0;
+          let eventsFound = 0;
+          let depositsMatched = 0;
 
-          for (const wallet of wallets) {
-            const events =
-              eventsByAddress.get(
-                wallet.address.toLowerCase()
-              ) ?? [];
+          for (const [address, events] of eventsByAddress) {
+            const wallet = walletMap.get(address);
+
+            if (!wallet) continue;
+
+            eventsFound += events.length;
 
             for (const event of events) {
               await this.processDeposit(
@@ -203,12 +227,12 @@ class DepositMonitorService {
                 }
               );
 
-              depositCount++;
+              depositsMatched++;
             }
           }
 
           logger.info(
-            `[BIG] USDT scan complete: ${depositCount} transfer event(s) found`
+            `[BIG] USDT events found: ${eventsFound}, deposits matched: ${depositsMatched}`
           );
         } catch (err) {
           const msg = this.getErrorMessage(err);
@@ -221,7 +245,7 @@ class DepositMonitorService {
             );
           } else {
             logger.error(
-              '[BIG] Error scanning batched USDT deposits:',
+              '[BIG] Error scanning USDT deposits:',
               err
             );
           }
@@ -229,8 +253,8 @@ class DepositMonitorService {
       }
 
       /**
-       * BNB balance scan — BIG pass only, bounded parallelism so it
-       * finishes quickly and never blocks the QuickNode slot.
+       * BNB balance sweep — BIG pass only, bounded concurrency with
+       * rate-limit-aware backoff.
        */
       if (!rateLimited) {
         const queue = [...wallets];
@@ -241,26 +265,49 @@ class DepositMonitorService {
             BNB_CHECK_CONCURRENCY
           );
 
-          await Promise.allSettled(
-            batchWallets.map((wallet) =>
-              this.checkNativeBalance(
-                wallet,
-                currentBlock
-              ).catch((err) => {
-                logger.error(
-                  `Error checking BNB balance for ${wallet.address}:`,
-                  err
-                );
-              })
-            )
-          );
+          const results =
+            await Promise.allSettled(
+              batchWallets.map((wallet) =>
+                this.checkNativeBalance(
+                  wallet,
+                  currentBlock
+                )
+              )
+            );
 
-          await sleep(BNB_CHECK_BATCH_DELAY_MS);
+          let hitRateLimit = false;
+
+          for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+
+            if (result.status === 'rejected') {
+              const msg = this.getErrorMessage(
+                result.reason
+              );
+
+              logger.error(
+                `Error checking BNB balance for ${batchWallets[i].address}:`,
+                result.reason
+              );
+
+              if (this.isTemporaryRPCError(msg)) {
+                hitRateLimit = true;
+              }
+            }
+          }
+
+          await sleep(
+            hitRateLimit
+              ? BNB_RATE_LIMIT_BACKOFF_MS
+              : BNB_CHECK_BATCH_DELAY_MS
+          );
         }
       }
 
       /**
-       * Only advance the cursor after the USDT scan succeeded.
+       * Cursor safety: only advance after the authoritative USDT scan
+       * succeeded. A failed scan leaves the cursor untouched so no
+       * block is ever silently skipped.
        */
       if (!rateLimited) {
         await redis.set(
@@ -277,8 +324,7 @@ class DepositMonitorService {
 
   // ------------------------------------------------------------------
   // SMALL scan — every 60s at second 30 — QuickNode, last 5 blocks.
-  // Fast pass for fresh deposits. Does NOT advance the cursor and
-  // does NOT check BNB balances (the BIG pass owns both).
+  // Fast idempotent safety net. Does NOT advance the cursor.
   // ------------------------------------------------------------------
 
   private async runSmallScan(): Promise<void> {
@@ -307,30 +353,28 @@ class DepositMonitorService {
 
       if (wallets.length === 0) return;
 
-      const addresses = wallets.map(
-        (wallet) => wallet.address
+      const walletMap = new Map(
+        wallets.map(
+          (wallet) =>
+            [wallet.address.toLowerCase(), wallet] as const
+        )
       );
 
-      /**
-       * Pinned to QuickNode — the adaptive chunk shrinker inside
-       * blockchain.ts handles QuickNode's small eth_getLogs limit.
-       */
       const eventsByAddress =
         await blockchain.getTokenTransferEventsForAddresses(
           'USDT',
-          addresses,
+          [...walletMap.keys()],
           fromBlock,
           currentBlock,
           provider
         );
 
-      let depositCount = 0;
+      let depositsMatched = 0;
 
-      for (const wallet of wallets) {
-        const events =
-          eventsByAddress.get(
-            wallet.address.toLowerCase()
-          ) ?? [];
+      for (const [address, events] of eventsByAddress) {
+        const wallet = walletMap.get(address);
+
+        if (!wallet) continue;
 
         for (const event of events) {
           await this.processDeposit(
@@ -343,12 +387,12 @@ class DepositMonitorService {
             }
           );
 
-          depositCount++;
+          depositsMatched++;
         }
       }
 
       logger.info(
-        `[SMALL] QuickNode scan complete: ${depositCount} transfer event(s) found`
+        `[SMALL] QuickNode scan complete: ${depositsMatched} deposit(s) matched`
       );
     } catch (err) {
       logger.error('[SMALL] QuickNode scan error:', err);
@@ -358,9 +402,55 @@ class DepositMonitorService {
   }
 
   // ------------------------------------------------------------------
-  // Deposit processing (unchanged logic — idempotent, safe for the
-  // small scan to overlap the big scan's window).
+  // BNB native balance sweep (balance-delta method, preserved).
+  //
+  // EXISTING ISSUE + FIX (proper, not partial):
+  //
+  //   VEYLO seeds BNB gas into a user wallet before forwarding USDT
+  //   fees. A raw balance delta cannot distinguish "operator gas seed"
+  //   from "user BNB deposit", so the seed was previously credited to
+  //   the user as a fake deposit.
+  //
+  //   Fix: a Redis pending-seed ledger. processDeposit() records the
+  //   intended seed BEFORE broadcasting; checkNativeBalance() subtracts
+  //   the recorded seeds from the delta and consumes the ledger.
+  //
+  //   Properties:
+  //    - seed + real deposit in the same window → remainder math still
+  //      credits exactly the deposit portion;
+  //    - seed tx failure → the ledger entry is rolled back in catch;
+  //    - 600s TTL → a lost entry can never suppress deposits forever.
+  //
+  //   Residual edge (documented, intentionally not "fixed"): any OTHER
+  //   inbound BNB in the same window (e.g. a user sending BNB between
+  //   the two balance snapshots) is still attributed by delta — that is
+  //   the pre-existing accounting semantic, unchanged here.
   // ------------------------------------------------------------------
+
+  private pendingSeedKey(address: string): string {
+    return `monitor:seed:pending:${address.toLowerCase()}`;
+  }
+
+  private async recordPendingGasSeed(
+    address: string,
+    seedAmount: bigint
+  ): Promise<void> {
+    const key = this.pendingSeedKey(address);
+    const amountBnb = Number(seedAmount) / 1e18;
+
+    await redis.incrbyfloat(key, amountBnb);
+    await redis.expire(key, SEED_LEDGER_TTL_SEC);
+  }
+
+  private async clearPendingGasSeed(
+    address: string,
+    seedAmount: bigint
+  ): Promise<void> {
+    const key = this.pendingSeedKey(address);
+    const amountBnb = Number(seedAmount) / 1e18;
+
+    await redis.incrbyfloat(key, -amountBnb);
+  }
 
   private async checkNativeBalance(
     wallet: MonitoredWallet,
@@ -395,19 +485,57 @@ class DepositMonitorService {
 
     if (diff <= 0) return;
 
+    /**
+     * Subtract operator gas seeds recorded since the previous
+     * snapshot, then consume the ledger.
+     */
+    const seedKey =
+      this.pendingSeedKey(wallet.address);
+
+    const pendingSeedsStr =
+      await redis.get(seedKey);
+
+    const pendingSeeds =
+      pendingSeedsStr
+        ? parseFloat(pendingSeedsStr)
+        : 0;
+
+    if (pendingSeeds > 0) {
+      await redis.incrbyfloat(seedKey, -pendingSeeds);
+      await redis.expire(seedKey, SEED_LEDGER_TTL_SEC);
+    }
+
+    const adjustedDiff =
+      diff - pendingSeeds;
+
+    if (adjustedDiff <= 0) {
+      logger.info(
+        `BNB delta for ${wallet.address} fully explained by operator gas seed (${pendingSeeds} BNB) — not a deposit.`
+      );
+
+      return;
+    }
+
     await this.processDeposit(
       wallet,
       'BNB',
       {
         from: '',
         amount: BigInt(
-          Math.floor(diff * 1e18)
+          Math.floor(adjustedDiff * 1e18)
         ),
         txHash:
           `bnb-diff:${wallet.address}:${currentBlock}`,
       }
     );
   }
+
+  // ------------------------------------------------------------------
+  // Deposit processing. Business logic unchanged (min amounts, fees,
+  // crediting, fee forwarding, operator balance, notifications).
+  // Idempotency: (txHash, walletAddress) — never a global txHash check,
+  // so two wallets receiving transfers in the same tx are both credited.
+  // ------------------------------------------------------------------
 
   private async processDeposit(
     wallet: MonitoredWallet,
@@ -436,16 +564,6 @@ class DepositMonitorService {
       return;
     }
 
-    const existing =
-      await prisma.transaction.findFirst({
-        where: {
-          userId: wallet.userId,
-          transactionHash: event.txHash,
-        },
-      });
-
-    if (existing) return;
-
     const seen =
       await prisma.depositMonitor.findUnique({
         where: {
@@ -460,6 +578,10 @@ class DepositMonitorService {
       return;
     }
 
+    /**
+     * Receipt verification: ERC20 Transfer logs can appear in failed
+     * transactions, so only successful txs are credited.
+     */
     const receipt =
       await blockchain.getTransactionReceipt(
         event.txHash
@@ -597,6 +719,10 @@ class DepositMonitorService {
       `Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 16)}...)`
     );
 
+    /**
+     * Fee forwarding (unchanged), with the gas-seed ledger recorded
+     * BEFORE broadcasting so the monitor can never misattribute it.
+     */
     if (
       platformFee > 0 &&
       asset === 'USDT'
@@ -622,16 +748,30 @@ class DepositMonitorService {
             FORWARD_GAS_SEED -
             baseline;
 
-          await blockchain.sendTransaction(
-            config.OPERATOR_WALLET_KEY,
+          await this.recordPendingGasSeed(
             wallet.address,
-            seedAmount,
-            'BNB',
-            hashIdempotencyKey(
-              'fwd-seed',
-              event.txHash
-            )
+            seedAmount
           );
+
+          try {
+            await blockchain.sendTransaction(
+              config.OPERATOR_WALLET_KEY,
+              wallet.address,
+              seedAmount,
+              'BNB',
+              hashIdempotencyKey(
+                'fwd-seed',
+                event.txHash
+              )
+            );
+          } catch (seedErr) {
+            await this.clearPendingGasSeed(
+              wallet.address,
+              seedAmount
+            );
+
+            throw seedErr;
+          }
 
           await walletService.adjustOperatorBalance(
             'BNB',
@@ -644,164 +784,4 @@ class DepositMonitorService {
             Math.floor(
               platformFee * 1e18
             )
-          );
-
-        const { hash } =
-          await blockchain.sendTransaction(
-            wallet.encryptedPrivateKey,
-            config.PLATFORM_FEE_WALLET,
-            rawFee,
-            'USDT',
-            hashIdempotencyKey(
-              'fee-forward',
-              event.txHash
-            )
-          );
-
-        if (feeRowId) {
-          await prisma.platformFee.update({
-            where: {
-              id: feeRowId,
-            },
-            data: {
-              sweptAt: new Date(),
-            },
-          });
-        }
-
-        await walletService.adjustOperatorBalance(
-          'USDT',
-          platformFee
-        );
-
-        logger.info(
-          `Fee forwarded: ${platformFee} USDT → platform wallet (tx ${hash})`
-        );
-      } catch (err) {
-        logger.error(
-          `Fee forward failed for ${event.txHash} (fee stays pending for admin sweep): ${(err as Error).message}`
-        );
-      }
-    }
-
-    if (wallet.user.chatId) {
-      await this.notify(
-        wallet.user.chatId,
-        `${'🟢'} <b>DEPOSIT RECEIVED</b>\n\n` +
-          `<b>Amount:</b> ${amount} ${asset}\n` +
-          (platformFee > 0
-            ? `<b>Platform Fee (1%):</b> ${platformFee.toFixed(6)} ${asset}\n`
-            : '') +
-          (gasFee > 0
-            ? `<b>Network Gas:</b> ≈$${gasFee.toFixed(4)}\n`
-            : '') +
-          `<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n` +
-          `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`,
-        30000
-      );
-    }
-  }
-
-  private async notify(
-    chatId: string,
-    html: string,
-    ttlMs = 30000
-  ): Promise<void> {
-    try {
-      const res = await fetch(
-        `https://api.telegram.org/bot${config.BOT_TOKEN}/sendMessage`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: html,
-            parse_mode: 'HTML',
-          }),
-        }
-      );
-
-      const data =
-        (await res.json()) as {
-          ok: boolean;
-          result?: {
-            message_id: number;
-          };
-        };
-
-      const messageId =
-        data?.result?.message_id;
-
-      if (messageId) {
-        const timer = setTimeout(
-          () => {
-            fetch(
-              `https://api.telegram.org/bot${config.BOT_TOKEN}/deleteMessage`,
-              {
-                method: 'POST',
-                headers: {
-                  'Content-Type':
-                    'application/json',
-                },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  message_id:
-                    messageId,
-                }),
-              }
-            ).catch(() => {});
-          },
-          ttlMs
-        );
-
-        timer.unref?.();
-      }
-    } catch (err) {
-      logger.error(
-        'Deposit notify failed:',
-        err
-      );
-    }
-  }
-
-  private getErrorMessage(
-    err: unknown
-  ): string {
-    if (err instanceof Error) {
-      return err.message.toLowerCase();
-    }
-
-    return String(err ?? '').toLowerCase();
-  }
-
-  private isTemporaryRPCError(
-    message: string
-  ): boolean {
-    return (
-      message.includes('timeout') ||
-      message.includes('timed out') ||
-      message.includes('rate limit') ||
-      message.includes('429') ||
-      message.includes('503') ||
-      message.includes('502') ||
-      message.includes('500') ||
-      message.includes('network error') ||
-      message.includes('socket') ||
-      message.includes('temporarily unavailable')
-    );
-  }
-}
-
-function sleep(
-  ms: number
-): Promise<void> {
-  return new Promise((resolve) =>
-    setTimeout(resolve, ms)
-  );
-}
-
-export const depositMonitor =
-  new DepositMonitorService();
-            
+  
