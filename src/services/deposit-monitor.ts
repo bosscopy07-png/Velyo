@@ -77,7 +77,12 @@ class DepositMonitorService {
   }
 
   private async checkNativeBalance(
-    wallet: { address: string; userId: string; user: { chatId: string | null; telegramId: string } },
+    wallet: {
+      address: string;
+      userId: string;
+      encryptedPrivateKey: string; // carried through for processDeposit's fee-forward
+      user: { chatId: string | null; telegramId: string };
+    },
     currentBlock: number
   ): Promise<void> {
     const key = `monitor:bal:${wallet.address}:BNB`;
@@ -141,7 +146,6 @@ class DepositMonitorService {
       update: {},
     });
 
-    let depositTxId = '';
     let feeRowId = '';
     await prisma.$transaction(async (tx) => {
       await tx.balance.upsert({
@@ -165,7 +169,6 @@ class DepositMonitorService {
           idempotencyKey: hashIdempotencyKey('deposit', event.txHash),
         },
       });
-      depositTxId = depositTx.id;
 
       if (platformFee > 0) {
         const feeRow = await tx.platformFee.create({
