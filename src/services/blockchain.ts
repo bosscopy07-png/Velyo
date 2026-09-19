@@ -11,17 +11,14 @@ const ERC20_ABI = [
   'event Transfer(address indexed from, address indexed to, uint256 amount)',
 ];
 
+/** Hard cap on any single RPC call — hung public nodes must fail, not freeze */
 const RPC_TIMEOUT_MS = 15000;
 
 /**
- * Block-range adaptive chunking.
- *
- * Starts large and halves on every block-range rejection, e.g.:
- *
- *   500 → 250 → 125 → 62 → 31 → 15 → 7 → 3 → 1
- *
- * QuickNode Discover ("limited to a 5 range") therefore settles on a
- * working size and keeps scanning the remaining blocks with it.
+ * Block-range adaptive chunking. Starts large and halves on every
+ * block-range rejection, e.g. 500 → 250 → … → 5. QuickNode Discover
+ * ("eth_getLogs is limited to a 5 range") settles on a working size
+ * and keeps scanning the remaining blocks with it.
  */
 const INITIAL_LOG_CHUNK = 500;
 const MIN_LOG_CHUNK = 1;
@@ -57,18 +54,22 @@ class BlockchainService {
   private quicknodeProvider: ethers.JsonRpcProvider;
   private fallbackProviders: ethers.JsonRpcProvider[];
   private currentProvider: ethers.JsonRpcProvider;
-  private providerIndex = 0;
+  private providerIndex: number = 0;
 
+  /**
+   * Per-address send queue. ALL outgoing transactions from one wallet are
+   * serialized through this queue, and each waits for the previous one to
+   * MINE before broadcasting — that prevents both "gapped nonce" rejections
+   * and balance-validation failures on paired sends (gas seed → fee forward).
+   */
   private sendQueues = new Map<string, Promise<{ hash: string; nonce: number }>>();
 
   private readonly transferInterface = new ethers.Interface(ERC20_ABI);
 
   /**
-   * Per-provider learned topic-batch size.
-   *
-   * Providers that reject address topic OR-arrays (413) are remembered
-   * as "range-only" for the lifetime of the process so we never waste
-   * failed requests re-learning it on every scan cycle.
+   * Per-provider learned topic-batch size. Providers that reject address
+   * topic OR-arrays (413) are remembered as "range-only" for the lifetime
+   * of the process so we never re-learn it on every scan cycle.
    */
   private learnedTopicSize = new Map<string, number>();
 
@@ -82,15 +83,12 @@ class BlockchainService {
   constructor() {
     const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
 
+    // Every provider gets a hard timeout. Public nodes under rate-limit
+    // pressure HANG instead of erroring — without this, awaits block forever.
     const makeProvider = (url: string): ethers.JsonRpcProvider => {
       const request = new ethers.FetchRequest(url);
       request.timeout = RPC_TIMEOUT_MS;
-
-      return new ethers.JsonRpcProvider(
-        request,
-        network,
-        { staticNetwork: network }
-      );
+      return new ethers.JsonRpcProvider(request, network, { staticNetwork: network });
     };
 
     this.primaryProvider = makeProvider(config.BSC_PRIMARY_RPC);
@@ -112,16 +110,14 @@ class BlockchainService {
     setInterval(async () => {
       try {
         await this.primaryProvider.getBlockNumber();
-
         const failed = await isPrimaryRPCFailed();
-
         if (failed) {
           logger.info('Primary RPC recovered, switching back');
           this.currentProvider = this.primaryProvider;
           await redis.del('rpc:primary:failed');
         }
       } catch {
-        // Health check intentionally silent.
+        // Primary still down
       }
     }, 30000);
   }
@@ -145,26 +141,20 @@ class BlockchainService {
     if (!primaryFailed) {
       try {
         await this.primaryProvider.getBlockNumber();
-
         this.currentProvider = this.primaryProvider;
-
         return this.primaryProvider;
-      } catch {
+      } catch (err) {
         logger.warn('Primary RPC failed, switching to fallback');
         await markPrimaryRPCFailed();
       }
     }
 
     for (let i = 0; i < this.fallbackProviders.length; i++) {
-      const idx =
-        (this.providerIndex + i) % this.fallbackProviders.length;
-
+      const idx = (this.providerIndex + i) % this.fallbackProviders.length;
       try {
         await this.fallbackProviders[idx].getBlockNumber();
-
         this.providerIndex = idx;
         this.currentProvider = this.fallbackProviders[idx];
-
         return this.fallbackProviders[idx];
       } catch {
         continue;
@@ -180,34 +170,24 @@ class BlockchainService {
    * small scan).
    */
   private async switchToAnotherProvider(): Promise<boolean> {
-    const providers = [
-      this.primaryProvider,
-      ...this.fallbackProviders,
-    ];
+    const providers = [this.primaryProvider, ...this.fallbackProviders];
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
-
       if (provider === this.currentProvider) continue;
 
       try {
         await provider.getBlockNumber();
-
         this.currentProvider = provider;
 
         if (provider === this.primaryProvider) {
           this.providerIndex = 0;
         } else {
-          const fallbackIndex =
-            this.fallbackProviders.indexOf(provider);
-
-          if (fallbackIndex >= 0) {
-            this.providerIndex = fallbackIndex;
-          }
+          const fallbackIndex = this.fallbackProviders.indexOf(provider);
+          if (fallbackIndex >= 0) this.providerIndex = fallbackIndex;
         }
 
         logger.warn('Switched RPC provider for log scanning');
-
         return true;
       } catch {
         continue;
@@ -217,54 +197,66 @@ class BlockchainService {
     return false;
   }
 
-  async getBalance(
-    address: string,
-    asset: AssetSymbol
-  ): Promise<bigint> {
+  async getBalance(address: string, asset: AssetSymbol): Promise<bigint> {
     const provider = await this.resolveProvider();
 
     if (asset === 'BNB') {
-      return provider.getBalance(address);
+      return await provider.getBalance(address);
     }
 
     const assetConfig = ASSETS[asset];
+    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    if (!assetConfig.contractAddress) {
-      throw new Error(`No contract for ${asset}`);
-    }
-
-    const contract = new ethers.Contract(
-      assetConfig.contractAddress,
-      ERC20_ABI,
-      provider
-    );
-
+    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, provider);
     return (await contract.balanceOf(address)) as bigint;
   }
 
+  /**
+   * Serialized send: waits for the previous tx from this wallet to mine,
+   * then broadcasts. Returns once the tx is accepted by the node.
+   */
   async sendTransaction(
     encryptedPrivateKey: string,
     to: string,
     amount: bigint,
     asset: AssetSymbol,
-    _idempotencyKey: string
+    idempotencyKey: string
   ): Promise<{ hash: string; nonce: number }> {
     const { decrypt } = await import('../utils/encryption');
-
     const privateKey = decrypt(encryptedPrivateKey);
     const wallet = new ethers.Wallet(privateKey);
 
-    const previous =
-      this.sendQueues.get(wallet.address) ??
-      Promise.resolve({ hash: '', nonce: 0 });
-
-    const run = previous
-      .catch(() => {})
-      .then(() => this.doSend(wallet, to, amount, asset));
+    const prev = this.sendQueues.get(wallet.address) ?? Promise.resolve({ hash: '', nonce: 0 });
+    const run = (async () => {
+      try {
+        const p = await prev;
+        // CRITICAL: wait for the previous tx to actually mine. Nodes validate
+        // balance/nonce against confirmed state — broadcasting a follow-up
+        // (fee forward) before the seed lands causes INSUFFICIENT_FUNDS.
+        if (p.hash) await this.waitMined(p.hash, 60000);
+      } catch {
+        // previous send failed — proceed anyway
+      }
+      return this.doSend(wallet, to, amount, asset);
+    })();
 
     this.sendQueues.set(wallet.address, run);
-
     return run;
+  }
+
+  /** Poll until a tx has at least 1 confirmation. Proceeds on timeout. */
+  private async waitMined(hash: string, timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const receipt = await this.getTransactionReceipt(hash);
+        if (receipt) return; // mined (status 0 or 1 — either way it's settled)
+      } catch {
+        // provider hiccup — keep polling
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    logger.warn(`waitMined: ${hash} not confirmed after ${timeoutMs}ms — proceeding anyway.`);
   }
 
   private async doSend(
@@ -275,25 +267,13 @@ class BlockchainService {
   ): Promise<{ hash: string; nonce: number }> {
     const provider = await this.resolveProvider();
     const signer = wallet.connect(provider);
-
     const nonce = await this.getNextNonce(wallet.address, provider);
 
     try {
-      const tx = await this.broadcast(
-        signer,
-        to,
-        amount,
-        asset,
-        nonce
-      );
-
-      return {
-        hash: tx.hash,
-        nonce: tx.nonce,
-      };
+      const tx = await this.broadcast(signer, to, amount, asset, nonce);
+      return { hash: tx.hash, nonce: tx.nonce };
     } catch (err) {
       const msg = ((err as Error).message ?? '').toLowerCase();
-
       const isNonceError =
         msg.includes('gapped') ||
         msg.includes('nonce') ||
@@ -301,31 +281,12 @@ class BlockchainService {
         msg.includes('replacement transaction');
 
       if (isNonceError) {
-        logger.warn(
-          `Nonce rejection from ${wallet.address} — refetching and retrying once.`
-        );
-
-        await sleep(4000);
-
-        const fresh = await this.getNextNonce(
-          wallet.address,
-          provider
-        );
-
-        const tx = await this.broadcast(
-          signer,
-          to,
-          amount,
-          asset,
-          fresh
-        );
-
-        return {
-          hash: tx.hash,
-          nonce: tx.nonce,
-        };
+        logger.warn(`Nonce rejection from ${wallet.address} — refetching and retrying once.`);
+        await new Promise((r) => setTimeout(r, 4000));
+        const fresh = await this.getNextNonce(wallet.address, provider);
+        const tx = await this.broadcast(signer, to, amount, asset, fresh);
+        return { hash: tx.hash, nonce: tx.nonce };
       }
-
       throw err;
     }
   }
@@ -338,68 +299,44 @@ class BlockchainService {
     nonce: number
   ): Promise<ethers.TransactionResponse> {
     if (asset === 'BNB') {
-      return signer.sendTransaction({
-        to,
-        value: amount,
-        nonce,
-      });
+      return await signer.sendTransaction({ to, value: amount, nonce });
     }
 
     const assetConfig = ASSETS[asset];
+    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    if (!assetConfig.contractAddress) {
-      throw new Error(`No contract for ${asset}`);
-    }
-
-    const contract = new ethers.Contract(
-      assetConfig.contractAddress,
-      ERC20_ABI,
-      signer
-    );
-
-    return (await contract.transfer(
-      to,
-      amount,
-      { nonce }
-    )) as ethers.TransactionResponse;
+    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, signer);
+    return (await contract.transfer(to, amount, { nonce })) as ethers.TransactionResponse;
   }
 
-  private async getNextNonce(
-    address: string,
-    provider: ethers.JsonRpcProvider
-  ): Promise<number> {
-    return provider.getTransactionCount(address, 'pending');
+  /**
+   * Live pending nonce — no in-memory cache. Combined with the send queue
+   * this is race-free: our previous tx is visible in the mempool before the
+   * next one asks for a nonce.
+   */
+  private async getNextNonce(address: string, provider: ethers.JsonRpcProvider): Promise<number> {
+    return await provider.getTransactionCount(address, 'pending');
   }
 
-  async getTransactionReceipt(
-    hash: string
-  ): Promise<ethers.TransactionReceipt | null> {
+  async getTransactionReceipt(hash: string): Promise<ethers.TransactionReceipt | null> {
     const provider = await this.resolveProvider();
-
-    return provider.getTransactionReceipt(hash);
+    return await provider.getTransactionReceipt(hash);
   }
 
   async waitForConfirmations(
     hash: string,
-    requiredConfirmations = 15,
-    timeoutMs = 300000
+    requiredConfirmations: number = 15,
+    timeoutMs: number = 300000
   ): Promise<ethers.TransactionReceipt> {
+    const provider = await this.resolveProvider();
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
-      const provider = await this.resolveProvider();
-
-      const receipt =
-        await provider.getTransactionReceipt(hash);
-
-      if (
-        receipt &&
-        (await receipt.confirmations()) >= requiredConfirmations
-      ) {
+      const receipt = await provider.getTransactionReceipt(hash);
+      if (receipt && (await receipt.confirmations()) >= requiredConfirmations) {
         return receipt;
       }
-
-      await sleep(5000);
+      await new Promise((r) => setTimeout(r, 5000));
     }
 
     throw new Error('Transaction confirmation timeout');
@@ -411,54 +348,24 @@ class BlockchainService {
 
   async getGasPrice(): Promise<bigint> {
     const provider = await this.resolveProvider();
-
     const feeData = await provider.getFeeData();
-
-    return feeData.gasPrice ?? 5000000000n;
+    return feeData.gasPrice ?? BigInt(5000000000);
   }
 
-  async estimateGas(
-    asset: AssetSymbol,
-    from: string,
-    to: string,
-    amount: bigint
-  ): Promise<bigint> {
+  async estimateGas(asset: AssetSymbol, from: string, to: string, amount: bigint): Promise<bigint> {
     const provider = await this.resolveProvider();
 
     if (asset === 'BNB') {
-      return provider.estimateGas({
-        from,
-        to,
-        value: amount,
-      });
+      return await provider.estimateGas({ from, to, value: amount });
     }
 
     const assetConfig = ASSETS[asset];
-
-    if (!assetConfig.contractAddress) {
-      throw new Error(`No contract for ${asset}`);
-    }
-
-    const contract = new ethers.Contract(
-      assetConfig.contractAddress,
-      ERC20_ABI,
-      provider
-    );
-
-    return (await contract.transfer.estimateGas(
-      to,
-      amount,
-      { from }
-    )) as bigint;
+    const contract = new ethers.Contract(assetConfig.contractAddress!, ERC20_ABI, provider);
+    return (await contract.transfer.estimateGas(to, amount, { from })) as bigint;
   }
 
-  generateWallet(): {
-    address: string;
-    privateKey: string;
-    mnemonic: string;
-  } {
+  generateWallet(): { address: string; privateKey: string; mnemonic: string } {
     const wallet = ethers.Wallet.createRandom();
-
     return {
       address: wallet.address,
       privateKey: wallet.privateKey,
@@ -467,7 +374,8 @@ class BlockchainService {
   }
 
   /**
-   * Original single-wallet API retained for compatibility.
+   * Original single-wallet API retained for compatibility. Delegates to
+   * the block-range-first scanner below.
    */
   async getTokenTransferEvents(
     asset: AssetSymbol,
@@ -475,13 +383,12 @@ class BlockchainService {
     fromBlock: number,
     toBlock: number
   ): Promise<TransferEvent[]> {
-    const grouped =
-      await this.getTokenTransferEventsForAddresses(
-        asset,
-        [toAddress],
-        fromBlock,
-        toBlock
-      );
+    const grouped = await this.getTokenTransferEventsForAddresses(
+      asset,
+      [toAddress],
+      fromBlock,
+      toBlock
+    );
 
     return grouped.get(toAddress.toLowerCase()) ?? [];
   }
@@ -531,10 +438,7 @@ class BlockchainService {
     if (fromBlock > toBlock) return result;
 
     const assetConfig = ASSETS[asset];
-
-    if (!assetConfig.contractAddress) {
-      throw new Error(`No contract for ${asset}`);
-    }
+    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
     const normalizedAddresses = [
       ...new Set(
@@ -549,10 +453,7 @@ class BlockchainService {
       start < normalizedAddresses.length;
       start += ADDRESS_BATCH_SIZE
     ) {
-      const batch = normalizedAddresses.slice(
-        start,
-        start + ADDRESS_BATCH_SIZE
-      );
+      const batch = normalizedAddresses.slice(start, start + ADDRESS_BATCH_SIZE);
 
       const events = await this.queryTransferEventsAdaptive(
         assetConfig.contractAddress,
@@ -612,10 +513,7 @@ class BlockchainService {
     let topicSize = this.getLearnedTopicSize(providerRef);
 
     while (cursor <= toBlock) {
-      const end = Math.min(
-        cursor + chunkSize - 1,
-        toBlock
-      );
+      const end = Math.min(cursor + chunkSize - 1, toBlock);
 
       /**
        * Query units for this block window. topicSize === 0 means one
@@ -643,10 +541,7 @@ class BlockchainService {
           }
         }
 
-        this.learnedTopicSize.set(
-          this.providerKey(providerRef),
-          topicSize
-        );
+        this.learnedTopicSize.set(this.providerKey(providerRef), topicSize);
 
         cursor = end + 1;
 
@@ -655,10 +550,7 @@ class BlockchainService {
          * providers are not penalised by QuickNode-sized chunks.
          */
         if (chunkSize < INITIAL_LOG_CHUNK) {
-          chunkSize = Math.min(
-            INITIAL_LOG_CHUNK,
-            chunkSize * 2
-          );
+          chunkSize = Math.min(INITIAL_LOG_CHUNK, chunkSize * 2);
         }
       } catch (err) {
         const msg = this.getErrorMessage(err);
@@ -672,10 +564,7 @@ class BlockchainService {
         if (this.isTopicTooLargeError(msg) && topicSize > 0) {
           topicSize = topicSize <= 4 ? 0 : Math.floor(topicSize / 2);
 
-          this.learnedTopicSize.set(
-            this.providerKey(providerRef),
-            topicSize
-          );
+          this.learnedTopicSize.set(this.providerKey(providerRef), topicSize);
 
           logger.warn(
             topicSize === 0
@@ -691,262 +580,7 @@ class BlockchainService {
           if (chunkSize > MIN_LOG_CHUNK) {
             const prevChunk = chunkSize;
 
-            chunkSize = Math.max(
-              MIN_LOG_CHUNK,
-              Math.floor(chunkSize / 2)
-            );
+            chunkSize = Math.max(MIN_LOG_CHUNK, Math.floor(chunkSize / 2));
 
             logger.warn(
-              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying with ${chunkSize}`
-            );
-
-            continue;
-          }
-
-          /**
-           * Even a 1-block range was rejected. Only un-pinned scans
-           * may switch provider; a pinned QuickNode scan rethrows.
-           */
-          if (!pinnedProvider) {
-            const switched =
-              await this.switchToAnotherProvider();
-
-            if (switched) {
-              providerRef = this.currentProvider;
-              topicSize = this.getLearnedTopicSize(providerRef);
-              continue;
-            }
-          }
-        }
-
-        throw err;
-      }
-    }
-
-    return allEvents;
-  }
-
-  /**
-   * One eth_getLogs request for one (topic unit, block chunk) pair.
-   *
-   * Retries with exponential backoff ONLY for provider failures
-   * (class B). Range errors (A1) and topic-payload errors (A2) are
-   * thrown immediately — the adaptive outer loop adjusts the right
-   * knob; retrying them unchanged here would just waste quota.
-   */
-  private async queryTransferChunk(
-    contractAddress: string,
-    topicBatch: string[] | null,
-    addressSet: Set<string>,
-    fromBlock: number,
-    toBlock: number,
-    pinnedProvider?: ethers.JsonRpcProvider
-  ): Promise<TransferEvent[]> {
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt < MAX_LOG_RETRIES; attempt++) {
-      try {
-        const provider =
-          pinnedProvider ?? (await this.resolveProvider());
-
-        const transferTopic = ethers.id(
-          'Transfer(address,address,uint256)'
-        );
-
-        const logs = await provider.getLogs({
-          address: contractAddress,
-          topics: [
-            transferTopic,
-            null,
-            topicBatch
-              ? topicBatch.map((address) =>
-                  ethers.zeroPadValue(address, 32)
-                )
-              : null,
-          ],
-          fromBlock,
-          toBlock,
-        });
-
-        const events: TransferEvent[] = [];
-
-        for (const log of logs) {
-          try {
-            const parsed = this.transferInterface.parseLog({
-              topics: log.topics,
-              data: log.data,
-            });
-
-            if (!parsed) continue;
-
-            const to = String(parsed.args[1]).toLowerCase();
-
-            /**
-             * In-memory wallet match. With a topic filter this is a
-             * cheap safety verification; in range-only mode this IS
-             * the filter.
-             */
-            if (!addressSet.has(to)) continue;
-
-            events.push({
-              from: String(parsed.args[0]),
-              to,
-              amount: BigInt(String(parsed.args[2])),
-              txHash: log.transactionHash,
-              blockNumber: log.blockNumber,
-            });
-          } catch {
-            continue;
-          }
-        }
-
-        return events;
-      } catch (err) {
-        lastError = err;
-
-        const msg = this.getErrorMessage(err);
-
-        // (B) provider failure / rate limit → backoff and retry.
-        if (this.isProviderFailure(msg)) {
-          const backoffMs = Math.min(
-            500 * (attempt + 1) * (attempt + 1),
-            5000
-          );
-
-          if (this.isRateLimitError(msg)) {
-            logger.warn(
-              `[RPC] rate limited → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
-            );
-          } else {
-            logger.warn(
-              `[RPC] provider failure → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
-            );
-          }
-
-          await sleep(backoffMs);
-
-          continue;
-        }
-
-        // (A2) / (A1) — thrown for the adaptive loop to handle.
-        if (this.isTopicTooLargeError(msg)) throw err;
-        if (this.isLogRangeError(msg)) throw err;
-
-        throw err;
-      }
-    }
-
-    throw lastError ?? new Error('eth_getLogs failed');
-  }
-
-  // ------------------------------------------------------------------
-  // Error classification
-  // ------------------------------------------------------------------
-
-  private getErrorMessage(err: unknown): string {
-    if (err instanceof Error) {
-      return err.message.toLowerCase();
-    }
-
-    return String(err ?? '').toLowerCase();
-  }
-
-  /**
-   * (B) TRUE provider failures: timeouts, HTTP 5xx, and rate limits
-   * (429, "rate limit", QuickNode -32007 "request limit").
-   *
-   * Checked FIRST, everywhere, because QuickNode's rate-limit text
-   * contains the word "limit" and must never be mistaken for a
-   * block-range rejection.
-   */
-  private isProviderFailure(message: string): boolean {
-    return (
-      message.includes('timeout') ||
-      message.includes('timed out') ||
-      message.includes('429') ||
-      message.includes('rate limit') ||
-      message.includes('rate_limit') ||
-      message.includes('request limit') ||
-      message.includes('-32007') ||
-      message.includes('too many requests') ||
-      message.includes('503') ||
-      message.includes('502') ||
-      message.includes('500') ||
-      message.includes('temporarily unavailable') ||
-      message.includes('server error') ||
-      message.includes('network error') ||
-      message.includes('socket')
-    );
-  }
-
-  /**
-   * (B+) Rate-limit flavour of provider failure (for logging; backoff
-   * is applied to all provider failures).
-   */
-  private isRateLimitError(message: string): boolean {
-    return (
-      message.includes('429') ||
-      message.includes('rate limit') ||
-      message.includes('rate_limit') ||
-      message.includes('request limit') ||
-      message.includes('-32007') ||
-      message.includes('too many requests')
-    );
-  }
-
-  /**
-   * (A2) Topic OR-array payload rejected by the provider.
-   * QuickNode Discover: "413 Request Entity Too Large".
-   */
-  private isTopicTooLargeError(message: string): boolean {
-    return (
-      message.includes('413') ||
-      message.includes('request entity too large') ||
-      message.includes('payload too large')
-    );
-  }
-
-  /**
-   * (A1) TRUE block-range / result-size rejections, e.g. QuickNode
-   * "eth_getLogs is limited to a 5 range", Infura -32005 "exceeds
-   * max results". Only ever consulted AFTER (B) and (A2).
-   */
-  private isLogRangeError(message: string): boolean {
-    return (
-      message.includes('eth_getlogs') ||
-      message.includes('too many results') ||
-      message.includes('range') ||
-      message.includes('block range') ||
-      message.includes('limit') ||
-      message.includes('-32005') ||
-      message.includes('-32615') ||
-      message.includes('result limit') ||
-      message.includes('exceeds')
-    );
-  }
-
-  // ------------------------------------------------------------------
-  // Per-provider topic-size learning
-  // ------------------------------------------------------------------
-
-  private providerKey(provider: ethers.JsonRpcProvider): string {
-    return this.providerUrls.get(provider) ?? 'unknown-provider';
-  }
-
-  private getLearnedTopicSize(
-    provider: ethers.JsonRpcProvider
-  ): number {
-    return (
-      this.learnedTopicSize.get(
-        this.providerKey(provider)
-      ) ?? ADDRESS_BATCH_SIZE
-    );
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export const blockchain = new BlockchainService();
-      
+              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying wit
