@@ -14,8 +14,8 @@ import type { AssetSymbol } from '../config';
 export const GAS_PER_CLAIM_BNB = 0.000002;
 const GAS_SEED_PER_PAYOUT = 2000000000000n;
 const BNB_USD_FALLBACK = 550;
-/** Extra gas units seeded beyond the claim count (buffer, refunded if unused) */
-const GAS_BUFFER_UNITS = 1;
+/** Extra seeded units: 1 buffer for claim rounding + 1 for the fee-forward tx */
+const GAS_BUFFER_UNITS = 2;
 
 /** USDT value of `units × 0.000002` BNB (for charging gas to users) */
 export async function estimateGasUSDT(units: number): Promise<number> {
@@ -40,6 +40,7 @@ export async function estimateCreationCost(totalAmount: number, maxClaimers: num
   const platformFee = config.ENABLE_FEES
     ? Number((totalAmount * (config.PLATFORM_FEE_PERCENT / 100)).toFixed(6))
     : 0;
+  // claimers payouts + 1 buffer + 1 fee-forward transaction
   const gasUnits = maxClaimers + GAS_BUFFER_UNITS;
   const gasFee = await estimateGasUSDT(gasUnits);
   const fee = Number((platformFee + gasFee).toFixed(6));
@@ -62,13 +63,10 @@ class GiveawayService {
     const fee = cost.fee;
     const totalCost = data.totalAmount + fee;
 
-    // Lazy wallet: creators need a real custodial wallet (their funds and the
-    // payout gas live there). Idempotent — returns instantly if one exists.
+    // Lazy wallet: creators need a real custodial wallet (funds + gas live there)
     await walletService.createWallet(data.creatorId);
 
     // ── REAL-BALANCE GATE ──
-    // DB can hold phantom credits (old refunds, admin-era redeems). Only
-    // on-chain truth may fund a giveaway.
     const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
     if (creatorWallet) {
       const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
@@ -136,7 +134,7 @@ class GiveawayService {
         },
       });
 
-      // Fee row 1: 1% platform fee — accumulates until admin sweep
+      // Fee row 1: 1% platform fee — forwarded on-chain right after creation
       if (cost.platformFee > 0) {
         const feeTx = await tx.transaction.create({
           data: {
@@ -156,7 +154,7 @@ class GiveawayService {
         });
       }
 
-      // Fee row 2: gas charge — collected instantly (covers admin's BNB seed)
+      // Fee row 2: gas charge — forwarded on-chain right after creation
       if (cost.gasFee > 0) {
         const gasTx = await tx.transaction.create({
           data: {
@@ -172,28 +170,63 @@ class GiveawayService {
           },
         });
         await tx.platformFee.create({
-          data: {
-            transactionId: gasTx.id,
-            asset: data.asset,
-            amount: cost.gasFee,
-            feeWallet: config.PLATFORM_FEE_WALLET,
-            sweptAt: new Date(), // paid up-front in USDT — nothing to sweep
-          },
+          data: { transactionId: gasTx.id, asset: data.asset, amount: cost.gasFee, feeWallet: config.PLATFORM_FEE_WALLET },
         });
       }
 
       return g;
     });
 
+    // 1) Seed BNB (payout gas + buffer + 1 unit for the fee-forward below).
+    //    Enqueued FIRST so the serialized send queue runs it before the forward.
     await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers + GAS_BUFFER_UNITS);
+
+    // 2) Immediately forward the full creation fee on-chain to the platform
+    //    wallet — same flow as deposits. On failure the rows stay pending and
+    //    the admin Fee Sweep catches them later.
+    await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, fee);
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
   }
 
+  /**
+   * Sends the creator's full creation fee (1% + gas charge) on-chain to the
+   * platform fee wallet. Marks the giveaway's platformFee rows swept on
+   * success; leaves them pending on failure (admin sweep is the fallback).
+   */
+  private async forwardCreationFee(giveawayId: string, creatorId: string, asset: AssetSymbol, amount: number): Promise<void> {
+    if (amount <= 0) return;
+
+    try {
+      const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+      if (!wallet) return;
+
+      const raw = BigInt(Math.floor(amount * 1e18));
+      const { hash } = await blockchain.sendTransaction(
+        wallet.encryptedPrivateKey,
+        config.PLATFORM_FEE_WALLET,
+        raw,
+        asset,
+        `creation-fwd-${giveawayId}`
+      );
+
+      await prisma.platformFee.updateMany({
+        where: {
+          sweptAt: null,
+          transaction: { userId: creatorId, metadata: { path: ['giveawayId'], equals: giveawayId } },
+        },
+        data: { sweptAt: new Date() },
+      });
+      await walletService.adjustOperatorBalance(asset, amount);
+      logger.info(`Creation fee forwarded: ${amount} ${asset} → platform wallet (tx ${hash})`);
+    } catch (err) {
+      logger.error(`Creation fee forward failed for giveaway ${giveawayId} (stays pending for admin sweep): ${(err as Error).message}`);
+    }
+  }
+
   private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<void> {
     try {
-      // Self-healing: if the creator somehow has no wallet yet, create one
       let wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
       if (!wallet) {
         await walletService.createWallet(creatorId);
@@ -236,7 +269,7 @@ class GiveawayService {
   /**
    * After all claims are paid (or the giveaway is cancelled):
    * leftover seeded BNB → admin wallet, creator refunded the USDT value
-   * of the leftover (they paid for claimers+buffer, only claimers got used).
+   * of the leftover.
    */
   async reclaimGas(giveawayId: string): Promise<void> {
     try {
@@ -465,4 +498,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-  
+              
