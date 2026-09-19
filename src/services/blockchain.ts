@@ -14,20 +14,43 @@ const ERC20_ABI = [
 const RPC_TIMEOUT_MS = 15000;
 
 /**
- * Start reasonably large, but automatically shrink when an RPC provider
- * rejects eth_getLogs because of its block-range/result limit.
+ * Block-range adaptive chunking.
+ *
+ * Starts large and halves on every block-range rejection, e.g.:
+ *
+ *   500 → 250 → 125 → 62 → 31 → 15 → 7 → 3 → 1
+ *
+ * QuickNode Discover ("limited to a 5 range") therefore settles on a
+ * working size and keeps scanning the remaining blocks with it.
  */
 const INITIAL_LOG_CHUNK = 500;
 const MIN_LOG_CHUNK = 1;
 const MAX_LOG_RETRIES = 6;
 
 /**
- * Query recipient addresses in batches.
- *
- * 50 is deliberately conservative. This keeps the JSON-RPC request size
- * reasonable while allowing hundreds/thousands of wallets.
+ * Addresses per eth_getLogs topic OR-array when the provider supports
+ * server-side address filtering. If the provider rejects the topic
+ * payload (QuickNode: 413 Request Entity Too Large), the scanner
+ * automatically falls back to range-only queries and matches wallet
+ * addresses in memory instead.
  */
 const ADDRESS_BATCH_SIZE = 50;
+
+export interface TransferEvent {
+  from: string;
+  to: string;
+  amount: bigint;
+  txHash: string;
+  blockNumber: number;
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
 
 class BlockchainService {
   private primaryProvider: ethers.JsonRpcProvider;
@@ -39,6 +62,22 @@ class BlockchainService {
   private sendQueues = new Map<string, Promise<{ hash: string; nonce: number }>>();
 
   private readonly transferInterface = new ethers.Interface(ERC20_ABI);
+
+  /**
+   * Per-provider learned topic-batch size.
+   *
+   * Providers that reject address topic OR-arrays (413) are remembered
+   * as "range-only" for the lifetime of the process so we never waste
+   * failed requests re-learning it on every scan cycle.
+   */
+  private learnedTopicSize = new Map<string, number>();
+
+  /**
+   * ethers v6 does not expose the RPC URL on JsonRpcProvider, so we
+   * track it ourselves — needed to remember per-provider scanning
+   * behaviour (topic-filter vs range-only) across scan cycles.
+   */
+  private providerUrls = new Map<ethers.JsonRpcProvider, string>();
 
   constructor() {
     const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
@@ -59,6 +98,12 @@ class BlockchainService {
     this.fallbackProviders = config.BSC_PUBLIC_RPCS.map(makeProvider);
 
     this.currentProvider = this.primaryProvider;
+
+    this.providerUrls.set(this.primaryProvider, config.BSC_PRIMARY_RPC);
+    this.providerUrls.set(this.quicknodeProvider, config.BSC_QUICKNODE_RPC);
+    this.fallbackProviders.forEach((provider, i) => {
+      this.providerUrls.set(provider, config.BSC_PUBLIC_RPCS[i]);
+    });
 
     this.startHealthCheck();
   }
@@ -86,7 +131,8 @@ class BlockchainService {
   }
 
   /**
-   * Dedicated QuickNode provider used by the 30-second-offset small scan.
+   * Dedicated QuickNode provider, used ONLY by the pinned 5-block small
+   * scan. Balance checks, receipts and sends never route through it.
    */
   async getQuickNodeProvider(): Promise<ethers.JsonRpcProvider> {
     await this.quicknodeProvider.getBlockNumber();
@@ -129,10 +175,9 @@ class BlockchainService {
   }
 
   /**
-   * Switch to another configured provider.
-   *
-   * Used when the current provider rejects a logs request because of
-   * provider-specific limitations.
+   * Switch to another configured provider (primary + public fallbacks;
+   * QuickNode is deliberately excluded — it is reserved for the pinned
+   * small scan).
    */
   private async switchToAnotherProvider(): Promise<boolean> {
     const providers = [
@@ -260,7 +305,7 @@ class BlockchainService {
           `Nonce rejection from ${wallet.address} — refetching and retrying once.`
         );
 
-        await new Promise((resolve) => setTimeout(resolve, 4000));
+        await sleep(4000);
 
         const fresh = await this.getNextNonce(
           wallet.address,
@@ -354,7 +399,7 @@ class BlockchainService {
         return receipt;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await sleep(5000);
     }
 
     throw new Error('Transaction confirmation timeout');
@@ -429,15 +474,7 @@ class BlockchainService {
     toAddress: string,
     fromBlock: number,
     toBlock: number
-  ): Promise<
-    Array<{
-      from: string;
-      to: string;
-      amount: bigint;
-      txHash: string;
-      blockNumber: number;
-    }>
-  > {
+  ): Promise<TransferEvent[]> {
     const grouped =
       await this.getTokenTransferEventsForAddresses(
         asset,
@@ -450,11 +487,35 @@ class BlockchainService {
   }
 
   /**
-   * Efficient multi-wallet USDT scanner.
+   * =========================================================================
+   * BLOCK-RANGE-FIRST USDT SCANNER
+   * =========================================================================
    *
-   * Pass `pinnedProvider` to force a specific RPC (e.g. QuickNode for the
-   * 30-second small scan). When pinned, provider switching on range errors
-   * is disabled — the adaptive chunk shrink is relied on instead.
+   * Scanning dimension is the BLOCK RANGE, never the wallet count:
+   *
+   *   BSC blocks → USDT Transfer logs → extract `to` → match against the
+   *   in-memory Set of VEYLO wallet addresses → return only matches,
+   *   grouped by lowercase recipient.
+   *
+   * Two query shapes, chosen adaptively per provider:
+   *
+   *  1. TOPIC-FILTERED (preferred where supported):
+   *     topics[2] = OR-array of up to ADDRESS_BATCH_SIZE wallet
+   *     addresses, so the provider filters server-side. 250 wallets =
+   *     5 address batches, NOT 250 requests.
+   *
+   *  2. RANGE-ONLY (fallback when the provider rejects the topic
+   *     payload — QuickNode Discover returns
+   *     "413 Request Entity Too Large" for wide OR-arrays):
+   *     no address topics at all; one query per block chunk returns
+   *     ALL USDT transfers in the range, matched against the wallet
+   *     Set in memory. Wallet count then has ZERO effect on the
+   *     request count: 250 wallets still cost 1 query per chunk.
+   *
+   * Both shapes share the same adaptive block-chunk logic, so
+   * QuickNode's "eth_getLogs is limited to a 5 range" is satisfied by
+   * shrinking chunks (500 → 250 → … → 5), never by per-wallet scans.
+   * =========================================================================
    */
   async getTokenTransferEventsForAddresses(
     asset: AssetSymbol,
@@ -462,28 +523,8 @@ class BlockchainService {
     fromBlock: number,
     toBlock: number,
     pinnedProvider?: ethers.JsonRpcProvider
-  ): Promise<
-    Map<
-      string,
-      Array<{
-        from: string;
-        to: string;
-        amount: bigint;
-        txHash: string;
-        blockNumber: number;
-      }>
-    >
-  > {
-    const result = new Map<
-      string,
-      Array<{
-        from: string;
-        to: string;
-        amount: bigint;
-        txHash: string;
-        blockNumber: number;
-      }>
-    >();
+  ): Promise<Map<string, TransferEvent[]>> {
+    const result = new Map<string, TransferEvent[]>();
 
     if (asset === 'BNB') return result;
     if (addresses.length === 0) return result;
@@ -524,11 +565,9 @@ class BlockchainService {
       for (const event of events) {
         const recipient = event.to.toLowerCase();
 
-        if (!result.has(recipient)) {
-          result.set(recipient, []);
-        }
-
-        result.get(recipient)!.push(event);
+        const existing = result.get(recipient) ?? [];
+        existing.push(event);
+        result.set(recipient, existing);
       }
     }
 
@@ -536,33 +575,41 @@ class BlockchainService {
   }
 
   /**
-   * Query one recipient batch with automatic block-range reduction.
+   * Scan one 50-address batch across the block range with TWO adaptive
+   * knobs:
+   *
+   *   chunkSize  — blocks per request; halves on range rejection,
+   *                doubles back after successes.
+   *   topicSize  — addresses per topic OR-array; halves on 413,
+   *                0 = range-only mode (in-memory matching).
+   *
+   * Error classes are ALWAYS distinguished in this order:
+   *
+   *   B. provider failure / rate limit  → throw (backoff in chunk loop)
+   *   A2. topic payload too large (413) → shrink topicSize, same range
+   *   A1. block-range / result limit    → shrink chunkSize
+   *   C. anything else                  → throw
+   *
+   * A rate limit is NEVER treated as a range error and never shrinks
+   * the block chunk.
    */
   private async queryTransferEventsAdaptive(
     contractAddress: string,
-    recipientAddresses: string[],
+    addresses: string[],
     fromBlock: number,
     toBlock: number,
     pinnedProvider?: ethers.JsonRpcProvider
-  ): Promise<
-    Array<{
-      from: string;
-      to: string;
-      amount: bigint;
-      txHash: string;
-      blockNumber: number;
-    }>
-  > {
-    const allEvents: Array<{
-      from: string;
-      to: string;
-      amount: bigint;
-      txHash: string;
-      blockNumber: number;
-    }> = [];
+  ): Promise<TransferEvent[]> {
+    const addressSet = new Set(addresses);
+
+    const allEvents: TransferEvent[] = [];
 
     let cursor = fromBlock;
     let chunkSize = INITIAL_LOG_CHUNK;
+
+    let providerRef: ethers.JsonRpcProvider =
+      pinnedProvider ?? this.currentProvider;
+    let topicSize = this.getLearnedTopicSize(providerRef);
 
     while (cursor <= toBlock) {
       const end = Math.min(
@@ -570,20 +617,43 @@ class BlockchainService {
         toBlock
       );
 
+      /**
+       * Query units for this block window. topicSize === 0 means one
+       * range-only query; otherwise the batch is split into
+       * topicSize-sized OR-arrays so EVERY address is still covered.
+       */
+      const units: Array<string[] | null> =
+        topicSize <= 0
+          ? [null]
+          : chunkArray(addresses, topicSize);
+
       try {
-        const events =
-          await this.queryTransferChunk(
+        for (const unit of units) {
+          const events = await this.queryTransferChunk(
             contractAddress,
-            recipientAddresses,
+            unit,
+            addressSet,
             cursor,
             end,
             pinnedProvider
           );
 
-        allEvents.push(...events);
+          for (const event of events) {
+            allEvents.push(event);
+          }
+        }
+
+        this.learnedTopicSize.set(
+          this.providerKey(providerRef),
+          topicSize
+        );
 
         cursor = end + 1;
 
+        /**
+         * Grow the block window back after successes so capable
+         * providers are not penalised by QuickNode-sized chunks.
+         */
         if (chunkSize < INITIAL_LOG_CHUNK) {
           chunkSize = Math.min(
             INITIAL_LOG_CHUNK,
@@ -593,9 +663,33 @@ class BlockchainService {
       } catch (err) {
         const msg = this.getErrorMessage(err);
 
+        // (B) rate-limit / provider failure — never a range problem.
+        if (this.isProviderFailure(msg)) {
+          throw err;
+        }
+
+        // (A2) topic OR-array too large — shrink it, retry same range.
+        if (this.isTopicTooLargeError(msg) && topicSize > 0) {
+          topicSize = topicSize <= 4 ? 0 : Math.floor(topicSize / 2);
+
+          this.learnedTopicSize.set(
+            this.providerKey(providerRef),
+            topicSize
+          );
+
+          logger.warn(
+            topicSize === 0
+              ? `[RPC] topic filter rejected (413) → using range-only scan for this provider (wallets matched in memory, 1 query per block chunk)`
+              : `[RPC] topic filter too large → retrying with ${topicSize} addresses per filter`
+          );
+
+          continue;
+        }
+
+        // (A1) block-range / result-size rejection — shrink the chunk.
         if (this.isLogRangeError(msg)) {
           if (chunkSize > MIN_LOG_CHUNK) {
-            const oldChunk = chunkSize;
+            const prevChunk = chunkSize;
 
             chunkSize = Math.max(
               MIN_LOG_CHUNK,
@@ -603,22 +697,23 @@ class BlockchainService {
             );
 
             logger.warn(
-              `RPC eth_getLogs range rejected (${oldChunk} blocks). Retrying with ${chunkSize} blocks.`
+              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying with ${chunkSize}`
             );
 
             continue;
           }
 
           /**
-           * Even one block was rejected.
-           *
-           * Only switch providers when NOT pinned to a specific RPC.
+           * Even a 1-block range was rejected. Only un-pinned scans
+           * may switch provider; a pinned QuickNode scan rethrows.
            */
           if (!pinnedProvider) {
             const switched =
               await this.switchToAnotherProvider();
 
             if (switched) {
+              providerRef = this.currentProvider;
+              topicSize = this.getLearnedTopicSize(providerRef);
               continue;
             }
           }
@@ -631,147 +726,12 @@ class BlockchainService {
     return allEvents;
   }
 
-  private async queryTransferChunk(
-    contractAddress: string,
-    recipientAddresses: string[],
-    fromBlock: number,
-    toBlock: number,
-    pinnedProvider?: ethers.JsonRpcProvider
-  ): Promise<
-    Array<{
-      from: string;
-      to: string;
-      amount: bigint;
-      txHash: string;
-      blockNumber: number;
-    }>
-  > {
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt < MAX_LOG_RETRIES; attempt++) {
-      try {
-        const provider =
-          pinnedProvider ?? (await this.resolveProvider());
-
-        const transferTopic =
-          ethers.id(
-            'Transfer(address,address,uint256)'
-          );
-
-        const recipientTopics =
-          recipientAddresses.map((address) =>
-            ethers.zeroPadValue(address, 32)
-          );
-
-        const logs = await provider.getLogs({
-          address: contractAddress,
-          topics: [
-            transferTopic,
-            null,
-            recipientTopics,
-          ],
-          fromBlock,
-          toBlock,
-        });
-
-        return logs
-          .map((log) => {
-            try {
-              const parsed =
-                this.transferInterface.parseLog({
-                  topics: log.topics,
-                  data: log.data,
-                });
-
-              if (!parsed) return null;
-
-              return {
-                from: String(parsed.args[0]),
-                to: String(parsed.args[1]),
-                amount: BigInt(parsed.args[2]),
-                txHash: log.transactionHash,
-                blockNumber: log.blockNumber,
-              };
-            } catch {
-              return null;
-            }
-          })
-          .filter(
-            (
-              event
-            ): event is {
-              from: string;
-              to: string;
-              amount: bigint;
-              txHash: string;
-              blockNumber: number;
-            } => event !== null
-          );
-      } catch (err) {
-        lastError = err;
-
-        const msg = this.getErrorMessage(err);
-
-        if (this.isLogRangeError(msg)) {
-          throw err;
-        }
-
-        if (this.isProviderFailure(msg)) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, 500 * (attempt + 1))
-          );
-
-          continue;
-        }
-
-        throw err;
-      }
-    }
-
-    throw lastError ?? new Error('eth_getLogs failed');
-  }
-
-  private getErrorMessage(err: unknown): string {
-    if (err instanceof Error) {
-      return err.message.toLowerCase();
-    }
-
-    return String(err ?? '').toLowerCase();
-  }
-
-  private isLogRangeError(message: string): boolean {
-    return (
-      message.includes('eth_getlogs') ||
-      message.includes('too many results') ||
-      message.includes('range') ||
-      message.includes('block range') ||
-      message.includes('413') ||
-      message.includes('request entity too large') ||
-      message.includes('limit') ||
-      message.includes('-32005') ||
-      message.includes('-32615') ||
-      message.includes('result limit') ||
-      message.includes('exceeds')
-    );
-  }
-
-  private isProviderFailure(message: string): boolean {
-    return (
-      message.includes('timeout') ||
-      message.includes('timed out') ||
-      message.includes('429') ||
-      message.includes('rate limit') ||
-      message.includes('rate_limit') ||
-      message.includes('503') ||
-      message.includes('502') ||
-      message.includes('500') ||
-      message.includes('temporarily unavailable') ||
-      message.includes('server error') ||
-      message.includes('network error') ||
-      message.includes('socket')
-    );
-  }
-}
-
-export const blockchain = new BlockchainService();
-        
+  /**
+   * One eth_getLogs request for one (topic unit, block chunk) pair.
+   *
+   * Retries with exponential backoff ONLY for provider failures
+   * (class B). Range errors (A1) and topic-payload errors (A2) are
+   * thrown immediately — the adaptive outer loop adjusts the right
+   * knob; retrying them unchanged here would just waste quota.
+   */
+  private async queryTransferChunk
