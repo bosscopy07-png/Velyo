@@ -8,7 +8,10 @@ import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
 import cron from 'node-cron';
 
-const ASSET_DECIMALS: Record<string, number> = { BNB: 18, USDT: 18 };
+const ASSET_DECIMALS: Record<string, number> = {
+  BNB: 18,
+  USDT: 18,
+};
 
 /**
  * BIG scan (BSC primary) — runs every 60s at second 0.
@@ -29,7 +32,7 @@ const SMALL_SCAN_BLOCK_WINDOW = 5;
 /**
  * Shared Redis lock. Both scans compete for it; only one holder at a
  * time, so even if one scan overruns its slot the other waits/skips
- * instead of running concurrently. Always released in finally.
+ * instead of running concurrently.
  */
 const SCAN_LOCK_KEY = 'monitor:scan:lock';
 const SCAN_LOCK_TTL_SEC = 240;
@@ -86,7 +89,7 @@ class DepositMonitorService {
 
   start(): void {
     /**
-     * t=0s, 60s, 120s ...  → BIG scan (primary, 150 blocks, cursor, BNB sweep)
+     * t=0s, 60s, 120s ...  → BIG scan (primary, 150 blocks, cursor)
      * t=30s, 90s, 150s ... → SMALL scan (QuickNode, 5 blocks, no cursor)
      */
     cron.schedule('0 * * * * *', () => {
@@ -169,10 +172,6 @@ class DepositMonitorService {
 
       if (wallets.length === 0) return;
 
-      /**
-       * address(lowercase) → wallet. USDT events are matched against
-       * this map; only matching addresses reach processDeposit().
-       */
       const walletMap = new Map(
         wallets.map(
           (wallet) =>
@@ -182,7 +181,8 @@ class DepositMonitorService {
 
       const provider = await blockchain.getProvider();
 
-      const currentBlock = await provider.getBlockNumber();
+      const currentBlock =
+        await provider.getBlockNumber();
 
       const cursorKey = 'monitor:lastBlock';
 
@@ -415,7 +415,7 @@ class DepositMonitorService {
   // ------------------------------------------------------------------
   // BNB native balance sweep (balance-delta method, preserved).
   //
-  // GAS-SEED FALSE-DEPOSIT FIX:
+  // EXISTING ISSUE + FIX (proper, not partial):
   //
   //   VEYLO seeds BNB gas into a user wallet before forwarding USDT
   //   fees. A raw balance delta cannot distinguish "operator gas seed"
@@ -432,9 +432,10 @@ class DepositMonitorService {
   //    - seed tx failure → the ledger entry is rolled back in catch;
   //    - 600s TTL → a lost entry can never suppress deposits forever.
   //
-  //   Residual edge (documented, intentionally not changed): any OTHER
-  //   inbound BNB in the same window is still attributed by delta —
-  //   that is the pre-existing accounting semantic.
+  //   Residual edge (documented, intentionally not "fixed"): any OTHER
+  //   inbound BNB in the same window (e.g. a user sending BNB between
+  //   the two balance snapshots) is still attributed by delta — that is
+  //   the pre-existing accounting semantic, unchanged here.
   // ------------------------------------------------------------------
 
   private pendingSeedKey(address: string): string {
@@ -466,24 +467,32 @@ class DepositMonitorService {
     wallet: MonitoredWallet,
     currentBlock: number
   ): Promise<void> {
-    const key = `monitor:bal:${wallet.address}:BNB`;
+    const key =
+      `monitor:bal:${wallet.address}:BNB`;
 
     const raw = await blockchain.getBalance(
       wallet.address,
       'BNB'
     );
 
-    const current = Number(raw) / 1e18;
+    const current =
+      Number(raw) / 1e18;
 
-    const prevStr = await redis.get(key);
+    const prevStr =
+      await redis.get(key);
 
-    await redis.set(key, current.toFixed(12));
+    await redis.set(
+      key,
+      current.toFixed(12)
+    );
 
     if (!prevStr) return;
 
-    const previous = parseFloat(prevStr);
+    const previous =
+      parseFloat(prevStr);
 
-    const diff = current - previous;
+    const diff =
+      current - previous;
 
     if (diff <= 0) return;
 
@@ -491,20 +500,24 @@ class DepositMonitorService {
      * Subtract operator gas seeds recorded since the previous
      * snapshot, then consume the ledger.
      */
-    const seedKey = this.pendingSeedKey(wallet.address);
+    const seedKey =
+      this.pendingSeedKey(wallet.address);
 
-    const pendingSeedsStr = await redis.get(seedKey);
+    const pendingSeedsStr =
+      await redis.get(seedKey);
 
-    const pendingSeeds = pendingSeedsStr
-      ? parseFloat(pendingSeedsStr)
-      : 0;
+    const pendingSeeds =
+      pendingSeedsStr
+        ? parseFloat(pendingSeedsStr)
+        : 0;
 
     if (pendingSeeds > 0) {
       await redis.incrbyfloat(seedKey, -pendingSeeds);
       await redis.expire(seedKey, SEED_LEDGER_TTL_SEC);
     }
 
-    const adjustedDiff = diff - pendingSeeds;
+    const adjustedDiff =
+      diff - pendingSeeds;
 
     if (adjustedDiff <= 0) {
       logger.info(
@@ -522,18 +535,17 @@ class DepositMonitorService {
         amount: BigInt(
           Math.floor(adjustedDiff * 1e18)
         ),
-        txHash: `bnb-diff:${wallet.address}:${currentBlock}`,
+        txHash:
+          `bnb-diff:${wallet.address}:${currentBlock}`,
       }
     );
-  }
-
+    }
+    
   // ------------------------------------------------------------------
-  // Deposit processing.
-  //
-  // Idempotency: (txHash, walletAddress) via the unique
-  // `hashIdempotencyKey('deposit', "${txHash}:${address}")` — NEVER a
-  // global transactionHash lookup, so two VEYLO wallets receiving
-  // transfers in the same on-chain tx are BOTH credited.
+  // Deposit processing. Business logic unchanged (min amounts, fees,
+  // crediting, fee forwarding, operator balance, notifications).
+  // Idempotency: (txHash, walletAddress) — never a global txHash check,
+  // so two wallets receiving transfers in the same tx are both credited.
   // ------------------------------------------------------------------
 
   private async processDeposit(
@@ -545,56 +557,88 @@ class DepositMonitorService {
       txHash: string;
     }
   ): Promise<void> {
-    const decimals = ASSET_DECIMALS[asset] ?? 18;
-    const amount = Number(event.amount) / 10 ** decimals;
+    const decimals =
+      ASSET_DECIMALS[asset] ?? 18;
 
-    const minAmount = MIN_DEPOSIT[asset] ?? 0.1;
+    const amount =
+      Number(event.amount) /
+      10 ** decimals;
+
+    const minAmount =
+      MIN_DEPOSIT[asset] ?? 0.1;
+
     if (amount < minAmount) {
       logger.info(
         `Ignoring dust ${asset} deposit of ${amount} (< min ${minAmount})`
       );
+
       return;
     }
 
-    const seen = await prisma.depositMonitor.findUnique({
-      where: {
-        txHash_address: {
-          txHash: event.txHash,
-          address: wallet.address,
+    const seen =
+      await prisma.depositMonitor.findUnique({
+        where: {
+          txHash_address: {
+            txHash: event.txHash,
+            address: wallet.address,
+          },
         },
-      },
-    });
+      });
 
-    if (seen?.status === 'PROCESSED') return;
+    if (seen?.status === 'PROCESSED') {
+      return;
+    }
 
     /**
      * Receipt verification: ERC20 Transfer logs can appear in failed
      * transactions, so only successful txs are credited.
      */
-    const receipt = await blockchain.getTransactionReceipt(
-      event.txHash
-    );
+    const receipt =
+      await blockchain.getTransactionReceipt(
+        event.txHash
+      );
 
-    if (!receipt || receipt.status !== 1) return;
+    if (!receipt || receipt.status !== 1) {
+      return;
+    }
 
-    // Fees: tiered flat fee + 1% platform fee + BNB gas (priced in the
-    // asset) to forward everything on-chain. USDT amount ≈ USD for tiering.
-    const flatFee = flatFeeFor(asset === 'USDT' ? amount : 0);
-    const pctFee = config.ENABLE_FEES
-      ? amount * (config.PLATFORM_FEE_PERCENT / 100)
-      : 0;
-    const platformFee = flatFee + pctFee;
+    /**
+     * Fees: tiered flat fee + percentage platform fee + BNB gas
+     * (priced in the asset) to forward everything on-chain.
+     * USDT amount ≈ USD for tiering; BNB deposits always use the
+     * small flat tier.
+     */
+    const flatFee =
+      flatFeeFor(asset === 'USDT' ? amount : 0);
+
+    const pctFee =
+      config.ENABLE_FEES
+        ? amount * (config.PLATFORM_FEE_PERCENT / 100)
+        : 0;
+
+    const platformFee =
+      flatFee + pctFee;
+
     const gasFee =
-      platformFee > 0 ? await estimateGasUSDT(1) : 0;
-    const totalFee = platformFee + gasFee;
-    const netAmount = amount - totalFee;
+      platformFee > 0
+        ? await estimateGasUSDT(1)
+        : 0;
 
-    // Safety: never credit negative — if fees would swallow the whole
-    // deposit, skip it entirely (it stays on-chain, user keeps it there)
+    const totalFee =
+      platformFee + gasFee;
+
+    const netAmount =
+      amount - totalFee;
+
+    /**
+     * Safety: never credit negative — if fees would swallow the whole
+     * deposit, skip it entirely (it stays on-chain, user keeps it there)
+     */
     if (netAmount <= 0) {
       logger.warn(
         `Deposit ${amount} ${asset} below fee floor (${totalFee}) — ignored, not credited`
       );
+
       return;
     }
 
@@ -617,63 +661,72 @@ class DepositMonitorService {
 
     let feeRowId = '';
 
-    const depositIdempotencyKey = hashIdempotencyKey(
-      'deposit',
-      `${event.txHash}:${wallet.address.toLowerCase()}`
-    );
+    const depositIdempotencyKey =
+      hashIdempotencyKey(
+        'deposit',
+        `${event.txHash}:${wallet.address.toLowerCase()}`
+      );
 
-    await prisma.$transaction(async (tx) => {
-      await tx.balance.upsert({
-        where: {
-          userId_asset: {
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.balance.upsert({
+          where: {
+            userId_asset: {
+              userId: wallet.userId,
+              asset,
+            },
+          },
+          create: {
             userId: wallet.userId,
             asset,
+            availableBalance: netAmount,
+            lockedBalance: 0,
+            pendingBalance: 0,
           },
-        },
-        create: {
-          userId: wallet.userId,
-          asset,
-          availableBalance: netAmount,
-          lockedBalance: 0,
-          pendingBalance: 0,
-        },
-        update: {
-          availableBalance: {
-            increment: netAmount,
-          },
-        },
-      });
-
-      const depositTx = await tx.transaction.create({
-        data: {
-          userId: wallet.userId,
-          type: 'DEPOSIT',
-          asset,
-          amount,
-          fee: totalFee,
-          netAmount,
-          status: 'CONFIRMED',
-          transactionHash: event.txHash,
-          fromAddress: event.from || null,
-          toAddress: wallet.address,
-          idempotencyKey: depositIdempotencyKey,
-        },
-      });
-
-      if (platformFee > 0) {
-        const feeRow = await tx.platformFee.create({
-          data: {
-            transactionId: depositTx.id,
-            asset,
-            amount: platformFee,
-            feeWallet: config.PLATFORM_FEE_WALLET,
-            // sweptAt stays null until the on-chain forward below succeeds
+          update: {
+            availableBalance: {
+              increment: netAmount,
+            },
           },
         });
 
-        feeRowId = feeRow.id;
+        const depositTx =
+          await tx.transaction.create({
+            data: {
+              userId: wallet.userId,
+              type: 'DEPOSIT',
+              asset,
+              amount,
+              fee: totalFee,
+              netAmount,
+              status: 'CONFIRMED',
+              transactionHash: event.txHash,
+              fromAddress:
+                event.from || null,
+              toAddress: wallet.address,
+              idempotencyKey:
+                depositIdempotencyKey,
+            },
+          });
+
+        if (platformFee > 0) {
+          const feeRow =
+            await tx.platformFee.create({
+              data: {
+                transactionId:
+                  depositTx.id,
+                asset,
+                amount: platformFee,
+                feeWallet:
+                  config.PLATFORM_FEE_WALLET,
+                // sweptAt stays null until the on-chain forward below succeeds
+              },
+            });
+
+          feeRowId = feeRow.id;
+        }
       }
-    });
+    );
 
     await prisma.depositMonitor.updateMany({
       where: {
@@ -690,38 +743,45 @@ class DepositMonitorService {
       `Deposit credited: ${netAmount} ${asset} (${event.txHash.slice(0, 16)}...)`
     );
 
-    // ── Immediate on-chain fee forwarding ──
-    if (platformFee > 0 && asset === 'USDT') {
+    /**
+     * Fee forwarding (unchanged), with the gas-seed ledger recorded
+     * BEFORE broadcasting so the monitor can never misattribute it.
+     */
+    if (
+      platformFee > 0 &&
+      asset === 'USDT'
+    ) {
       try {
-        const baseline = await blockchain.getBalance(
-          wallet.address,
-          'BNB'
-        );
+        const baseline =
+          await blockchain.getBalance(
+            wallet.address,
+            'BNB'
+          );
 
-        if (baseline < FORWARD_GAS_SEED) {
+        if (
+          baseline <
+          FORWARD_GAS_SEED
+        ) {
           if (!config.OPERATOR_WALLET_KEY) {
             throw new Error(
               'OPERATOR_WALLET_KEY not configured'
             );
           }
 
-          const seedAmt = FORWARD_GAS_SEED - baseline;
+          const seedAmount =
+            FORWARD_GAS_SEED -
+            baseline;
 
-          /**
-           * Record the seed in the pending ledger BEFORE broadcasting
-           * so the balance sweep can never misattribute it as a user
-           * BNB deposit. Rolled back if the send fails.
-           */
           await this.recordPendingGasSeed(
             wallet.address,
-            seedAmt
+            seedAmount
           );
 
-                    try {
+          try {
             await blockchain.sendTransaction(
               config.OPERATOR_WALLET_KEY,
               wallet.address,
-              seedAmt,
+              seedAmount,
               'BNB',
               hashIdempotencyKey(
                 'fwd-seed',
@@ -731,7 +791,7 @@ class DepositMonitorService {
           } catch (seedErr) {
             await this.clearPendingGasSeed(
               wallet.address,
-              seedAmt
+              seedAmount
             );
 
             throw seedErr;
@@ -739,29 +799,39 @@ class DepositMonitorService {
 
           await walletService.adjustOperatorBalance(
             'BNB',
-            -Number(seedAmt) / 1e18
+            -Number(seedAmount) / 1e18
           );
         }
 
-        const rawFee = BigInt(
-          Math.floor(platformFee * 1e18)
-        );
+        const rawFee =
+          BigInt(
+            Math.floor(
+              platformFee * 1e18
+            )
+          );
 
-        const { hash } = await blockchain.sendTransaction(
-          wallet.encryptedPrivateKey,
-          config.PLATFORM_FEE_WALLET,
-          rawFee,
-          'USDT',
-          hashIdempotencyKey(
-            'fee-forward',
-            event.txHash
-          )
-        );
+        const { hash } =
+          await blockchain.sendTransaction(
+            wallet.encryptedPrivateKey,
+            config.PLATFORM_FEE_WALLET,
+            rawFee,
+            'USDT',
+            hashIdempotencyKey(
+              'fee-forward',
+              event.txHash
+            )
+          );
 
-        await prisma.platformFee.update({
-          where: { id: feeRowId },
-          data: { sweptAt: new Date() },
-        });
+        if (feeRowId) {
+          await prisma.platformFee.update({
+            where: {
+              id: feeRowId,
+            },
+            data: {
+              sweptAt: new Date(),
+            },
+          });
+        }
 
         await walletService.adjustOperatorBalance(
           'USDT',
@@ -820,40 +890,52 @@ class DepositMonitorService {
         }
       );
 
-      const data = (await res.json()) as {
-        ok: boolean;
-        result?: {
-          message_id: number;
+      const data =
+        (await res.json()) as {
+          ok: boolean;
+          result?: {
+            message_id: number;
+          };
         };
-      };
 
-      const messageId = data?.result?.message_id;
+      const messageId =
+        data?.result?.message_id;
 
       if (messageId) {
-        const timer = setTimeout(() => {
-          fetch(
-            `https://api.telegram.org/bot${config.BOT_TOKEN}/deleteMessage`,
-            {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId,
-              }),
-            }
-          ).catch(() => {});
-        }, ttlMs);
+        const timer = setTimeout(
+          () => {
+            fetch(
+              `https://api.telegram.org/bot${config.BOT_TOKEN}/deleteMessage`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type':
+                    'application/json',
+                },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id:
+                    messageId,
+                }),
+              }
+            ).catch(() => {});
+          },
+          ttlMs
+        );
 
         timer.unref?.();
       }
     } catch (err) {
-      logger.error('Deposit notify failed:', err);
+      logger.error(
+        'Deposit notify failed:',
+        err
+      );
     }
   }
 
-  private getErrorMessage(err: unknown): string {
+  private getErrorMessage(
+    err: unknown
+  ): string {
     if (err instanceof Error) {
       return err.message.toLowerCase();
     }
@@ -861,7 +943,9 @@ class DepositMonitorService {
     return String(err ?? '').toLowerCase();
   }
 
-  private isTemporaryRPCError(message: string): boolean {
+  private isTemporaryRPCError(
+    message: string
+  ): boolean {
     return (
       message.includes('timeout') ||
       message.includes('timed out') ||
@@ -880,9 +964,14 @@ class DepositMonitorService {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(
+  ms: number
+): Promise<void> {
+  return new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
 }
 
-export const depositMonitor = new DepositMonitorService();
-          
+export const depositMonitor =
+  new DepositMonitorService();
+      
