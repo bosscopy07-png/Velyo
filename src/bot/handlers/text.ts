@@ -13,7 +13,6 @@ import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
-const MAX_CLAIMERS = 1000;
 
 export function registerTextHandlers(bot: any): void {
   bot.on('text', async (ctx: Context) => {
@@ -26,9 +25,11 @@ export function registerTextHandlers(bot: any): void {
 
     try {
       await ctx.deleteMessage();
-    } catch { /* message may be too old — ignore */ }
+    } catch {}
 
-    if (!session?.state) return;
+    if (!session?.state) {
+      return;
+    }
 
     try {
       switch (session.state) {
@@ -76,7 +77,7 @@ export function registerTextHandlers(bot: any): void {
             `${e('person')} Claimers: <b>1 User</b>\n` +
             `${e('star')} Reward Per User: <b>${amount} ${asset}</b>\n` +
             (cost.fee > 0
-              ? `${e('card')} Platform Fee (${config.PLATFORM_FEE_PERCENT}%): <b>${cost.platformFee} ${asset}</b>\n` +
+              ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
                 `${e('fire')} Network Gas (${cost.gasUnits} slots: 1 claim + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
                 `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
               : '') +
@@ -99,8 +100,7 @@ export function registerTextHandlers(bot: any): void {
           if (!isValidAmount(amountStr)) {
             await editMainMessage(
               ctx,
-              `${e('warning')} <b>INVALID AMOUNT</b>\n${DIVIDER}\n\n` +
-              `Enter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
+              `${e('warning')} <b>INVALID AMOUNT</b>\n\nEnter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
               backKeyboard('giveaway')
             );
             return;
@@ -136,7 +136,7 @@ export function registerTextHandlers(bot: any): void {
 
         // === GIVEAWAY MULTI: CLAIMERS ===
         case 'giveaway_multi_claimers': {
-          const claimers = parseInt(text.trim(), 10);
+          const claimers = parseInt(text.trim());
           if (isNaN(claimers) || claimers < 1) {
             await editMainMessage(
               ctx,
@@ -145,25 +145,9 @@ export function registerTextHandlers(bot: any): void {
             );
             return;
           }
-          if (claimers > MAX_CLAIMERS) {
-            await editMainMessage(
-              ctx,
-              `${e('warning')} <b>TOO MANY CLAIMERS</b>\n\nMaximum is <b>${MAX_CLAIMERS}</b> claimers per giveaway.`,
-              backKeyboard('giveaway:multiple')
-            );
-            return;
-          }
 
           const { amount, asset } = session as any;
           const amountPerUser = amount / claimers;
-          if (amountPerUser < 0.000001) {
-            await editMainMessage(
-              ctx,
-              `${e('warning')} <b>REWARD TOO SMALL</b>\n\nWith ${claimers} claimers, each user gets ≈${amountPerUser.toExponential(2)} ${asset} — below the dust limit. Lower the claimer count or raise the amount.`,
-              backKeyboard('giveaway:multiple')
-            );
-            return;
-          }
 
           await setUserSession(telegramId, {
             state: 'giveaway_multi_expiry',
@@ -202,7 +186,11 @@ export function registerTextHandlers(bot: any): void {
           const user = await prisma.user.findUnique({ where: { telegramId } });
           if (!user) return;
 
-          const redeemCode = await prisma.redeemCode.findUnique({ where: { code } });
+          const redeemCode = await prisma.redeemCode.findUnique({
+            where: { code },
+            include: { redemptions: true },
+          });
+
           if (!redeemCode) {
             await editMainMessage(ctx, `${e('warning')} <b>INVALID CODE</b>\n\nPlease check the code and try again.`, backKeyboard('main'));
             return;
@@ -215,62 +203,42 @@ export function registerTextHandlers(bot: any): void {
             await editMainMessage(ctx, `${e('warning')} <b>CODE EXPIRED</b>\n\nThis code has expired.`, backKeyboard('main'));
             return;
           }
-
-          // Atomic redemption: the conditional increment is the real guard.
-          // Two concurrent redemptions of the last slot — only one wins.
-          const claimed = await prisma.redeemCode.updateMany({
-            where: {
-              id: redeemCode.id,
-              status: 'ACTIVE',
-              redemptionCount: { lt: redeemCode.maxRedemptions },
-              OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-            },
-            data: { redemptionCount: { increment: 1 } },
-          });
-          if (claimed.count === 0) {
+          if (redeemCode.redemptions.length >= redeemCode.maxRedemptions) {
             await editMainMessage(ctx, `${e('warning')} <b>CODE DEPLETED</b>\n\nThis code has reached its maximum redemptions.`, backKeyboard('main'));
             return;
           }
-
-          try {
-            await prisma.$transaction(async (tx) => {
-              await tx.codeRedemption.create({
-                data: { codeId: redeemCode.id, userId: user.id, amount: Number(redeemCode.rewardAmount) },
-              });
-              await tx.balance.upsert({
-                where: { userId_asset: { userId: user.id, asset: redeemCode.asset } },
-                create: {
-                  userId: user.id,
-                  asset: redeemCode.asset,
-                  availableBalance: Number(redeemCode.rewardAmount),
-                  lockedBalance: 0,
-                  pendingBalance: 0,
-                },
-                update: { availableBalance: { increment: Number(redeemCode.rewardAmount) } },
-              });
-              await tx.transaction.create({
-                data: {
-                  userId: user.id,
-                  type: 'CODE_REDEMPTION',
-                  asset: redeemCode.asset,
-                  amount: Number(redeemCode.rewardAmount),
-                  fee: 0,
-                  netAmount: Number(redeemCode.rewardAmount),
-                  status: 'CONFIRMED',
-                  idempotencyKey: hashIdempotencyKey('redeem', redeemCode.id, user.id),
-                },
-              });
-            });
-          } catch (err) {
-            // Credit failed after the slot was taken — roll the counter back
-            logger.error(`Redemption credit failed for ${code}: ${(err as Error).message}`);
-            await prisma.redeemCode.update({
-              where: { id: redeemCode.id },
-              data: { redemptionCount: { decrement: 1 } },
-            });
-            await editMainMessage(ctx, `${e('warning')} <b>ERROR</b>\n\nRedemption failed, please try again.`, backKeyboard('main'));
+          const alreadyRedeemed = redeemCode.redemptions.some((r) => r.userId === user.id);
+          if (alreadyRedeemed) {
+            await editMainMessage(ctx, `${e('warning')} <b>ALREADY REDEEMED</b>\n\nYou already redeemed this code.`, backKeyboard('main'));
             return;
           }
+
+          await prisma.$transaction(async (tx) => {
+            await tx.codeRedemption.create({
+              data: { codeId: redeemCode.id, userId: user.id, amount: Number(redeemCode.rewardAmount) },
+            });
+            await tx.redeemCode.update({
+              where: { id: redeemCode.id },
+              data: { redemptionCount: { increment: 1 } },
+            });
+            await tx.balance.upsert({
+              where: { userId_asset: { userId: user.id, asset: redeemCode.asset } },
+              create: { userId: user.id, asset: redeemCode.asset, availableBalance: Number(redeemCode.rewardAmount) },
+              update: { availableBalance: { increment: Number(redeemCode.rewardAmount) } },
+            });
+            await tx.transaction.create({
+              data: {
+                userId: user.id,
+                type: 'CODE_REDEMPTION',
+                asset: redeemCode.asset,
+                amount: Number(redeemCode.rewardAmount),
+                fee: 0,
+                netAmount: Number(redeemCode.rewardAmount),
+                status: 'CONFIRMED',
+                idempotencyKey: hashIdempotencyKey('redeem', redeemCode.id, user.id),
+              },
+            });
+          });
 
           await clearUserSession(telegramId);
           await editMainMessage(
@@ -419,9 +387,10 @@ export function registerTextHandlers(bot: any): void {
       await clearUserSession(telegramId);
     }
   });
-                                                                                                         // === EXPIRY SELECTION ===
+
+  // === EXPIRY SELECTION ===
   bot.action(/giveaway:expiry:(\d+)/, async (ctx: Context) => {
-    const hours = parseInt((ctx as any).match[1], 10);
+    const hours = parseInt((ctx as any).match[1]);
     const from = ctx.from!;
     const session = await getUserSession(from.id.toString());
 
@@ -454,8 +423,8 @@ export function registerTextHandlers(bot: any): void {
       `${e('people')} Claimers: <b>${maxClaimers}</b>\n` +
       `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
       (cost.fee > 0
-        ? `${e('card')} Platform Fee (${config.PLATFORM_FEE_PERCENT}%): <b>${cost.platformFee} ${asset}</b>\n` +
-          `${e('fire')} Network Gas (${cost.gasUnits} slots: ${maxClaimers} claim${maxClaimers > 1 ? 's' : ''} + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
+        ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+          `${e('fire')} Network Gas (${cost.gasUnits} slots: ${maxClaimers} claims + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
           `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
         : '') +
       `${e('chart')} Per User: <b>≈ ${pricing.formatUSD(usdPerUser)}</b>\n` +
@@ -476,14 +445,15 @@ export function registerTextHandlers(bot: any): void {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
 
+    await ctx.answerCbQuery('Processing your reward...');
+
     const session = await getUserSession(from.id.toString());
     const address =
-      session?.state === 'awaiting_payout_confirm' && (session as any).claimId === claimId
+      session?.state === 'awaiting_payout_confirm'
         ? ((session as any).address as string)
         : undefined;
 
     if (!address) {
-      await ctx.answerCbQuery('Session expired.');
       await editMainMessage(
         ctx,
         `${e('warning')} <b>SESSION EXPIRED</b>\n\nPlease send your wallet address again.`,
@@ -497,37 +467,8 @@ export function registerTextHandlers(bot: any): void {
       include: { giveaway: true },
     });
 
-    if (!claim || claim.userId !== from.id.toString()) {
-      await ctx.answerCbQuery('Invalid claim.');
+    if (!claim || claim.status !== 'RESERVED') {
       await editMainMessage(ctx, `${e('warning')} <b>INVALID CLAIM</b>\n\nThis claim is no longer valid.`, backKeyboard('main'));
-      return;
-    }
-
-    // Guarded transition: first confirm wins; a double-click lands on
-    // ADDRESS_CONFIRMED and skips re-queueing. FAILED is included so a
-    // resumed claim (after a payout failure) can re-confirm.
-    const transitioned = await prisma.giveawayClaim.updateMany({
-      where: { id: claimId, status: { in: ['RESERVED', 'FAILED'] } },
-      data: { status: 'ADDRESS_CONFIRMED' },
-    });
-
-    if (transitioned.count === 0) {
-      // Refresh status for the message
-      const fresh = await prisma.giveawayClaim.findUnique({ where: { id: claimId } });
-      if (fresh && ['ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING', 'PAID'].includes(fresh.status!)) {
-        await ctx.answerCbQuery('Already confirmed!');
-        await editMainMessage(
-          ctx,
-          `${e('check')} <b>REWARD QUEUED</b>\n${DIVIDER}\n\n` +
-          `${e('gift')} Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward is already being processed.\n\n` +
-          `${e('clock')} You will receive a notification once it's sent.`,
-          backKeyboard('main')
-        );
-      } else {
-        await ctx.answerCbQuery('This claim is no longer valid.');
-        await editMainMessage(ctx, `${e('warning')} <b>INVALID CLAIM</b>\n\nThis claim is no longer valid.`, backKeyboard('main'));
-      }
-      await clearUserSession(from.id.toString());
       return;
     }
 
@@ -545,7 +486,6 @@ export function registerTextHandlers(bot: any): void {
     });
 
     await clearUserSession(from.id.toString());
-    await ctx.answerCbQuery('Processing your reward...');
 
     await editMainMessage(
       ctx,
@@ -564,16 +504,7 @@ export function registerTextHandlers(bot: any): void {
       where: { id: claimId },
       include: { giveaway: true },
     });
-    if (!claim || claim.userId !== from.id.toString()) {
-      await ctx.answerCbQuery('Invalid claim.');
-      return;
-    }
-
-    // Only allow changing the address while it hasn't been queued yet
-    if (claim.status !== 'RESERVED' && claim.status !== 'ADDRESS_CONFIRMED') {
-      await ctx.answerCbQuery('Payout already in progress.');
-      return;
-    }
+    if (!claim) return;
 
     await setUserSession(from.id.toString(), {
       state: 'awaiting_payout_address',
