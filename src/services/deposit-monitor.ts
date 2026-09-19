@@ -717,7 +717,7 @@ class DepositMonitorService {
             seedAmt
           );
 
-          try {
+                    try {
             await blockchain.sendTransaction(
               config.OPERATOR_WALLET_KEY,
               wallet.address,
@@ -726,3 +726,163 @@ class DepositMonitorService {
               hashIdempotencyKey(
                 'fwd-seed',
                 event.txHash
+              )
+            );
+          } catch (seedErr) {
+            await this.clearPendingGasSeed(
+              wallet.address,
+              seedAmt
+            );
+
+            throw seedErr;
+          }
+
+          await walletService.adjustOperatorBalance(
+            'BNB',
+            -Number(seedAmt) / 1e18
+          );
+        }
+
+        const rawFee = BigInt(
+          Math.floor(platformFee * 1e18)
+        );
+
+        const { hash } = await blockchain.sendTransaction(
+          wallet.encryptedPrivateKey,
+          config.PLATFORM_FEE_WALLET,
+          rawFee,
+          'USDT',
+          hashIdempotencyKey(
+            'fee-forward',
+            event.txHash
+          )
+        );
+
+        await prisma.platformFee.update({
+          where: { id: feeRowId },
+          data: { sweptAt: new Date() },
+        });
+
+        await walletService.adjustOperatorBalance(
+          'USDT',
+          platformFee
+        );
+
+        logger.info(
+          `Fee forwarded: ${platformFee} USDT → platform wallet (tx ${hash})`
+        );
+      } catch (err) {
+        logger.error(
+          `Fee forward failed for ${event.txHash} (fee stays pending for admin sweep): ${(err as Error).message}`
+        );
+      }
+    }
+
+    if (wallet.user.chatId) {
+      await this.notify(
+        wallet.user.chatId,
+        `${'🟢'} <b>DEPOSIT RECEIVED</b>\n\n` +
+          `<b>Amount:</b> ${amount} ${asset}\n` +
+          (flatFee > 0
+            ? `<b>Flat Fee:</b> $${flatFee.toFixed(2)}\n`
+            : '') +
+          (pctFee > 0
+            ? `<b>Platform Fee (1%):</b> ${pctFee.toFixed(6)} ${asset}\n`
+            : '') +
+          (gasFee > 0
+            ? `<b>Network Gas:</b> ≈$${gasFee.toFixed(4)}\n`
+            : '') +
+          `<b>Credited:</b> ${netAmount.toFixed(6)} ${asset}\n` +
+          `<b>Ref:</b> <code>${event.txHash.slice(0, 24)}...</code>`,
+        30000
+      );
+    }
+  }
+
+  private async notify(
+    chatId: string,
+    html: string,
+    ttlMs = 30000
+  ): Promise<void> {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${config.BOT_TOKEN}/sendMessage`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: html,
+            parse_mode: 'HTML',
+          }),
+        }
+      );
+
+      const data = (await res.json()) as {
+        ok: boolean;
+        result?: {
+          message_id: number;
+        };
+      };
+
+      const messageId = data?.result?.message_id;
+
+      if (messageId) {
+        const timer = setTimeout(() => {
+          fetch(
+            `https://api.telegram.org/bot${config.BOT_TOKEN}/deleteMessage`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+              }),
+            }
+          ).catch(() => {});
+        }, ttlMs);
+
+        timer.unref?.();
+      }
+    } catch (err) {
+      logger.error('Deposit notify failed:', err);
+    }
+  }
+
+  private getErrorMessage(err: unknown): string {
+    if (err instanceof Error) {
+      return err.message.toLowerCase();
+    }
+
+    return String(err ?? '').toLowerCase();
+  }
+
+  private isTemporaryRPCError(message: string): boolean {
+    return (
+      message.includes('timeout') ||
+      message.includes('timed out') ||
+      message.includes('rate limit') ||
+      message.includes('request limit') ||
+      message.includes('-32007') ||
+      message.includes('too many requests') ||
+      message.includes('429') ||
+      message.includes('503') ||
+      message.includes('502') ||
+      message.includes('500') ||
+      message.includes('network error') ||
+      message.includes('socket') ||
+      message.includes('temporarily unavailable')
+    );
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+export const depositMonitor = new DepositMonitorService();
+          
