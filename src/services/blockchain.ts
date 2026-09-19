@@ -11,6 +11,9 @@ const ERC20_ABI = [
   'event Transfer(address indexed from, address indexed to, uint256 amount)',
 ];
 
+/** Hard cap on any single RPC call — hung public nodes must fail, not freeze */
+const RPC_TIMEOUT_MS = 15000;
+
 class BlockchainService {
   private primaryProvider: ethers.JsonRpcProvider;
   private fallbackProviders: ethers.JsonRpcProvider[];
@@ -27,15 +30,17 @@ class BlockchainService {
   constructor() {
     const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
 
-    this.primaryProvider = new ethers.JsonRpcProvider(
-      config.BSC_PRIMARY_RPC,
-      network,
-      { staticNetwork: network }
-    );
+    // Every provider gets a hard timeout. Public nodes under rate-limit
+    // pressure HANG instead of erroring — without this, awaits block forever
+    // and Telegraf kills handlers at 90s.
+    const makeProvider = (url: string): ethers.JsonRpcProvider => {
+      const request = new ethers.FetchRequest(url);
+      request.timeout = RPC_TIMEOUT_MS;
+      return new ethers.JsonRpcProvider(request, network, { staticNetwork: network });
+    };
 
-    this.fallbackProviders = config.BSC_PUBLIC_RPCS.map(
-      (url) => new ethers.JsonRpcProvider(url, network, { staticNetwork: network })
-    );
+    this.primaryProvider = makeProvider(config.BSC_PRIMARY_RPC);
+    this.fallbackProviders = config.BSC_PUBLIC_RPCS.map(makeProvider);
 
     this.currentProvider = this.primaryProvider;
     this.startHealthCheck();
@@ -269,4 +274,4 @@ class BlockchainService {
 }
 
 export const blockchain = new BlockchainService();
-                             
+      
