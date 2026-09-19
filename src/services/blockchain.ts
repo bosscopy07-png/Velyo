@@ -15,10 +15,14 @@ const ERC20_ABI = [
 const RPC_TIMEOUT_MS = 15000;
 
 /**
- * Block-range adaptive chunking. Starts large and halves on every
- * block-range rejection, e.g. 500 → 250 → … → 5. QuickNode Discover
- * ("eth_getLogs is limited to a 5 range") settles on a working size
- * and keeps scanning the remaining blocks with it.
+ * Block-range adaptive chunking.
+ *
+ * Starts large and halves on every block-range rejection, e.g.:
+ *
+ *   500 → 250 → 125 → 62 → 31 → 15 → 7 → 3 → 1
+ *
+ * QuickNode Discover ("limited to a 5 range") therefore settles on a
+ * working size and keeps scanning the remaining blocks with it.
  */
 const INITIAL_LOG_CHUNK = 500;
 const MIN_LOG_CHUNK = 1;
@@ -54,7 +58,7 @@ class BlockchainService {
   private quicknodeProvider: ethers.JsonRpcProvider;
   private fallbackProviders: ethers.JsonRpcProvider[];
   private currentProvider: ethers.JsonRpcProvider;
-  private providerIndex: number = 0;
+  private providerIndex = 0;
 
   /**
    * Per-address send queue. ALL outgoing transactions from one wallet are
@@ -67,9 +71,11 @@ class BlockchainService {
   private readonly transferInterface = new ethers.Interface(ERC20_ABI);
 
   /**
-   * Per-provider learned topic-batch size. Providers that reject address
-   * topic OR-arrays (413) are remembered as "range-only" for the lifetime
-   * of the process so we never re-learn it on every scan cycle.
+   * Per-provider learned topic-batch size.
+   *
+   * Providers that reject address topic OR-arrays (413) are remembered
+   * as "range-only" for the lifetime of the process so we never waste
+   * failed requests re-learning it on every scan cycle.
    */
   private learnedTopicSize = new Map<string, number>();
 
@@ -110,14 +116,16 @@ class BlockchainService {
     setInterval(async () => {
       try {
         await this.primaryProvider.getBlockNumber();
+
         const failed = await isPrimaryRPCFailed();
+
         if (failed) {
           logger.info('Primary RPC recovered, switching back');
           this.currentProvider = this.primaryProvider;
           await redis.del('rpc:primary:failed');
         }
       } catch {
-        // Primary still down
+        // Primary still down — health check intentionally silent.
       }
     }, 30000);
   }
@@ -141,9 +149,11 @@ class BlockchainService {
     if (!primaryFailed) {
       try {
         await this.primaryProvider.getBlockNumber();
+
         this.currentProvider = this.primaryProvider;
+
         return this.primaryProvider;
-      } catch (err) {
+      } catch {
         logger.warn('Primary RPC failed, switching to fallback');
         await markPrimaryRPCFailed();
       }
@@ -151,10 +161,13 @@ class BlockchainService {
 
     for (let i = 0; i < this.fallbackProviders.length; i++) {
       const idx = (this.providerIndex + i) % this.fallbackProviders.length;
+
       try {
         await this.fallbackProviders[idx].getBlockNumber();
+
         this.providerIndex = idx;
         this.currentProvider = this.fallbackProviders[idx];
+
         return this.fallbackProviders[idx];
       } catch {
         continue;
@@ -170,24 +183,33 @@ class BlockchainService {
    * small scan).
    */
   private async switchToAnotherProvider(): Promise<boolean> {
-    const providers = [this.primaryProvider, ...this.fallbackProviders];
+    const providers = [
+      this.primaryProvider,
+      ...this.fallbackProviders,
+    ];
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
+
       if (provider === this.currentProvider) continue;
 
       try {
         await provider.getBlockNumber();
+
         this.currentProvider = provider;
 
         if (provider === this.primaryProvider) {
           this.providerIndex = 0;
         } else {
           const fallbackIndex = this.fallbackProviders.indexOf(provider);
-          if (fallbackIndex >= 0) this.providerIndex = fallbackIndex;
+
+          if (fallbackIndex >= 0) {
+            this.providerIndex = fallbackIndex;
+          }
         }
 
         logger.warn('Switched RPC provider for log scanning');
+
         return true;
       } catch {
         continue;
@@ -201,13 +223,21 @@ class BlockchainService {
     const provider = await this.resolveProvider();
 
     if (asset === 'BNB') {
-      return await provider.getBalance(address);
+      return provider.getBalance(address);
     }
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, provider);
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      provider
+    );
+
     return (await contract.balanceOf(address)) as bigint;
   }
 
@@ -220,42 +250,53 @@ class BlockchainService {
     to: string,
     amount: bigint,
     asset: AssetSymbol,
-    idempotencyKey: string
+    _idempotencyKey: string
   ): Promise<{ hash: string; nonce: number }> {
     const { decrypt } = await import('../utils/encryption');
+
     const privateKey = decrypt(encryptedPrivateKey);
     const wallet = new ethers.Wallet(privateKey);
 
-    const prev = this.sendQueues.get(wallet.address) ?? Promise.resolve({ hash: '', nonce: 0 });
+    const previous =
+      this.sendQueues.get(wallet.address) ??
+      Promise.resolve({ hash: '', nonce: 0 });
+
     const run = (async () => {
       try {
-        const p = await prev;
+        const prev = await previous;
+
         // CRITICAL: wait for the previous tx to actually mine. Nodes validate
         // balance/nonce against confirmed state — broadcasting a follow-up
         // (fee forward) before the seed lands causes INSUFFICIENT_FUNDS.
-        if (p.hash) await this.waitMined(p.hash, 60000);
+        if (prev.hash) await this.waitMined(prev.hash, 60000);
       } catch {
         // previous send failed — proceed anyway
       }
+
       return this.doSend(wallet, to, amount, asset);
     })();
 
     this.sendQueues.set(wallet.address, run);
+
     return run;
   }
 
   /** Poll until a tx has at least 1 confirmation. Proceeds on timeout. */
   private async waitMined(hash: string, timeoutMs: number): Promise<void> {
     const start = Date.now();
+
     while (Date.now() - start < timeoutMs) {
       try {
         const receipt = await this.getTransactionReceipt(hash);
+
         if (receipt) return; // mined (status 0 or 1 — either way it's settled)
       } catch {
         // provider hiccup — keep polling
       }
-      await new Promise((r) => setTimeout(r, 2000));
+
+      await sleep(2000);
     }
+
     logger.warn(`waitMined: ${hash} not confirmed after ${timeoutMs}ms — proceeding anyway.`);
   }
 
@@ -267,13 +308,19 @@ class BlockchainService {
   ): Promise<{ hash: string; nonce: number }> {
     const provider = await this.resolveProvider();
     const signer = wallet.connect(provider);
+
     const nonce = await this.getNextNonce(wallet.address, provider);
 
     try {
       const tx = await this.broadcast(signer, to, amount, asset, nonce);
-      return { hash: tx.hash, nonce: tx.nonce };
+
+      return {
+        hash: tx.hash,
+        nonce: tx.nonce,
+      };
     } catch (err) {
       const msg = ((err as Error).message ?? '').toLowerCase();
+
       const isNonceError =
         msg.includes('gapped') ||
         msg.includes('nonce') ||
@@ -282,11 +329,19 @@ class BlockchainService {
 
       if (isNonceError) {
         logger.warn(`Nonce rejection from ${wallet.address} — refetching and retrying once.`);
-        await new Promise((r) => setTimeout(r, 4000));
+
+        await sleep(4000);
+
         const fresh = await this.getNextNonce(wallet.address, provider);
+
         const tx = await this.broadcast(signer, to, amount, asset, fresh);
-        return { hash: tx.hash, nonce: tx.nonce };
+
+        return {
+          hash: tx.hash,
+          nonce: tx.nonce,
+        };
       }
+
       throw err;
     }
   }
@@ -299,13 +354,21 @@ class BlockchainService {
     nonce: number
   ): Promise<ethers.TransactionResponse> {
     if (asset === 'BNB') {
-      return await signer.sendTransaction({ to, value: amount, nonce });
+      return signer.sendTransaction({ to, value: amount, nonce });
     }
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, signer);
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      signer
+    );
+
     return (await contract.transfer(to, amount, { nonce })) as ethers.TransactionResponse;
   }
 
@@ -314,29 +377,36 @@ class BlockchainService {
    * this is race-free: our previous tx is visible in the mempool before the
    * next one asks for a nonce.
    */
-  private async getNextNonce(address: string, provider: ethers.JsonRpcProvider): Promise<number> {
-    return await provider.getTransactionCount(address, 'pending');
+  private async getNextNonce(
+    address: string,
+    provider: ethers.JsonRpcProvider
+  ): Promise<number> {
+    return provider.getTransactionCount(address, 'pending');
   }
 
   async getTransactionReceipt(hash: string): Promise<ethers.TransactionReceipt | null> {
     const provider = await this.resolveProvider();
-    return await provider.getTransactionReceipt(hash);
+
+    return provider.getTransactionReceipt(hash);
   }
 
   async waitForConfirmations(
     hash: string,
-    requiredConfirmations: number = 15,
-    timeoutMs: number = 300000
+    requiredConfirmations = 15,
+    timeoutMs = 300000
   ): Promise<ethers.TransactionReceipt> {
-    const provider = await this.resolveProvider();
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
+      const provider = await this.resolveProvider();
+
       const receipt = await provider.getTransactionReceipt(hash);
+
       if (receipt && (await receipt.confirmations()) >= requiredConfirmations) {
         return receipt;
       }
-      await new Promise((r) => setTimeout(r, 5000));
+
+      await sleep(5000);
     }
 
     throw new Error('Transaction confirmation timeout');
@@ -348,24 +418,46 @@ class BlockchainService {
 
   async getGasPrice(): Promise<bigint> {
     const provider = await this.resolveProvider();
+
     const feeData = await provider.getFeeData();
-    return feeData.gasPrice ?? BigInt(5000000000);
+
+    return feeData.gasPrice ?? 5000000000n;
   }
 
-  async estimateGas(asset: AssetSymbol, from: string, to: string, amount: bigint): Promise<bigint> {
+  async estimateGas(
+    asset: AssetSymbol,
+    from: string,
+    to: string,
+    amount: bigint
+  ): Promise<bigint> {
     const provider = await this.resolveProvider();
 
     if (asset === 'BNB') {
-      return await provider.estimateGas({ from, to, value: amount });
+      return provider.estimateGas({ from, to, value: amount });
     }
 
     const assetConfig = ASSETS[asset];
-    const contract = new ethers.Contract(assetConfig.contractAddress!, ERC20_ABI, provider);
+
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      provider
+    );
+
     return (await contract.transfer.estimateGas(to, amount, { from })) as bigint;
   }
 
-  generateWallet(): { address: string; privateKey: string; mnemonic: string } {
+  generateWallet(): {
+    address: string;
+    privateKey: string;
+    mnemonic: string;
+  } {
     const wallet = ethers.Wallet.createRandom();
+
     return {
       address: wallet.address,
       privateKey: wallet.privateKey,
@@ -374,8 +466,7 @@ class BlockchainService {
   }
 
   /**
-   * Original single-wallet API retained for compatibility. Delegates to
-   * the block-range-first scanner below.
+   * Original single-wallet API retained for compatibility.
    */
   async getTokenTransferEvents(
     asset: AssetSymbol,
@@ -438,7 +529,10 @@ class BlockchainService {
     if (fromBlock > toBlock) return result;
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
+
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
 
     const normalizedAddresses = [
       ...new Set(
@@ -474,7 +568,7 @@ class BlockchainService {
 
     return result;
   }
-
+  
   /**
    * Scan one 50-address batch across the block range with TWO adaptive
    * knobs:
@@ -508,8 +602,7 @@ class BlockchainService {
     let cursor = fromBlock;
     let chunkSize = INITIAL_LOG_CHUNK;
 
-    let providerRef: ethers.JsonRpcProvider =
-      pinnedProvider ?? this.currentProvider;
+    let providerRef: ethers.JsonRpcProvider = pinnedProvider ?? this.currentProvider;
     let topicSize = this.getLearnedTopicSize(providerRef);
 
     while (cursor <= toBlock) {
@@ -521,9 +614,7 @@ class BlockchainService {
        * topicSize-sized OR-arrays so EVERY address is still covered.
        */
       const units: Array<string[] | null> =
-        topicSize <= 0
-          ? [null]
-          : chunkArray(addresses, topicSize);
+        topicSize <= 0 ? [null] : chunkArray(addresses, topicSize);
 
       try {
         for (const unit of units) {
@@ -575,7 +666,7 @@ class BlockchainService {
           continue;
         }
 
-                // (A1) block-range / result-size rejection — shrink the chunk.
+        // (A1) block-range / result-size rejection — shrink the chunk.
         if (this.isLogRangeError(msg)) {
           if (chunkSize > MIN_LOG_CHUNK) {
             const prevChunk = chunkSize;
@@ -631,12 +722,9 @@ class BlockchainService {
 
     for (let attempt = 0; attempt < MAX_LOG_RETRIES; attempt++) {
       try {
-        const provider =
-          pinnedProvider ?? (await this.resolveProvider());
+        const provider = pinnedProvider ?? (await this.resolveProvider());
 
-        const transferTopic = ethers.id(
-          'Transfer(address,address,uint256)'
-        );
+        const transferTopic = ethers.id('Transfer(address,address,uint256)');
 
         const logs = await provider.getLogs({
           address: contractAddress,
@@ -644,9 +732,7 @@ class BlockchainService {
             transferTopic,
             null,
             topicBatch
-              ? topicBatch.map((address) =>
-                  ethers.zeroPadValue(address, 32)
-                )
+              ? topicBatch.map((address) => ethers.zeroPadValue(address, 32))
               : null,
           ],
           fromBlock,
@@ -693,10 +779,7 @@ class BlockchainService {
 
         // (B) provider failure / rate limit → backoff and retry.
         if (this.isProviderFailure(msg)) {
-          const backoffMs = Math.min(
-            500 * (attempt + 1) * (attempt + 1),
-            5000
-          );
+          const backoffMs = Math.min(500 * (attempt + 1) * (attempt + 1), 5000);
 
           if (this.isRateLimitError(msg)) {
             logger.warn(
@@ -708,7 +791,7 @@ class BlockchainService {
             );
           }
 
-          await new Promise((r) => setTimeout(r, backoffMs));
+          await sleep(backoffMs);
 
           continue;
         }
@@ -818,16 +901,14 @@ class BlockchainService {
     return this.providerUrls.get(provider) ?? 'unknown-provider';
   }
 
-  private getLearnedTopicSize(
-    provider: ethers.JsonRpcProvider
-  ): number {
-    return (
-      this.learnedTopicSize.get(
-        this.providerKey(provider)
-      ) ?? ADDRESS_BATCH_SIZE
-    );
+  private getLearnedTopicSize(provider: ethers.JsonRpcProvider): number {
+    return this.learnedTopicSize.get(this.providerKey(provider)) ?? ADDRESS_BATCH_SIZE;
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export const blockchain = new BlockchainService();
-              
+  
