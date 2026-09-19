@@ -575,7 +575,7 @@ class BlockchainService {
           continue;
         }
 
-        // (A1) block-range / result-size rejection — shrink the chunk.
+                // (A1) block-range / result-size rejection — shrink the chunk.
         if (this.isLogRangeError(msg)) {
           if (chunkSize > MIN_LOG_CHUNK) {
             const prevChunk = chunkSize;
@@ -583,4 +583,251 @@ class BlockchainService {
             chunkSize = Math.max(MIN_LOG_CHUNK, Math.floor(chunkSize / 2));
 
             logger.warn(
-              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying wit
+              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying with ${chunkSize}`
+            );
+
+            continue;
+          }
+
+          /**
+           * Even a 1-block range was rejected. Only un-pinned scans
+           * may switch provider; a pinned QuickNode scan rethrows.
+           */
+          if (!pinnedProvider) {
+            const switched = await this.switchToAnotherProvider();
+
+            if (switched) {
+              providerRef = this.currentProvider;
+              topicSize = this.getLearnedTopicSize(providerRef);
+              continue;
+            }
+          }
+        }
+
+        throw err;
+      }
+    }
+
+    return allEvents;
+  }
+
+  /**
+   * One eth_getLogs request for one (topic unit, block chunk) pair.
+   *
+   * Retries with exponential backoff ONLY for provider failures
+   * (class B). Range errors (A1) and topic-payload errors (A2) are
+   * thrown immediately — the adaptive outer loop adjusts the right
+   * knob; retrying them unchanged here would just waste quota.
+   */
+  private async queryTransferChunk(
+    contractAddress: string,
+    topicBatch: string[] | null,
+    addressSet: Set<string>,
+    fromBlock: number,
+    toBlock: number,
+    pinnedProvider?: ethers.JsonRpcProvider
+  ): Promise<TransferEvent[]> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < MAX_LOG_RETRIES; attempt++) {
+      try {
+        const provider =
+          pinnedProvider ?? (await this.resolveProvider());
+
+        const transferTopic = ethers.id(
+          'Transfer(address,address,uint256)'
+        );
+
+        const logs = await provider.getLogs({
+          address: contractAddress,
+          topics: [
+            transferTopic,
+            null,
+            topicBatch
+              ? topicBatch.map((address) =>
+                  ethers.zeroPadValue(address, 32)
+                )
+              : null,
+          ],
+          fromBlock,
+          toBlock,
+        });
+
+        const events: TransferEvent[] = [];
+
+        for (const log of logs) {
+          try {
+            const parsed = this.transferInterface.parseLog({
+              topics: log.topics,
+              data: log.data,
+            });
+
+            if (!parsed) continue;
+
+            const to = String(parsed.args[1]).toLowerCase();
+
+            /**
+             * In-memory wallet match. With a topic filter this is a
+             * cheap safety verification; in range-only mode this IS
+             * the filter.
+             */
+            if (!addressSet.has(to)) continue;
+
+            events.push({
+              from: String(parsed.args[0]),
+              to,
+              amount: BigInt(String(parsed.args[2])),
+              txHash: log.transactionHash,
+              blockNumber: log.blockNumber,
+            });
+          } catch {
+            continue;
+          }
+        }
+
+        return events;
+      } catch (err) {
+        lastError = err;
+
+        const msg = this.getErrorMessage(err);
+
+        // (B) provider failure / rate limit → backoff and retry.
+        if (this.isProviderFailure(msg)) {
+          const backoffMs = Math.min(
+            500 * (attempt + 1) * (attempt + 1),
+            5000
+          );
+
+          if (this.isRateLimitError(msg)) {
+            logger.warn(
+              `[RPC] rate limited → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
+            );
+          } else {
+            logger.warn(
+              `[RPC] provider failure → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
+            );
+          }
+
+          await new Promise((r) => setTimeout(r, backoffMs));
+
+          continue;
+        }
+
+        // (A2) / (A1) — thrown for the adaptive loop to handle.
+        if (this.isTopicTooLargeError(msg)) throw err;
+        if (this.isLogRangeError(msg)) throw err;
+
+        throw err;
+      }
+    }
+
+    throw lastError ?? new Error('eth_getLogs failed');
+  }
+
+  // ------------------------------------------------------------------
+  // Error classification
+  // ------------------------------------------------------------------
+
+  private getErrorMessage(err: unknown): string {
+    if (err instanceof Error) {
+      return err.message.toLowerCase();
+    }
+
+    return String(err ?? '').toLowerCase();
+  }
+
+  /**
+   * (B) TRUE provider failures: timeouts, HTTP 5xx, and rate limits
+   * (429, "rate limit", QuickNode -32007 "request limit").
+   *
+   * Checked FIRST, everywhere, because QuickNode's rate-limit text
+   * contains the word "limit" and must never be mistaken for a
+   * block-range rejection.
+   */
+  private isProviderFailure(message: string): boolean {
+    return (
+      message.includes('timeout') ||
+      message.includes('timed out') ||
+      message.includes('429') ||
+      message.includes('rate limit') ||
+      message.includes('rate_limit') ||
+      message.includes('request limit') ||
+      message.includes('-32007') ||
+      message.includes('too many requests') ||
+      message.includes('503') ||
+      message.includes('502') ||
+      message.includes('500') ||
+      message.includes('temporarily unavailable') ||
+      message.includes('server error') ||
+      message.includes('network error') ||
+      message.includes('socket')
+    );
+  }
+
+  /**
+   * (B+) Rate-limit flavour of provider failure (for logging; backoff
+   * is applied to all provider failures).
+   */
+  private isRateLimitError(message: string): boolean {
+    return (
+      message.includes('429') ||
+      message.includes('rate limit') ||
+      message.includes('rate_limit') ||
+      message.includes('request limit') ||
+      message.includes('-32007') ||
+      message.includes('too many requests')
+    );
+  }
+
+  /**
+   * (A2) Topic OR-array payload rejected by the provider.
+   * QuickNode Discover: "413 Request Entity Too Large".
+   */
+  private isTopicTooLargeError(message: string): boolean {
+    return (
+      message.includes('413') ||
+      message.includes('request entity too large') ||
+      message.includes('payload too large')
+    );
+  }
+
+  /**
+   * (A1) TRUE block-range / result-size rejections, e.g. QuickNode
+   * "eth_getLogs is limited to a 5 range", Infura -32005 "exceeds
+   * max results". Only ever consulted AFTER (B) and (A2).
+   */
+  private isLogRangeError(message: string): boolean {
+    return (
+      message.includes('eth_getlogs') ||
+      message.includes('too many results') ||
+      message.includes('range') ||
+      message.includes('block range') ||
+      message.includes('limit') ||
+      message.includes('-32005') ||
+      message.includes('-32615') ||
+      message.includes('result limit') ||
+      message.includes('exceeds')
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Per-provider topic-size learning
+  // ------------------------------------------------------------------
+
+  private providerKey(provider: ethers.JsonRpcProvider): string {
+    return this.providerUrls.get(provider) ?? 'unknown-provider';
+  }
+
+  private getLearnedTopicSize(
+    provider: ethers.JsonRpcProvider
+  ): number {
+    return (
+      this.learnedTopicSize.get(
+        this.providerKey(provider)
+      ) ?? ADDRESS_BATCH_SIZE
+    );
+  }
+}
+
+export const blockchain = new BlockchainService();
+              
