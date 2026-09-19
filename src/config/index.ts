@@ -28,12 +28,17 @@ const envSchema = z.object({
   PLATFORM_FEE_WALLET: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
   // Encrypted private key of the operator/admin wallet (same wallet as
   // PLATFORM_FEE_WALLET): supplies tiny BNB gas at giveaway creation and
-  // during fee sweeps.
+  // during fee sweeps, and receives fees.
   OPERATOR_WALLET_KEY: z.string().optional(),
 
   PLATFORM_FEE_PERCENT: z.string().default('1.0').transform(Number),
   MINIMUM_AMOUNT_USD: z.string().default('0.1').transform(Number),
   ENABLE_FEES: z.string().default('true').transform((s) => s === 'true'),
+
+  // Deposit flat fee: standard tier, and the reduced tier for small deposits
+  DEPOSIT_FLAT_FEE_USD: z.string().default('0.1').transform(Number),
+  DEPOSIT_FLAT_FEE_SMALL_USD: z.string().default('0.05').transform(Number),
+  DEPOSIT_FLAT_FEE_TIER_USD: z.string().default('0.5').transform(Number),
 
   PRICE_API_URL: z.string().default('https://api.coingecko.com/api/v3'),
   NGN_RATE_API_URL: z.string().default('https://api.exchangerate-api.com/v4/latest/USD'),
@@ -83,4 +88,3 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
-  
