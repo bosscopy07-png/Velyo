@@ -14,8 +14,10 @@ const SYNC_TOLERANCE: Record<string, number> = {
 const SYNC_ASSETS = ['USDT', 'BNB'] as const;
 type SyncAsset = (typeof SYNC_ASSETS)[number];
 
-const CRON_SCHEDULE = '*/2 * * * *'; // every 2 minutes
-const SYNC_KEY_WINDOW_MS = 120000;
+// Every 5 minutes at second 30 — deliberately offset from the deposit monitor
+// (second 0 of every minute) so the two never burst the RPC simultaneously
+const CRON_SCHEDULE = '30 */5 * * * *';
+const SYNC_KEY_WINDOW_MS = 300000; // matches the 5-min cycle
 
 interface SyncContext {
   userId: string;
@@ -34,7 +36,7 @@ class BalanceSyncService {
 
   start(): void {
     cron.schedule(CRON_SCHEDULE, () => void this.syncAll());
-    logger.info('Balance sync started (on-chain → DB, every 2 min)');
+    logger.info('Balance sync started (on-chain → DB, every 5 min, offset from deposit monitor)');
   }
 
   private async syncAll(): Promise<void> {
@@ -51,16 +53,25 @@ class BalanceSyncService {
         },
       });
 
+      let rateLimited = false;
       for (const wallet of wallets) {
         for (const asset of SYNC_ASSETS) {
           try {
             await this.syncOne(wallet.userId, wallet.address, asset);
           } catch (err) {
-            logger.error(
-              `Balance sync failed for ${wallet.address} ${asset}: ${(err as Error).message}`
-            );
+            const msg = (err as Error).message ?? '';
+            if (msg.includes('rate limit') || msg.includes('-32005') || msg.includes('limit exceeded')) {
+              rateLimited = true;
+              logger.warn('Balance sync: rate limited — aborting this cycle, next window retries.');
+              break;
+            }
+            logger.error(`Balance sync failed for ${wallet.address} ${asset}: ${msg}`);
           }
+          // Pace calls so wallets don't burst the RPC in one batch
+          await sleep(400);
         }
+        if (rateLimited) break;
+        await sleep(500);
       }
     } catch (err) {
       logger.error('Balance sync run failed:', err);
@@ -75,10 +86,9 @@ class BalanceSyncService {
    *   available     → user's spendable balance (what they could withdraw)
    *   locked        → giveaway escrow held for the creator
    *   unsweptFees   → USDT fees owed to platform, still sitting in the wallet
-   *   redeemCredits → USDT credited to the user's app balance via redeem codes,
-   *                   NOT yet funded on-chain (code redemptions are app-side)
-   *   gasRefunds    → USDT refunded to the creator for unused seeded BNB
-   *                   (giveaway.reclaimGas) — app credit, no on-chain movement
+   *   redeemCredits → USDT credited via redeem codes, NOT funded on-chain
+   *   gasRefunds    → USDT refunded for unused seeded BNB (reclaimGas) —
+   *                   app credit, no on-chain movement
    *
    * Anything beyond tolerance = a movement the deposit monitor missed → self-heal.
    */
@@ -147,10 +157,9 @@ class BalanceSyncService {
    * Applies the drift correction: nudge `availableBalance` by `diff` and
    * record an audit trail row.
    *
-   * Idempotency: two adjustments for the same user+asset inside the same
-   * 2-minute window share a bucket key. If a collision occurs (rare — drift
-   * is normally one-shot per missed event), the insert fails on the unique
-   * constraint; we log and rethrow so the next tick retries cleanly.
+   * Idempotency: adjustments for the same user+asset inside the same 5-minute
+   * window share a bucket key. On unique-constraint collision (rare), we log
+   * and rethrow so the next tick retries cleanly.
    */
   private async applyAdjustment(ctx: SyncContext, expected: number, diff: number): Promise<void> {
     const bucket = String(Math.floor(Date.now() / SYNC_KEY_WINDOW_MS));
@@ -198,4 +207,9 @@ class BalanceSyncService {
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export const balanceSync = new BalanceSyncService();
+  
