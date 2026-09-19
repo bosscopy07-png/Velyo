@@ -16,6 +16,11 @@ const envSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
 
   BSC_PRIMARY_RPC: z.string().min(1),
+  // QuickNode endpoint used by the 30-second-offset small scan (5 blocks).
+  BSC_QUICKNODE_RPC: z
+    .string()
+    .url()
+    .default('https://dry-fabled-firefly.bsc.quiknode.pro/b3fe69e21c3a3151f6b8e67bf661830acde8256a'),
   BSC_PUBLIC_RPCS: z.string().transform((s) => s.split(',').map((url) => url.trim())),
   BSC_CHAIN_ID: z.string().default('56').transform(Number),
 
@@ -78,3 +83,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
+  
