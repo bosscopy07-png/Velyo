@@ -19,12 +19,15 @@ const MIN_DEPOSIT: Record<string, number> = {
   USDT: config.MINIMUM_AMOUNT_USD,
 };
 
+/** Pacing between wallet scans — spreads RPC calls across the minute */
+const WALLET_SCAN_DELAY_MS = 1500;
+
 class DepositMonitorService {
   private isRunning = false;
 
   start(): void {
     cron.schedule('0 * * * * *', () => void this.scanDeposits());
-    logger.info('Deposit monitor started (immediate fee forwarding mode)');
+    logger.info('Deposit monitor started (immediate fee forwarding, rate-limit aware)');
   }
 
   private async scanDeposits(): Promise<void> {
@@ -49,6 +52,8 @@ class DepositMonitorService {
       const lastScanned = cached ? parseInt(cached) : currentBlock - 20;
       const fromBlock = Math.max(lastScanned + 1, currentBlock - MAX_LOG_WINDOW);
 
+      let rateLimited = false;
+
       for (const wallet of wallets) {
         try {
           if (fromBlock <= currentBlock) {
@@ -58,6 +63,12 @@ class DepositMonitorService {
             }
           }
         } catch (err) {
+          const msg = (err as Error).message ?? '';
+          if (msg.includes('rate limit') || msg.includes('-32005') || msg.includes('limit exceeded')) {
+            rateLimited = true;
+            logger.warn('Deposit scan: rate limited — cursor NOT advanced, retrying this window next cycle.');
+            break; // stop scanning; window is re-attempted next minute
+          }
           logger.error(`Error scanning USDT for ${wallet.address}:`, err);
         }
 
@@ -66,9 +77,17 @@ class DepositMonitorService {
         } catch (err) {
           logger.error(`Error checking BNB balance for ${wallet.address}:`, err);
         }
+
+        // Spread scans across the minute instead of bursting them in one batch
+        await sleep(WALLET_SCAN_DELAY_MS);
       }
 
-      await redis.set(cursorKey, currentBlock.toString());
+      // Advance the cursor ONLY on a clean full pass — a rate-limited cycle
+      // leaves it in place so missed blocks are re-scanned (the 500-block cap
+      // bounds the catch-up window).
+      if (!rateLimited) {
+        await redis.set(cursorKey, currentBlock.toString());
+      }
     } catch (err) {
       logger.error('Deposit scan error:', err);
     } finally {
@@ -80,7 +99,7 @@ class DepositMonitorService {
     wallet: {
       address: string;
       userId: string;
-      encryptedPrivateKey: string; // carried through for processDeposit's fee-forward
+      encryptedPrivateKey: string;
       user: { chatId: string | null; telegramId: string };
     },
     currentBlock: number
@@ -194,7 +213,6 @@ class DepositMonitorService {
     // ── Immediate on-chain fee forwarding ──
     if (platformFee > 0 && asset === 'USDT') {
       try {
-        // Seed just enough BNB for the forward (deficit only)
         const baseline = await blockchain.getBalance(wallet.address, 'BNB');
         if (baseline < FORWARD_GAS_SEED) {
           if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
@@ -266,6 +284,10 @@ class DepositMonitorService {
       logger.error('Deposit notify failed:', err);
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 export const depositMonitor = new DepositMonitorService();
