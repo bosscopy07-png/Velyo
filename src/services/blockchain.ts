@@ -270,7 +270,27 @@ class BlockchainService {
 
     return (await contract.balanceOf(address)) as bigint;
   }
+async getTokenDecimals(asset: AssetSymbol): Promise<number> {
+  if (asset === 'BNB') {
+    return 18;
+  }
 
+  const provider = await this.resolveProvider();
+  const assetConfig = ASSETS[asset];
+
+  if (!assetConfig.contractAddress) {
+    throw new Error(`No contract for ${asset}`);
+  }
+
+  const contract = new ethers.Contract(
+    assetConfig.contractAddress,
+    ERC20_ABI,
+    provider
+  );
+
+  return Number(await contract.decimals());
+}
+  
   /**
    * Serialized send via the dedicated TX RPC (Chainstack). Waits for the
    * previous tx from this wallet to mine before broadcasting.
