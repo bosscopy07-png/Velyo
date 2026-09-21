@@ -11,17 +11,30 @@ const ERC20_ABI = [
   'event Transfer(address indexed from, address indexed to, uint256 amount)',
 ];
 
-/** Hard cap on any single RPC call — hung nodes must fail, not freeze */
+/** Hard cap on any single RPC call — hung public nodes must fail, not freeze */
 const RPC_TIMEOUT_MS = 15000;
 
 /**
- * Block-range adaptive chunking: 500 → 250 → … → 1 on range rejections.
- * QuickNode's "limited to a 5 range" therefore settles on a working size.
+ * Block-range adaptive chunking.
+ *
+ * Starts large and halves on every block-range rejection, e.g.:
+ *
+ *   500 → 250 → 125 → 62 → 31 → 15 → 7 → 3 → 1
+ *
+ * Range-limited providers therefore settle on a working size and keep
+ * scanning the remaining blocks with it.
  */
 const INITIAL_LOG_CHUNK = 500;
 const MIN_LOG_CHUNK = 1;
 const MAX_LOG_RETRIES = 6;
 
+/**
+ * Addresses per eth_getLogs topic OR-array when the provider supports
+ * server-side address filtering. If the provider rejects the topic
+ * payload (413 Request Entity Too Large), the scanner automatically
+ * falls back to range-only queries and matches wallet addresses in
+ * memory instead.
+ */
 const ADDRESS_BATCH_SIZE = 50;
 
 export interface TransferEvent {
@@ -45,30 +58,43 @@ class BlockchainService {
   private quicknodeProvider: ethers.JsonRpcProvider;
   /** getblock.io — SMALL safety scan only */
   private smallScanProvider: ethers.JsonRpcProvider;
-  /** Chainstack — ALL transaction sends (payouts, seeds, forwards) */
+  /** Chainstack — ALL transaction sends and tx confirmation waits */
   private txProvider: ethers.JsonRpcProvider;
   private fallbackProviders: ethers.JsonRpcProvider[];
   private currentProvider: ethers.JsonRpcProvider;
   private providerIndex = 0;
 
   /**
-   * Per-address send queue. Txs from one wallet serialize, each waiting
-   * for the previous to MINE — prevents gapped nonces and the
-   * balance-validation race on paired sends.
+   * Per-address send queue. ALL outgoing transactions from one wallet are
+   * serialized through this queue, and each waits for the previous one to
+   * MINE before broadcasting — that prevents both "gapped nonce" rejections
+   * and balance-validation failures on paired sends (gas seed → fee forward).
    */
   private sendQueues = new Map<string, Promise<{ hash: string; nonce: number }>>();
 
   private readonly transferInterface = new ethers.Interface(ERC20_ABI);
 
-  /** Per-provider learned topic-batch size (0 = range-only mode). */
+  /**
+   * Per-provider learned topic-batch size.
+   *
+   * Providers that reject address topic OR-arrays (413) are remembered
+   * as "range-only" for the lifetime of the process so we never waste
+   * failed requests re-learning it on every scan cycle.
+   */
   private learnedTopicSize = new Map<string, number>();
 
-  /** ethers v6 hides the RPC URL on providers — track it for learning keys. */
+  /**
+   * ethers v6 does not expose the RPC URL on JsonRpcProvider, so we
+   * track it ourselves — needed to remember per-provider scanning
+   * behaviour (topic-filter vs range-only) across scan cycles.
+   */
   private providerUrls = new Map<ethers.JsonRpcProvider, string>();
 
   constructor() {
     const network = new ethers.Network('bnb', config.BSC_CHAIN_ID);
 
+    // Every provider gets a hard timeout. Public nodes under rate-limit
+    // pressure HANG instead of erroring — without this, awaits block forever.
     const makeProvider = (url: string): ethers.JsonRpcProvider => {
       const request = new ethers.FetchRequest(url);
       request.timeout = RPC_TIMEOUT_MS;
@@ -98,14 +124,16 @@ class BlockchainService {
     setInterval(async () => {
       try {
         await this.primaryProvider.getBlockNumber();
+
         const failed = await isPrimaryRPCFailed();
+
         if (failed) {
           logger.info('Primary RPC recovered, switching back');
           this.currentProvider = this.primaryProvider;
           await redis.del('rpc:primary:failed');
         }
       } catch {
-        // Primary still down
+        // Primary still down — health check intentionally silent.
       }
     }, 30000);
   }
@@ -114,14 +142,26 @@ class BlockchainService {
     return this.resolveProvider();
   }
 
-  /** getblock.io — used ONLY by the SMALL 5-block safety scan. */
+  /**
+   * getblock.io — used ONLY by the pinned 5-block small scan (@:30s).
+   * Isolated RPC so the safety net never competes with the BIG scan
+   * or the transaction RPC for quota.
+   */
   async getSmallScanProvider(): Promise<ethers.JsonRpcProvider> {
     await this.smallScanProvider.getBlockNumber();
     return this.smallScanProvider;
   }
 
+  /** Legacy QuickNode accessor — retained for compatibility. */
+  async getQuickNodeProvider(): Promise<ethers.JsonRpcProvider> {
+    await this.quicknodeProvider.getBlockNumber();
+    return this.quicknodeProvider;
+  }
+
   /**
-   * Chainstack — ALL sends and tx confirmations. Isolated from read pools.
+   * Chainstack — used for ALL transaction sends, gas estimation and tx
+   * confirmation waits. Isolated from the read pools so heavy scanning
+   * never delays a payout and scan credit burn never touches sends.
    * Falls back to the read pool only if Chainstack itself is unreachable.
    */
   private async getTxProvider(): Promise<ethers.JsonRpcProvider> {
@@ -129,7 +169,7 @@ class BlockchainService {
       await this.txProvider.getBlockNumber();
       return this.txProvider;
     } catch {
-      logger.warn('TX RPC (Chainstack) unreachable — falling back to read pool for this send');
+      logger.warn('TX RPC (Chainstack) unreachable — falling back to read pool for this operation');
       return this.resolveProvider();
     }
   }
@@ -140,7 +180,9 @@ class BlockchainService {
     if (!primaryFailed) {
       try {
         await this.primaryProvider.getBlockNumber();
+
         this.currentProvider = this.primaryProvider;
+
         return this.primaryProvider;
       } catch {
         logger.warn('Primary RPC failed, switching to fallback');
@@ -150,10 +192,13 @@ class BlockchainService {
 
     for (let i = 0; i < this.fallbackProviders.length; i++) {
       const idx = (this.providerIndex + i) % this.fallbackProviders.length;
+
       try {
         await this.fallbackProviders[idx].getBlockNumber();
+
         this.providerIndex = idx;
         this.currentProvider = this.fallbackProviders[idx];
+
         return this.fallbackProviders[idx];
       } catch {
         continue;
@@ -163,23 +208,38 @@ class BlockchainService {
     throw new Error('All RPC providers unavailable');
   }
 
+  /**
+   * Switch to another configured provider (primary + public fallbacks;
+   * the pinned scan/tx providers are deliberately excluded).
+   */
   private async switchToAnotherProvider(): Promise<boolean> {
-    const providers = [this.primaryProvider, ...this.fallbackProviders];
+    const providers = [
+      this.primaryProvider,
+      ...this.fallbackProviders,
+    ];
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
+
       if (provider === this.currentProvider) continue;
 
       try {
         await provider.getBlockNumber();
+
         this.currentProvider = provider;
+
         if (provider === this.primaryProvider) {
           this.providerIndex = 0;
         } else {
           const fallbackIndex = this.fallbackProviders.indexOf(provider);
-          if (fallbackIndex >= 0) this.providerIndex = fallbackIndex;
+
+          if (fallbackIndex >= 0) {
+            this.providerIndex = fallbackIndex;
+          }
         }
+
         logger.warn('Switched RPC provider for log scanning');
+
         return true;
       } catch {
         continue;
@@ -197,15 +257,23 @@ class BlockchainService {
     }
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, provider);
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      provider
+    );
+
     return (await contract.balanceOf(address)) as bigint;
   }
 
   /**
-   * Serialized send via the dedicated TX RPC. Waits for the previous tx
-   * from this wallet to mine, then broadcasts.
+   * Serialized send via the dedicated TX RPC (Chainstack). Waits for the
+   * previous tx from this wallet to mine before broadcasting.
    */
   async sendTransaction(
     encryptedPrivateKey: string,
@@ -215,6 +283,7 @@ class BlockchainService {
     _idempotencyKey: string
   ): Promise<{ hash: string; nonce: number }> {
     const { decrypt } = await import('../utils/encryption');
+
     const privateKey = decrypt(encryptedPrivateKey);
     const wallet = new ethers.Wallet(privateKey);
 
@@ -225,33 +294,43 @@ class BlockchainService {
     const run = (async () => {
       try {
         const prev = await previous;
+
+        // CRITICAL: wait for the previous tx to actually mine. Nodes validate
+        // balance/nonce against confirmed state — broadcasting a follow-up
+        // (fee forward) before the seed lands causes INSUFFICIENT_FUNDS.
         if (prev.hash) await this.waitMined(prev.hash, 60000);
       } catch {
         // previous send failed — proceed anyway
       }
+
       return this.doSend(wallet, to, amount, asset);
     })();
 
     this.sendQueues.set(wallet.address, run);
+
     return run;
   }
 
-  /** Poll until a tx has at least 1 confirmation. TX RPC. Proceeds on timeout. */
+  /** Poll until a tx has at least 1 confirmation. Uses the TX RPC. Proceeds on timeout. */
   async waitMined(hash: string, timeoutMs: number): Promise<void> {
     const start = Date.now();
+
     while (Date.now() - start < timeoutMs) {
       try {
         const receipt = await this.getTxReceipt(hash);
-        if (receipt) return;
+
+        if (receipt) return; // mined (status 0 or 1 — either way it's settled)
       } catch {
-        // hiccup — keep polling
+        // provider hiccup — keep polling
       }
+
       await sleep(2000);
     }
+
     logger.warn(`waitMined: ${hash} not confirmed after ${timeoutMs}ms — proceeding anyway.`);
   }
 
-  /** Receipt from the TX RPC — what our own sends care about. */
+  /** Receipt from the TX RPC (Chainstack) — what our own sends care about. */
   private async getTxReceipt(hash: string): Promise<ethers.TransactionReceipt | null> {
     const provider = await this.getTxProvider();
     return provider.getTransactionReceipt(hash);
@@ -265,13 +344,19 @@ class BlockchainService {
   ): Promise<{ hash: string; nonce: number }> {
     const provider = await this.getTxProvider();
     const signer = wallet.connect(provider);
+
     const nonce = await this.getNextNonce(wallet.address, provider);
 
     try {
       const tx = await this.broadcast(signer, to, amount, asset, nonce);
-      return { hash: tx.hash, nonce: tx.nonce };
+
+      return {
+        hash: tx.hash,
+        nonce: tx.nonce,
+      };
     } catch (err) {
       const msg = ((err as Error).message ?? '').toLowerCase();
+
       const isNonceError =
         msg.includes('gapped') ||
         msg.includes('nonce') ||
@@ -280,11 +365,19 @@ class BlockchainService {
 
       if (isNonceError) {
         logger.warn(`Nonce rejection from ${wallet.address} — refetching and retrying once.`);
+
         await sleep(4000);
+
         const fresh = await this.getNextNonce(wallet.address, provider);
+
         const tx = await this.broadcast(signer, to, amount, asset, fresh);
-        return { hash: tx.hash, nonce: tx.nonce };
+
+        return {
+          hash: tx.hash,
+          nonce: tx.nonce,
+        };
       }
+
       throw err;
     }
   }
@@ -301,19 +394,36 @@ class BlockchainService {
     }
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
 
-    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, signer);
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      signer
+    );
+
     return (await contract.transfer(to, amount, { nonce })) as ethers.TransactionResponse;
   }
 
-  private async getNextNonce(address: string, provider: ethers.JsonRpcProvider): Promise<number> {
+  /**
+   * Live pending nonce — no in-memory cache. Combined with the send queue
+   * this is race-free: our previous tx is visible in the mempool before the
+   * next one asks for a nonce.
+   */
+  private async getNextNonce(
+    address: string,
+    provider: ethers.JsonRpcProvider
+  ): Promise<number> {
     return provider.getTransactionCount(address, 'pending');
   }
 
   /** Read-pool receipt — used by the deposit monitor for event verification. */
   async getTransactionReceipt(hash: string): Promise<ethers.TransactionReceipt | null> {
     const provider = await this.resolveProvider();
+
     return provider.getTransactionReceipt(hash);
   }
 
@@ -323,13 +433,17 @@ class BlockchainService {
     timeoutMs = 300000
   ): Promise<ethers.TransactionReceipt> {
     const startTime = Date.now();
+
     while (Date.now() - startTime < timeoutMs) {
       const receipt = await this.getTxReceipt(hash);
+
       if (receipt && (await receipt.confirmations()) >= requiredConfirmations) {
         return receipt;
       }
+
       await sleep(5000);
     }
+
     throw new Error('Transaction confirmation timeout');
   }
 
@@ -339,23 +453,46 @@ class BlockchainService {
 
   async getGasPrice(): Promise<bigint> {
     const provider = await this.getTxProvider();
+
     const feeData = await provider.getFeeData();
+
     return feeData.gasPrice ?? 5000000000n;
   }
 
-  async estimateGas(asset: AssetSymbol, from: string, to: string, amount: bigint): Promise<bigint> {
+  async estimateGas(
+    asset: AssetSymbol,
+    from: string,
+    to: string,
+    amount: bigint
+  ): Promise<bigint> {
     const provider = await this.getTxProvider();
+
     if (asset === 'BNB') {
       return provider.estimateGas({ from, to, value: amount });
     }
+
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
-    const contract = new ethers.Contract(assetConfig.contractAddress, ERC20_ABI, provider);
+
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
+
+    const contract = new ethers.Contract(
+      assetConfig.contractAddress,
+      ERC20_ABI,
+      provider
+    );
+
     return (await contract.transfer.estimateGas(to, amount, { from })) as bigint;
   }
 
-  generateWallet(): { address: string; privateKey: string; mnemonic: string } {
+  generateWallet(): {
+    address: string;
+    privateKey: string;
+    mnemonic: string;
+  } {
     const wallet = ethers.Wallet.createRandom();
+
     return {
       address: wallet.address,
       privateKey: wallet.privateKey,
@@ -363,24 +500,60 @@ class BlockchainService {
     };
   }
 
-  /** Original single-wallet API retained for compatibility. */
+  /**
+   * Original single-wallet API retained for compatibility.
+   */
   async getTokenTransferEvents(
     asset: AssetSymbol,
     toAddress: string,
     fromBlock: number,
     toBlock: number
   ): Promise<TransferEvent[]> {
-    const grouped = await this.getTokenTransferEventsForAddresses(asset, [toAddress], fromBlock, toBlock);
+    const grouped = await this.getTokenTransferEventsForAddresses(
+      asset,
+      [toAddress],
+      fromBlock,
+      toBlock
+    );
+
     return grouped.get(toAddress.toLowerCase()) ?? [];
-      }
+  }
       /**
-   * Block-range-first USDT scanner.
+   * =========================================================================
+   * BLOCK-RANGE-FIRST USDT SCANNER
+   * =========================================================================
    *
-   * COST FIX: when the provider is in range-only mode (learned topic
-   * size 0), address BATCHING is meaningless — one range-only query
-   * returns ALL transfers and wallets are matched in memory. One pass
-   * with all addresses then costs 1 query per block chunk instead of
-   * (batches × chunks). This is what stops the credit burn.
+   * Scanning dimension is the BLOCK RANGE, never the wallet count:
+   *
+   *   BSC blocks → USDT Transfer logs → extract `to` → match against the
+   *   in-memory Set of VEYLO wallet addresses → return only matches,
+   *   grouped by lowercase recipient.
+   *
+   * Two query shapes, chosen adaptively per provider:
+   *
+   *  1. TOPIC-FILTERED (preferred where supported):
+   *     topics[2] = OR-array of up to ADDRESS_BATCH_SIZE wallet
+   *     addresses, so the provider filters server-side. 250 wallets =
+   *     5 address batches, NOT 250 requests.
+   *
+   *  2. RANGE-ONLY (fallback when the provider rejects the topic
+   *     payload — some providers return "413 Request Entity Too Large"
+   *     for wide OR-arrays):
+   *     no address topics at all; one query per block chunk returns
+   *     ALL USDT transfers in the range, matched against the wallet
+   *     Set in memory. Wallet count then has ZERO effect on the
+   *     request count: 250 wallets still cost 1 query per chunk.
+   *
+   * COST FIX: when the learned topic size for this provider is 0
+   * (range-only mode), address BATCHING is meaningless — one range-only
+   * pass covers every address at once (1 query per block chunk instead
+   * of batches × chunks). This is what stops the credit burn on
+   * range-limited providers.
+   *
+   * Both shapes share the same adaptive block-chunk logic, so a
+   * "limited to a 5 range" provider is satisfied by shrinking chunks
+   * (500 → 250 → … → 5), never by per-wallet scans.
+   * =========================================================================
    */
   async getTokenTransferEventsForAddresses(
     asset: AssetSymbol,
@@ -396,7 +569,10 @@ class BlockchainService {
     if (fromBlock > toBlock) return result;
 
     const assetConfig = ASSETS[asset];
-    if (!assetConfig.contractAddress) throw new Error(`No contract for ${asset}`);
+
+    if (!assetConfig.contractAddress) {
+      throw new Error(`No contract for ${asset}`);
+    }
 
     const normalizedAddresses = [
       ...new Set(
@@ -409,15 +585,6 @@ class BlockchainService {
     const providerForLearn = pinnedProvider ?? this.currentProvider;
     const learned = this.getLearnedTopicSize(providerForLearn);
 
-    const collect = (events: TransferEvent[]): void => {
-      for (const event of events) {
-        const recipient = event.to.toLowerCase();
-        const existing = result.get(recipient) ?? [];
-        existing.push(event);
-        result.set(recipient, existing);
-      }
-    };
-
     // RANGE-ONLY FAST PATH: batches irrelevant — one pass, in-memory match.
     if (learned <= 0) {
       const events = await this.queryTransferEventsAdaptive(
@@ -427,13 +594,25 @@ class BlockchainService {
         toBlock,
         pinnedProvider
       );
-      collect(events);
+
+      for (const event of events) {
+        const recipient = event.to.toLowerCase();
+        const existing = result.get(recipient) ?? [];
+        existing.push(event);
+        result.set(recipient, existing);
+      }
+
       return result;
     }
 
     // TOPIC-FILTERED PATH: batch addresses for server-side filtering.
-    for (let start = 0; start < normalizedAddresses.length; start += ADDRESS_BATCH_SIZE) {
+    for (
+      let start = 0;
+      start < normalizedAddresses.length;
+      start += ADDRESS_BATCH_SIZE
+    ) {
       const batch = normalizedAddresses.slice(start, start + ADDRESS_BATCH_SIZE);
+
       const events = await this.queryTransferEventsAdaptive(
         assetConfig.contractAddress,
         batch,
@@ -441,7 +620,14 @@ class BlockchainService {
         toBlock,
         pinnedProvider
       );
-      collect(events);
+
+      for (const event of events) {
+        const recipient = event.to.toLowerCase();
+
+        const existing = result.get(recipient) ?? [];
+        existing.push(event);
+        result.set(recipient, existing);
+      }
     }
 
     return result;
@@ -449,12 +635,21 @@ class BlockchainService {
 
   /**
    * Scan one address batch across the block range with TWO adaptive knobs:
-   *   chunkSize — blocks per request; halves on range rejection.
-   *   topicSize — addresses per topic OR-array; halves on 413; 0 = range-only.
    *
-   * Error order is ALWAYS: (B) provider failure → throw; (A2) 413 → shrink
-   * topic; (A1) range rejection → shrink chunk. A rate limit is NEVER a
-   * range error.
+   *   chunkSize  — blocks per request; halves on range rejection,
+   *                doubles back after successes.
+   *   topicSize  — addresses per topic OR-array; halves on 413,
+   *                0 = range-only mode (in-memory matching).
+   *
+   * Error classes are ALWAYS distinguished in this order:
+   *
+   *   B. provider failure / rate limit  → throw (backoff handled by caller)
+   *   A2. topic payload too large (413) → shrink topicSize, same range
+   *   A1. block-range / result limit    → shrink chunkSize
+   *   C. anything else                  → throw
+   *
+   * A rate limit is NEVER treated as a range error and never shrinks
+   * the block chunk.
    */
   private async queryTransferEventsAdaptive(
     contractAddress: string,
@@ -464,51 +659,97 @@ class BlockchainService {
     pinnedProvider?: ethers.JsonRpcProvider
   ): Promise<TransferEvent[]> {
     const addressSet = new Set(addresses);
+
     const allEvents: TransferEvent[] = [];
 
     let cursor = fromBlock;
     let chunkSize = INITIAL_LOG_CHUNK;
+
     let providerRef: ethers.JsonRpcProvider = pinnedProvider ?? this.currentProvider;
     let topicSize = this.getLearnedTopicSize(providerRef);
 
     while (cursor <= toBlock) {
       const end = Math.min(cursor + chunkSize - 1, toBlock);
-      const units: Array<string[] | null> = topicSize <= 0 ? [null] : chunkArray(addresses, topicSize);
+
+      /**
+       * Query units for this block window. topicSize === 0 means one
+       * range-only query; otherwise the batch is split into
+       * topicSize-sized OR-arrays so EVERY address is still covered.
+       */
+      const units: Array<string[] | null> =
+        topicSize <= 0 ? [null] : chunkArray(addresses, topicSize);
 
       try {
         for (const unit of units) {
-          const events = await this.queryTransferChunk(contractAddress, unit, addressSet, cursor, end, pinnedProvider);
-          for (const event of events) allEvents.push(event);
+          const events = await this.queryTransferChunk(
+            contractAddress,
+            unit,
+            addressSet,
+            cursor,
+            end,
+            pinnedProvider
+          );
+
+          for (const event of events) {
+            allEvents.push(event);
+          }
         }
 
         this.learnedTopicSize.set(this.providerKey(providerRef), topicSize);
+
         cursor = end + 1;
-        if (chunkSize < INITIAL_LOG_CHUNK) chunkSize = Math.min(INITIAL_LOG_CHUNK, chunkSize * 2);
+
+        /**
+         * Grow the block window back after successes so capable
+         * providers are not penalised by small-chunk providers' sizes.
+         */
+        if (chunkSize < INITIAL_LOG_CHUNK) {
+          chunkSize = Math.min(INITIAL_LOG_CHUNK, chunkSize * 2);
+        }
       } catch (err) {
         const msg = this.getErrorMessage(err);
 
-        if (this.isProviderFailure(msg)) throw err;
+        // (B) rate-limit / provider failure — never a range problem.
+        if (this.isProviderFailure(msg)) {
+          throw err;
+        }
 
+        // (A2) topic OR-array too large — shrink it, retry same range.
         if (this.isTopicTooLargeError(msg) && topicSize > 0) {
           topicSize = topicSize <= 4 ? 0 : Math.floor(topicSize / 2);
+
           this.learnedTopicSize.set(this.providerKey(providerRef), topicSize);
+
           logger.warn(
             topicSize === 0
-              ? `[RPC] topic filter rejected (413) → range-only mode for this provider`
+              ? `[RPC] topic filter rejected (413) → using range-only scan for this provider (wallets matched in memory, 1 query per block chunk)`
               : `[RPC] topic filter too large → retrying with ${topicSize} addresses per filter`
           );
+
           continue;
         }
 
+        // (A1) block-range / result-size rejection — shrink the chunk.
         if (this.isLogRangeError(msg)) {
           if (chunkSize > MIN_LOG_CHUNK) {
             const prevChunk = chunkSize;
+
             chunkSize = Math.max(MIN_LOG_CHUNK, Math.floor(chunkSize / 2));
-            logger.warn(`[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying with ${chunkSize}`);
+
+            logger.warn(
+              `[RPC] eth_getLogs range rejected: ${prevChunk} blocks → retrying with ${chunkSize}`
+            );
+
             continue;
           }
+
+          /**
+           * Even a 1-block range was rejected. Only un-pinned scans
+           * may switch provider; a pinned scan rethrows.
+           */
           if (!pinnedProvider) {
             const switched = await this.switchToAnotherProvider();
+
             if (switched) {
               providerRef = this.currentProvider;
               topicSize = this.getLearnedTopicSize(providerRef);
@@ -526,8 +767,11 @@ class BlockchainService {
 
   /**
    * One eth_getLogs request for one (topic unit, block chunk) pair.
-   * Retries with backoff ONLY for provider failures; (A1)/(A2) throw
-   * immediately for the adaptive loop.
+   *
+   * Retries with exponential backoff ONLY for provider failures
+   * (class B). Range errors (A1) and topic-payload errors (A2) are
+   * thrown immediately — the adaptive outer loop adjusts the right
+   * knob; retrying them unchanged here would just waste quota.
    */
   private async queryTransferChunk(
     contractAddress: string,
@@ -542,6 +786,7 @@ class BlockchainService {
     for (let attempt = 0; attempt < MAX_LOG_RETRIES; attempt++) {
       try {
         const provider = pinnedProvider ?? (await this.resolveProvider());
+
         const transferTopic = ethers.id('Transfer(address,address,uint256)');
 
         const logs = await provider.getLogs({
@@ -549,19 +794,34 @@ class BlockchainService {
           topics: [
             transferTopic,
             null,
-            topicBatch ? topicBatch.map((address) => ethers.zeroPadValue(address, 32)) : null,
+            topicBatch
+              ? topicBatch.map((address) => ethers.zeroPadValue(address, 32))
+              : null,
           ],
           fromBlock,
           toBlock,
         });
 
         const events: TransferEvent[] = [];
+
         for (const log of logs) {
           try {
-            const parsed = this.transferInterface.parseLog({ topics: log.topics, data: log.data });
+            const parsed = this.transferInterface.parseLog({
+              topics: log.topics,
+              data: log.data,
+            });
+
             if (!parsed) continue;
+
             const to = String(parsed.args[1]).toLowerCase();
+
+            /**
+             * In-memory wallet match. With a topic filter this is a
+             * cheap safety verification; in range-only mode this IS
+             * the filter.
+             */
             if (!addressSet.has(to)) continue;
+
             events.push({
               from: String(parsed.args[0]),
               to,
@@ -573,20 +833,36 @@ class BlockchainService {
             continue;
           }
         }
+
         return events;
       } catch (err) {
         lastError = err;
+
         const msg = this.getErrorMessage(err);
 
+        // (B) provider failure / rate limit → backoff and retry.
         if (this.isProviderFailure(msg)) {
           const backoffMs = Math.min(500 * (attempt + 1) * (attempt + 1), 5000);
-          logger.warn(`[RPC] provider failure → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`);
+
+          if (this.isRateLimitError(msg)) {
+            logger.warn(
+              `[RPC] rate limited → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
+            );
+          } else {
+            logger.warn(
+              `[RPC] provider failure → backing off ${backoffMs}ms (attempt ${attempt + 1}/${MAX_LOG_RETRIES})`
+            );
+          }
+
           await sleep(backoffMs);
+
           continue;
         }
 
+        // (A2) / (A1) — thrown for the adaptive loop to handle.
         if (this.isTopicTooLargeError(msg)) throw err;
         if (this.isLogRangeError(msg)) throw err;
+
         throw err;
       }
     }
@@ -594,12 +870,25 @@ class BlockchainService {
     throw lastError ?? new Error('eth_getLogs failed');
   }
 
+  // ------------------------------------------------------------------
+  // Error classification
+  // ------------------------------------------------------------------
+
   private getErrorMessage(err: unknown): string {
-    if (err instanceof Error) return err.message.toLowerCase();
+    if (err instanceof Error) {
+      return err.message.toLowerCase();
+    }
+
     return String(err ?? '').toLowerCase();
   }
 
-  /** (B) TRUE provider failures — checked FIRST, everywhere. */
+  /**
+   * (B) TRUE provider failures: timeouts, HTTP 5xx, and rate limits
+   * (429, "rate limit", -32007 "request limit").
+   *
+   * Checked FIRST, everywhere, because rate-limit text contains the
+   * word "limit" and must never be mistaken for a block-range rejection.
+   */
   private isProviderFailure(message: string): boolean {
     return (
       message.includes('timeout') ||
@@ -620,6 +909,10 @@ class BlockchainService {
     );
   }
 
+  /**
+   * (B+) Rate-limit flavour of provider failure (for logging; backoff
+   * is applied to all provider failures).
+   */
   private isRateLimitError(message: string): boolean {
     return (
       message.includes('429') ||
@@ -631,7 +924,10 @@ class BlockchainService {
     );
   }
 
-  /** (A2) Topic OR-array payload rejected (QuickNode Discover: 413). */
+  /**
+   * (A2) Topic OR-array payload rejected by the provider.
+   * "413 Request Entity Too Large".
+   */
   private isTopicTooLargeError(message: string): boolean {
     return (
       message.includes('413') ||
@@ -640,7 +936,11 @@ class BlockchainService {
     );
   }
 
-  /** (A1) TRUE block-range / result-size rejections — only after (B) and (A2). */
+  /**
+   * (A1) TRUE block-range / result-size rejections, e.g.
+   * "eth_getLogs is limited to a 5 range", -32005 "exceeds max
+   * results". Only ever consulted AFTER (B) and (A2).
+   */
   private isLogRangeError(message: string): boolean {
     return (
       message.includes('eth_getlogs') ||
@@ -654,6 +954,10 @@ class BlockchainService {
       message.includes('exceeds')
     );
   }
+
+  // ------------------------------------------------------------------
+  // Per-provider topic-size learning
+  // ------------------------------------------------------------------
 
   private providerKey(provider: ethers.JsonRpcProvider): string {
     return this.providerUrls.get(provider) ?? 'unknown-provider';
@@ -669,4 +973,3 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const blockchain = new BlockchainService();
-      
