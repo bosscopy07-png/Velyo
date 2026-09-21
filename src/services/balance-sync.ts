@@ -95,11 +95,23 @@ class BalanceSyncService {
   private async syncOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
     const ctx = await this.gatherState(userId, address, asset);
 
+    // NEVER heal a debtor: a negative available balance means the user owes
+    // the platform (phantom-era over-credit). Matching on-chain by crediting
+    // them would mint money from nothing. Their balance stays negative until
+    // real deposits cover it.
+    const tol = SYNC_TOLERANCE[asset] ?? 0.000001;
+    if (ctx.available < -tol) {
+      logger.warn(
+        `Balance sync (${asset}) ${address}: debtor (available ${ctx.available.toFixed(6)}) — skipped, no auto-credit`
+      );
+      return;
+    }
+
     const expected =
       ctx.available + ctx.locked + ctx.unsweptFees - ctx.redeemCredits - ctx.gasRefunds;
     const diff = ctx.onChain - expected;
 
-    if (Math.abs(diff) < (SYNC_TOLERANCE[asset] ?? 0.000001)) return;
+    if (Math.abs(diff) < tol) return;
 
     await this.applyAdjustment(ctx, expected, diff);
 
@@ -212,4 +224,3 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
-  
