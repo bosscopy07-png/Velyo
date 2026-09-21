@@ -15,7 +15,8 @@ import { formatAddress } from '../utils/validation';
 /** 0.000002 BNB = 2×10^12 wei (2,000,000,000,000) */
 const SWEEP_GAS_SEED = 2000000000000n;
 const SWEEP_SEED_BUFFER_WEI = 500000000000n; // 0.0000005 BNB buffer on top of deficit
-const SWEEP_THRESHOLD_USDT = 0.5;
+/** Standard sweep threshold — Max Sweep ignores this entirely */
+const SWEEP_THRESHOLD_USDT = 0.1;
 
 const USERS_PER_PAGE = 10;
 const FEES_PER_PAGE = 10;
@@ -115,6 +116,7 @@ export function registerAdminCommands(bot: any): void {
     await renderSweepDashboard(ctx);
   });
 
+  // Standard sweep — only users above the threshold
   bot.action('admin:sweep:run', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
 
@@ -126,7 +128,49 @@ export function registerAdminCommands(bot: any): void {
     await ctx.answerCbQuery('Sweep started — running in the background.');
 
     try {
-      await runSweep(ctx);
+      await runSweep(ctx, SWEEP_THRESHOLD_USDT);
+    } finally {
+      await redis.del(SWEEP_LOCK_KEY);
+    }
+  });
+
+  // MAX sweep — clears EVERY fee from EVERY user, threshold ignored.
+  // Each forward costs ~0.0000017 BNB gas, so a max sweep over many tiny
+  // balances costs more gas than it collects if fees are dust — confirm first.
+  bot.action('admin:sweep:max', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+
+    const fees = await getUnsweptFees();
+    const totalAll = fees.reduce((s, f) => s + f.total, 0);
+
+    await editMainMessage(
+      ctx,
+      `${e('warning')} <b>CONFIRM MAX SWEEP</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('people')} Users with fees: <b>${fees.length}</b>\n` +
+      `${e('money')} Total collectable: <b>$${totalAll.toFixed(4)} USDT</b>\n` +
+      `${e('fire')} Gas cost: ~${(fees.length * 0.0000017).toFixed(6)} BNB\n\n` +
+      `<i>This sweeps EVERY fee, including dust amounts below $${SWEEP_THRESHOLD_USDT}. Continue?</i>`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`⚠️ Yes, sweep everything (${fees.length})`, 'admin:sweep:max:confirm')],
+        [Markup.button.callback(`${eb('back')} Cancel`, 'admin:sweep')],
+      ])
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action('admin:sweep:max:confirm', async (ctx: Context) => {
+    if (!isAdmin(ctx)) return;
+
+    const lock = await redis.set(SWEEP_LOCK_KEY, '1', 'EX', SWEEP_LOCK_TTL_SEC, 'NX');
+    if (!lock) {
+      await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
+      return;
+    }
+    await ctx.answerCbQuery('MAX sweep started — clearing every fee.');
+
+    try {
+      await runSweep(ctx, 0); // 0 = no minimum, everyone
     } finally {
       await redis.del(SWEEP_LOCK_KEY);
     }
@@ -492,21 +536,22 @@ async function getUnsweptFees(): Promise<Array<{ userId: string; total: number }
   return [...byUser.entries()].map(([userId, total]) => ({ userId, total }));
 }
 
+
 async function renderSweepDashboard(ctx: Context): Promise<void> {
   const fees = await getUnsweptFees();
   const eligible = fees.filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
-  const pending = fees.length - eligible.length;
+  const below = fees.length - eligible.length;
   const totalPullable = eligible.reduce((s, f) => s + f.total, 0);
+  const totalAll = fees.reduce((s, f) => s + f.total, 0);
 
   let text = `${e('money')} <b>FEE SWEEP</b>\n${DIVIDER}\n\n`;
-  text += `${e('money')} <b>Ready to pull: $${totalPullable.toFixed(4)} USDT</b>\n`;
-  text += `${e('check')} ${eligible.length} user(s) passed $${SWEEP_THRESHOLD_USDT}\n`;
-  text += `${e('clock')} ${pending} user(s) yet to pass\n\n`;
+  text += `${e('money')} Ready to pull (≥ $${SWEEP_THRESHOLD_USDT}): <b>$${totalPullable.toFixed(4)} USDT</b>\n`;
+  text += `${e('check')} ${eligible.length} user(s) above threshold\n`;
+  text += `${e('clock')} ${below} user(s) below threshold ($${(totalAll - totalPullable).toFixed(4)} total)\n\n`;
 
   if (eligible.length > 0) {
     text += `<b>Ready to pull:</b>\n`;
 
-    // Single query instead of N+1 per-user lookups
     const users = await prisma.user.findMany({
       where: { id: { in: eligible.map((f) => f.userId) } },
       select: { id: true, username: true, telegramId: true },
@@ -520,19 +565,23 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
     if (eligible.length > 15) text += `…and ${eligible.length - 15} more\n`;
   }
 
-  const keyboard = eligible.length > 0
-    ? Markup.inlineKeyboard([
-        [Markup.button.callback(`💰 Pull Out All (${eligible.length})`, 'admin:sweep:run')],
-        [Markup.button.callback(`${eb('back')} Back`, 'admin')],
-      ])
-    : Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Back`, 'admin')]]);
+  // Both buttons when there's anything to pull; Max Sweep always shown if
+  // anyone has fees at all (even dust)
+  const rows: any[] = [];
+  if (eligible.length > 0) {
+    rows.push([Markup.button.callback(`💰 Pull Out All (${eligible.length})`, 'admin:sweep:run')]);
+  }
+  if (fees.length > 0) {
+    rows.push([Markup.button.callback(`🔥 Max Sweep — everyone (${fees.length})`, 'admin:sweep:max')]);
+  }
+  rows.push([Markup.button.callback(`${eb('back')} Back`, 'admin')]);
 
-  await editMainMessage(ctx, text, keyboard);
+  await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
 }
 
 /**
  * Sweeps one user's accumulated fee USDT.
- * Snapshot-based: reads BNN balance BEFORE seeding, seeds only the tiny
+ * Snapshot-based: reads BNB balance BEFORE seeding, seeds only the tiny
  * deficit, forwards the fee. The user's own BNB is never touched.
  */
 async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
@@ -541,19 +590,24 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
 
   const baseline = await blockchain.getBalance(wallet.address, 'BNB');
 
+  let seedHash: string | null = null;
   if (baseline < SWEEP_GAS_SEED) {
     if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
     const seedAmount = SWEEP_GAS_SEED - baseline + SWEEP_SEED_BUFFER_WEI; // deficit + buffer
-    await blockchain.sendTransaction(
+    const sent = await blockchain.sendTransaction(
       config.OPERATOR_WALLET_KEY,
       wallet.address,
       seedAmount,
       'BNB',
       `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
     );
-    // Admin's app balance reflects the seed BNB that left their wallet
+    seedHash = sent.hash;
     await walletService.adjustOperatorBalance('BNB', -Number(seedAmount) / 1e18);
   }
+
+  // Cross-wallet ordering: seed is from admin, forward is from the user —
+  // different send queues. Wait for the seed to mine before broadcasting.
+  if (seedHash) await blockchain.waitMined(seedHash, 60000);
 
   const rawFee = BigInt(Math.floor(amountUSDT * 1e18));
   const { hash } = await blockchain.sendTransaction(
@@ -569,16 +623,30 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<string> {
     data: { sweptAt: new Date() },
   });
 
-  // The fee arrived in the admin wallet on-chain — reflect it in the app balance
   await walletService.adjustOperatorBalance('USDT', amountUSDT);
 
   return hash;
 }
 
-async function runSweep(ctx: Context): Promise<void> {
-  const eligible = (await getUnsweptFees()).filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
+/**
+ * @param minAmount 0 = Max Sweep (every user, dust included); otherwise only
+ * users with at least this much accumulated.
+ */
+async function runSweep(ctx: Context, minAmount: number): Promise<void> {
+  const eligible = (await getUnsweptFees()).filter((f) => f.total >= minAmount);
   let done = 0;
   let failed = 0;
+
+  if (eligible.length === 0) {
+    await editMainMessage(
+      ctx,
+      `${e('check')} <b>NOTHING TO SWEEP</b>\n\nNo user has unswept fees right now.`,
+      Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
+    );
+    return;
+  }
+
+  const label = minAmount === 0 ? 'MAX SWEEP' : 'FEE SWEEP';
 
   for (const f of eligible) {
     try {
@@ -592,7 +660,7 @@ async function runSweep(ctx: Context): Promise<void> {
     try {
       await editMainMessage(
         ctx,
-        `${e('money')} <b>FEE SWEEP RUNNING…</b>\n` +
+        `${e('money')} <b>${label} RUNNING…</b>\n` +
         `${DIVIDER}\n\n` +
         `${e('people')} Processed: <b>${done + failed}/${eligible.length}</b>\n` +
         `${e('check')} Done: <b>${done}</b>\n` +
@@ -606,7 +674,7 @@ async function runSweep(ctx: Context): Promise<void> {
 
   await editMainMessage(
     ctx,
-    `${e('check')} <b>FEE SWEEP COMPLETE</b>\n` +
+    `${e('check')} <b>${label} COMPLETE</b>\n` +
     `${DIVIDER}\n\n` +
     `${e('money')} Pulled from: <b>${done}</b> wallet(s)\n` +
     `${e('cancel')} Failed: <b>${failed}</b>`,
@@ -680,4 +748,4 @@ async function getAdminStats() {
     activeGiveaways,
     pendingPayouts,
   };
-}
+      }
