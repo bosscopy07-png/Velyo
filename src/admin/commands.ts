@@ -14,9 +14,11 @@ import { formatAddress } from '../utils/validation';
 
 /** 0.000002 BNB = 2×10^12 wei (2,000,000,000,000) */
 const SWEEP_GAS_SEED = 2000000000000n;
-const SWEEP_SEED_BUFFER_WEI = 500000000000n;
+const SWEEP_SEED_BUFFER_WEI = 500000000000n; // 0.0000005 BNB buffer on top of deficit
 /** Standard sweep threshold — Max Sweep ignores this entirely */
 const SWEEP_THRESHOLD_USDT = 0.1;
+/** On-chain reserve left in the wallet + minimum worth sweeping */
+const SWEEP_RESERVE_USDT = 0.01;
 
 const USERS_PER_PAGE = 10;
 const FEES_PER_PAGE = 10;
@@ -48,6 +50,7 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback(`${eb('back')} Back`, 'main')],
 ]);
 
+/** Builds a Prev / page indicator / Next row. */
 function pager(prefix: string, page: number, totalPages: number, totalLabel: string) {
   const row: any[] = [];
   if (page > 0) row.push(Markup.button.callback('◀️ Prev', `${prefix}:${page - 1}`));
@@ -55,6 +58,8 @@ function pager(prefix: string, page: number, totalPages: number, totalLabel: str
   if (page < totalPages - 1) row.push(Markup.button.callback('Next ▶️', `${prefix}:${page + 1}`));
   return row;
 }
+
+// ─────────────────────────── REGISTRATION ───────────────────────────
 
 export function registerAdminCommands(bot: any): void {
   bot.command('admin', async (ctx: Context) => {
@@ -72,11 +77,12 @@ export function registerAdminCommands(bot: any): void {
     await renderDashboard(ctx);
   });
 
+  // Pager page-indicator buttons — just dismiss the loading spinner
   bot.action(/admin:(users|fees|giveaways):noop/, async (ctx: Context) => {
     await ctx.answerCbQuery();
   });
 
-  // ── USERS (paginated) ──
+  // ─────────────────────────── USERS (paginated) ───────────────────────────
 
   bot.action('admin:users', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
@@ -90,7 +96,7 @@ export function registerAdminCommands(bot: any): void {
     await renderUsersPage(ctx, parseInt((ctx as any).match[1], 10));
   });
 
-  // ── FEES (paginated) ──
+  // ─────────────────────────── FEES (paginated) ───────────────────────────
 
   bot.action('admin:fees', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
@@ -104,7 +110,7 @@ export function registerAdminCommands(bot: any): void {
     await renderFeesPage(ctx, parseInt((ctx as any).match[1], 10));
   });
 
-  // ── FEE SWEEP ──
+  // ─────────────────────────── FEE SWEEP ───────────────────────────
 
   bot.action('admin:sweep', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
@@ -112,14 +118,17 @@ export function registerAdminCommands(bot: any): void {
     await renderSweepDashboard(ctx);
   });
 
+  // Standard sweep — only users above the threshold
   bot.action('admin:sweep:run', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
+
     const lock = await redis.set(SWEEP_LOCK_KEY, '1', 'EX', SWEEP_LOCK_TTL_SEC, 'NX');
     if (!lock) {
       await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
       return;
     }
     await ctx.answerCbQuery('Sweep started — running in the background.');
+
     try {
       await runSweep(ctx, SWEEP_THRESHOLD_USDT);
     } finally {
@@ -127,8 +136,10 @@ export function registerAdminCommands(bot: any): void {
     }
   });
 
+  // MAX sweep — clears EVERY fee from EVERY user, threshold ignored.
   bot.action('admin:sweep:max', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
+
     const fees = await getUnsweptFees();
     const totalAll = fees.reduce((s, f) => s + f.total, 0);
 
@@ -139,7 +150,7 @@ export function registerAdminCommands(bot: any): void {
       `${e('people')} Users with fees: <b>${fees.length}</b>\n` +
       `${e('money')} Total collectable: <b>$${totalAll.toFixed(4)} USDT</b>\n` +
       `${e('fire')} Gas cost: ~${(fees.length * 0.0000017).toFixed(6)} BNB\n\n` +
-      `<i>Sweeps EVERY fee, including dust below $${SWEEP_THRESHOLD_USDT}. Amounts are capped at each wallet's real on-chain balance.</i>`,
+      `<i>This sweeps EVERY fee, including dust amounts below $${SWEEP_THRESHOLD_USDT}. Continue?</i>`,
       Markup.inlineKeyboard([
         [Markup.button.callback(`⚠️ Yes, sweep everything (${fees.length})`, 'admin:sweep:max:confirm')],
         [Markup.button.callback(`${eb('back')} Cancel`, 'admin:sweep')],
@@ -150,20 +161,22 @@ export function registerAdminCommands(bot: any): void {
 
   bot.action('admin:sweep:max:confirm', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
+
     const lock = await redis.set(SWEEP_LOCK_KEY, '1', 'EX', SWEEP_LOCK_TTL_SEC, 'NX');
     if (!lock) {
       await ctx.answerCbQuery('A sweep is already running.', { show_alert: true });
       return;
     }
     await ctx.answerCbQuery('MAX sweep started — clearing every fee.');
+
     try {
-      await runSweep(ctx, 0);
+      await runSweep(ctx, 0); // 0 = no minimum, everyone
     } finally {
       await redis.del(SWEEP_LOCK_KEY);
     }
   });
 
-  // ── KEY RECOVERY ──
+  // ─────────────────────────── KEY RECOVERY ───────────────────────────
 
   bot.action('admin:findkey', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
@@ -171,7 +184,8 @@ export function registerAdminCommands(bot: any): void {
     await setUserSession(ctx.from!.id.toString(), { state: 'admin_find_key' });
     await editMainMessage(
       ctx,
-      `${e('lock')} <b>RECOVER USER KEY</b>\n${DIVIDER}\n\n` +
+      `${e('lock')} <b>RECOVER USER KEY</b>\n` +
+      `${DIVIDER}\n\n` +
       `${e('person')} Send the user's <b>Telegram ID</b> (digits) or <b>@username</b>.\n\n` +
       `<i>${e('warning')} Every reveal is audit-logged.</i>`,
       backKeyboard('admin')
@@ -181,20 +195,25 @@ export function registerAdminCommands(bot: any): void {
   bot.action(/admin:revealkey:(.+):(pk|mn)/, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
+
     const walletId = (ctx as any).match[1];
     const kind = (ctx as any).match[2];
+
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId }, include: { user: true } });
     if (!wallet) {
       await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
       return;
     }
+
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
     await editMainMessage(
       ctx,
-      `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n${DIVIDER}\n\n` +
+      `${e('warning')} <b>CONFIRM KEY REVEAL</b>\n` +
+      `${DIVIDER}\n\n` +
       `${e('person')} User: <code>${wallet.user.telegramId}</code> (@${wallet.user.username || 'N/A'})\n` +
       `${e('wallet')} Wallet: <code>${formatAddress(wallet.address)}</code>\n\n` +
-      `You are about to display the <b>${label}</b>.\n<i>This action will be written to the audit log.</i>`,
+      `You are about to display the <b>${label}</b>.\n` +
+      `<i>This action will be written to the audit log.</i>`,
       Markup.inlineKeyboard([
         [Markup.button.callback(`⚠️ Yes, show the ${label}`, `admin:revealconfirm:${walletId}:${kind}`)],
         [Markup.button.callback(`${eb('back')} Cancel`, 'admin')],
@@ -205,27 +224,33 @@ export function registerAdminCommands(bot: any): void {
   bot.action(/admin:revealconfirm:(.+):(pk|mn)/, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
+
     const walletId = (ctx as any).match[1];
     const kind = (ctx as any).match[2];
+
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId }, include: { user: true } });
     if (!wallet) {
       await editMainMessage(ctx, `${e('warning')} Wallet not found.`, backKeyboard('admin'));
       return;
     }
+
     const secret =
       kind === 'pk'
         ? decrypt(wallet.encryptedPrivateKey)
         : wallet.encryptedMnemonic
           ? decrypt(wallet.encryptedMnemonic)
           : null;
+
     if (!secret) {
       await editMainMessage(
         ctx,
-        `${e('warning')} <b>NOT AVAILABLE</b>\n\nNo ${kind === 'mn' ? 'mnemonic' : 'private key'} stored for this wallet.`,
+        `${e('warning')} <b>NOT AVAILABLE</b>\n\n` +
+        `No ${kind === 'mn' ? 'mnemonic' : 'private key'} stored for this wallet.`,
         backKeyboard('admin')
       );
       return;
     }
+
     await prisma.auditLog.create({
       data: {
         adminId: ctx.from!.id.toString(),
@@ -236,10 +261,12 @@ export function registerAdminCommands(bot: any): void {
       },
     });
     logger.warn(`Admin ${ctx.from!.id} revealed ${kind} for wallet ${wallet.address}`);
+
     const label = kind === 'pk' ? 'PRIVATE KEY' : 'SECRET PHRASE';
     await editMainMessage(
       ctx,
-      `${e('lock')} <b>${label}</b>\n${DIVIDER}\n\n` +
+      `${e('lock')} <b>${label}</b>\n` +
+      `${DIVIDER}\n\n` +
       `${e('person')} @${wallet.user.username || wallet.user.telegramId}\n` +
       `${e('wallet')} <code>${wallet.address}</code>\n\n` +
       `<code>${secret}</code>\n\n` +
@@ -248,7 +275,7 @@ export function registerAdminCommands(bot: any): void {
     );
   });
 
-  // ── GIVEAWAYS (paginated) ──
+  // ─────────────────────────── GIVEAWAYS (paginated) ───────────────────────────
 
   bot.action('admin:giveaways', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
@@ -262,15 +289,17 @@ export function registerAdminCommands(bot: any): void {
     await renderGiveawaysPage(ctx, parseInt((ctx as any).match[1], 10));
   });
 
-  // ── REDEEM CODES ──
+  // ─────────────────────────── REDEEM CODES ───────────────────────────
 
   bot.action('admin:code:create', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('diamond')} <b>CREATE REDEEM CODE</b>\n${DIVIDER}\n\n` +
-      `${e('edit')} Send in this format:\n<code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
+      `${e('diamond')} <b>CREATE REDEEM CODE</b>\n` +
+      `${DIVIDER}\n\n` +
+      `${e('edit')} Send in this format:\n` +
+      `<code>CODE|ASSET|AMOUNT|MAX_REDEMPTIONS|EXPIRY_DAYS</code>\n\n` +
       `${e('star')} Example: <code>VEYLO2026|USDT|10|100|7</code>`,
       backKeyboard('admin')
     );
@@ -279,9 +308,14 @@ export function registerAdminCommands(bot: any): void {
   bot.action('admin:codes', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
-    const codes = await prisma.redeemCode.findMany({ take: 15, orderBy: { createdAt: 'desc' } });
+    const codes = await prisma.redeemCode.findMany({
+      take: 15,
+      orderBy: { createdAt: 'desc' },
+    });
     let text = `${e('diamond')} <b>REDEEM CODES</b>\n${DIVIDER}\n\n`;
-    if (codes.length === 0) text += 'No codes created yet.';
+    if (codes.length === 0) {
+      text += 'No codes created yet.';
+    }
     for (const c of codes) {
       const used = `${c.redemptionCount}/${c.maxRedemptions}`;
       const expired = c.expiresAt && c.expiresAt < new Date();
@@ -292,14 +326,16 @@ export function registerAdminCommands(bot: any): void {
     await editMainMessage(ctx, text, backKeyboard('admin'));
   });
 
-  // ── EMERGENCY ──
+  // ─────────────────────────── EMERGENCY ───────────────────────────
 
   bot.action('admin:emergency', async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n${DIVIDER}\n\n<i>Use these carefully. All actions are logged.</i>`,
+      `${e('warning')} <b>EMERGENCY CONTROLS</b>\n` +
+      `${DIVIDER}\n\n` +
+      `<i>Use these carefully. All actions are logged.</i>`,
       Markup.inlineKeyboard([
         [Markup.button.callback('⛔ Pause Deposits', 'admin:pause:deposits')],
         [Markup.button.callback('⛔ Pause Giveaways', 'admin:pause:giveaways')],
@@ -332,8 +368,10 @@ export function registerAdminCommands(bot: any): void {
   bot.hears(/^[A-Z0-9]+\|(BNB|USDT)\|[\d.]+(\|\d+)?(\|\d+)?$/i, async (ctx: Context) => {
     if (!isAdmin(ctx)) return;
     try { await ctx.deleteMessage(); } catch { /* ignore */ }
+
     const text = (ctx.message as any).text as string;
     const [code, asset, amountStr, maxRedemptions = '1', expiryDays = '30'] = text.split('|');
+
     await prisma.redeemCode.create({
       data: {
         code: code.toUpperCase(),
@@ -344,10 +382,13 @@ export function registerAdminCommands(bot: any): void {
         createdBy: ctx.from!.id.toString(),
       },
     });
+
     logger.info(`Redeem code ${code} created by admin ${ctx.from!.id}`);
+
     await editMainMessage(
       ctx,
-      `${e('check')} <b>CODE CREATED</b>\n${DIVIDER}\n\n` +
+      `${e('check')} <b>CODE CREATED</b>\n` +
+      `${DIVIDER}\n\n` +
       `${e('diamond')} <code>${code.toUpperCase()}</code>\n` +
       `${e('gift')} ${amountStr} ${asset.toUpperCase()}\n` +
       `${e('people')} ${maxRedemptions} redemptions\n` +
@@ -358,8 +399,8 @@ export function registerAdminCommands(bot: any): void {
       ])
     );
   });
-                                                  }
-                         // ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
+          }
+      // ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
 
 async function renderUsersPage(ctx: Context, page: number): Promise<void> {
   const totalUsers = await prisma.user.count();
@@ -373,7 +414,9 @@ async function renderUsersPage(ctx: Context, page: number): Promise<void> {
   });
 
   let text = `${e('people')} <b>USERS</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
-  if (users.length === 0) text += 'No users on this page.';
+  if (users.length === 0) {
+    text += 'No users on this page.';
+  }
   for (const u of users) {
     const bal = u.balances.reduce((sum, b) => sum + Number(b.availableBalance), 0);
     const active = u.lastActive && Date.now() - new Date(u.lastActive).getTime() < 86400000;
@@ -410,7 +453,9 @@ async function renderFeesPage(ctx: Context, page: number): Promise<void> {
   });
 
   let text = `${e('chart')} <b>PLATFORM FEES</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
-  if (fees.length === 0) text += 'No fees on this page.';
+  if (fees.length === 0) {
+    text += 'No fees on this page.';
+  }
   for (const f of fees) {
     const status = f.sweptAt
       ? `${e('check')} swept ${f.sweptAt.toLocaleDateString()}`
@@ -504,11 +549,13 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
 
   if (eligible.length > 0) {
     text += `<b>Ready to pull:</b>\n`;
+
     const users = await prisma.user.findMany({
       where: { id: { in: eligible.map((f) => f.userId) } },
       select: { id: true, username: true, telegramId: true },
     });
     const userMap = new Map(users.map((u) => [u.id, u]));
+
     for (const f of eligible.slice(0, 15)) {
       const u = userMap.get(f.userId);
       text += `• @${u?.username || u?.telegramId || 'unknown'} — ${f.total.toFixed(4)} USDT\n`;
@@ -530,21 +577,23 @@ async function renderSweepDashboard(ctx: Context): Promise<void> {
 
 /**
  * Sweeps one user's accumulated fee USDT — capped at what the wallet
- * ACTUALLY holds on-chain. Phantom-era fee records can exceed the real
- * balance (old refund bugs); the shortfall is forgiven, never chased,
- * and debtors are skipped until they deposit.
+ * ACTUALLY holds on-chain. Phantom-era fee rows can exceed the real
+ * balance (old double-refunds, forgiven claim-backs); the shortfall is
+ * forgiven, never chased. Returns the outcome for the run counters.
  */
 async function sweepOne(userId: string, amountUSDT: number): Promise<'swept' | 'short' | 'empty'> {
   const wallet = await prisma.wallet.findUnique({ where: { userId } });
   if (!wallet) throw new Error('no wallet');
 
+  // On-chain truth gate: never attempt more than the wallet holds.
   const rawBalance = await blockchain.getBalance(wallet.address, 'USDT');
   const onChain = Number(rawBalance) / 1e18;
-  const RESERVE = 0.01; // dust / gas-fluctuation margin
-  const sweepable = Math.min(amountUSDT, Math.max(0, onChain - RESERVE));
+  const sweepable = Math.min(amountUSDT, Math.max(0, onChain - SWEEP_RESERVE_USDT));
 
-  if (sweepable < 0.01) {
-    logger.warn(`Sweep skip user ${userId}: on-chain ${onChain.toFixed(4)} < fee ${amountUSDT.toFixed(4)} (phantom gap — forgiven)`);
+  if (sweepable < SWEEP_RESERVE_USDT) {
+    logger.warn(
+      `Sweep skip user ${userId}: on-chain ${onChain.toFixed(4)} USDT < fee ${amountUSDT.toFixed(4)} (phantom gap — forgiven, rows left pending)`
+    );
     return 'empty';
   }
 
@@ -554,17 +603,25 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<'swept' | '
     if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
     const seedAmount = SWEEP_GAS_SEED - baseline + SWEEP_SEED_BUFFER_WEI;
     const sent = await blockchain.sendTransaction(
-      config.OPERATOR_WALLET_KEY, wallet.address, seedAmount, 'BNB',
+      config.OPERATOR_WALLET_KEY,
+      wallet.address,
+      seedAmount,
+      'BNB',
       `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
     );
     seedHash = sent.hash;
     await walletService.adjustOperatorBalance('BNB', -Number(seedAmount) / 1e18);
   }
+
+  // Cross-wallet ordering: seed (admin) → forward (user), different queues.
   if (seedHash) await blockchain.waitMined(seedHash, 60000);
 
   const rawFee = BigInt(Math.floor(sweepable * 1e18));
   const { hash } = await blockchain.sendTransaction(
-    wallet.encryptedPrivateKey, config.PLATFORM_FEE_WALLET, rawFee, 'USDT',
+    wallet.encryptedPrivateKey,
+    config.PLATFORM_FEE_WALLET,
+    rawFee,
+    'USDT',
     `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
   );
 
@@ -581,10 +638,14 @@ async function sweepOne(userId: string, amountUSDT: number): Promise<'swept' | '
   return 'swept';
 }
 
+/**
+ * @param minAmount 0 = Max Sweep (every user, dust included); otherwise
+ * only users with at least this much accumulated.
+ */
 async function runSweep(ctx: Context, minAmount: number): Promise<void> {
   const eligible = (await getUnsweptFees()).filter((f) => f.total >= minAmount);
-  let done = 0;
-  let short = 0;
+  let full = 0;
+  let partial = 0;
   let skipped = 0;
   let failed = 0;
 
@@ -602,8 +663,8 @@ async function runSweep(ctx: Context, minAmount: number): Promise<void> {
   for (const f of eligible) {
     try {
       const result = await sweepOne(f.userId, f.total);
-      if (result === 'swept') done++;
-      else if (result === 'short') short++;
+      if (result === 'swept') full++;
+      else if (result === 'short') partial++;
       else skipped++;
     } catch (err) {
       failed++;
@@ -613,25 +674,27 @@ async function runSweep(ctx: Context, minAmount: number): Promise<void> {
     try {
       await editMainMessage(
         ctx,
-        `${e('money')} <b>${label} RUNNING…</b>\n${DIVIDER}\n\n` +
-        `${e('people')} Processed: <b>${done + short + skipped + failed}/${eligible.length}</b>\n` +
-        `${e('check')} Full: <b>${done}</b>\n` +
-        `⚠️ Partial: <b>${short}</b>\n` +
-        `⏭ Skipped: <b>${skipped}</b>\n` +
+        `${e('money')} <b>${label} RUNNING…</b>\n` +
+        `${DIVIDER}\n\n` +
+        `${e('people')} Processed: <b>${full + partial + skipped + failed}/${eligible.length}</b>\n` +
+        `${e('check')} Full: <b>${full}</b>\n` +
+        `${e('warning')} Partial: <b>${partial}</b>\n` +
+        `${e('clock')} Skipped (on-chain short): <b>${skipped}</b>\n` +
         `${e('cancel')} Failed: <b>${failed}</b>`,
         Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
       );
-    } catch { /* message too old to edit */ }
+    } catch { /* message may be too old to edit — ignore */ }
 
     await new Promise((r) => setTimeout(r, SWEEP_STAGGER_MS));
   }
 
   await editMainMessage(
     ctx,
-    `${e('check')} <b>${label} COMPLETE</b>\n${DIVIDER}\n\n` +
-    `${e('check')} Full pulls: <b>${done}</b>\n` +
-    `⚠️ Partial (on-chain capped): <b>${short}</b>\n` +
-    `⏭ Skipped (debtor/dust): <b>${skipped}</b>\n` +
+    `${e('check')} <b>${label} COMPLETE</b>\n` +
+    `${DIVIDER}\n\n` +
+    `${e('check')} Fully swept: <b>${full}</b>\n` +
+    `${e('warning')} Partially swept (on-chain cap): <b>${partial}</b>\n` +
+    `${e('clock')} Skipped (insufficient on-chain): <b>${skipped}</b>\n` +
     `${e('cancel')} Failed: <b>${failed}</b>`,
     Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
   );
