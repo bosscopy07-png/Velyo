@@ -32,6 +32,14 @@ interface PayoutJobData {
   idempotencyKey: string;
 }
 
+type ClaimWithGiveaway = {
+  id: string;
+  giveawayId: string;
+  status: string;
+  payoutTransactionHash: string | null;
+  giveaway: { creatorId: string; asset: string };
+};
+
 const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   const { claimId, userId, address, amount, asset, idempotencyKey } = job.data;
 
@@ -84,7 +92,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   ]);
 
   if (onChainAsset < amountBigInt) {
-    await unwindFailedPayout(claimId, claim.giveaway.creatorId, asset, amount, 'CREATOR_WALLET_UNDERFUNDED');
+    await unwindFailedPayout(claim, amount, 'CREATOR_WALLET_UNDERFUNDED');
     throw new UnrecoverableError(
       `Creator wallet ${creatorWallet.address} holds ${onChainAsset} ${asset}, needs ${amountBigInt}. ` +
       `Claim unwound; manual review required.`
@@ -132,7 +140,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
     if (isPermanentRevert(err)) {
       // Guaranteed to revert again — unwind and stop forever
-      await unwindFailedPayout(claimId, claim.giveaway.creatorId, asset, amount, msg);
+      await unwindFailedPayout(claim, amount, msg);
       throw new UnrecoverableError(`Permanent payout failure for claim ${claimId}: ${msg}`);
     }
 
@@ -151,47 +159,78 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
 /**
  * A payout that can never succeed: return the locked slice to the creator's
- * available balance and mark the claim terminal. Idempotent — guarded by the
- * FAILED transition so a double-call never double-refunds.
+ * available balance AND release the claim's slot on the giveaway atomically.
+ *
+ * Releasing the slot is what prevents the double-refund: once released, a
+ * later cancelGiveaway no longer counts this share as escrowed, so it is
+ * never refunded a second time. FULL giveaways reopen (status → ACTIVE).
+ *
+ * Race safety vs cancel: the whole thing runs in one transaction. If the
+ * giveaway was already CANCELLED, cancel already refunded every funded slot
+ * — so we skip our refund entirely (cancel owns it). The guarded FAILED
+ * transition makes the whole path idempotent.
  */
 async function unwindFailedPayout(
-  claimId: string,
-  creatorId: string,
-  asset: string,
+  claim: ClaimWithGiveaway,
   amount: number,
   reason: string
 ): Promise<void> {
+  const claimId = claim.id;
+  const creatorId = claim.giveaway.creatorId;
+  const asset = claim.giveaway.asset;
+
+  // Guarded terminal transition — a double-call never double-refunds.
   const res = await prisma.giveawayClaim.updateMany({
     where: { id: claimId, status: { notIn: ['PAID', 'FAILED'] } },
     data: { status: 'FAILED', failedReason: reason.slice(0, 500) },
   });
-  if (res.count === 0) return; // already terminal — don't double-refund
+  if (res.count === 0) return; // already terminal
 
   await prisma.$transaction(async (tx) => {
-    await tx.balance.update({
-      where: { userId_asset: { userId: creatorId, asset } },
-      data: {
-        lockedBalance: { decrement: amount },
-        availableBalance: { increment: amount },
-      },
+    // Re-check giveaway status inside the tx: if a cancel won the race,
+    // cancel already refunded this share — releasing the slot AND refunding
+    // here would double-pay the creator.
+    const giveaway = await tx.giveaway.findUnique({
+      where: { id: claim.giveawayId },
+      select: { status: true },
     });
 
-    await tx.transaction.create({
-      data: {
-        userId: creatorId,
-        type: 'REFUND',
-        asset,
-        amount,
-        fee: 0,
-        netAmount: amount,
-        status: 'CONFIRMED',
-        idempotencyKey: `payout-unwind-${claimId}`,
-        metadata: { kind: 'payout_unwind', claimId, reason },
-      },
-    });
+    if (giveaway && giveaway.status !== 'CANCELLED') {
+      // Release the slot so a later cancel won't refund this share again,
+      // and reopen the giveaway if it had gone FULL.
+      await tx.$queryRaw`
+        UPDATE giveaways
+        SET "claimedCount" = "claimedCount" - 1,
+            status = CASE WHEN status = 'FULL' THEN 'ACTIVE'::"GiveawayStatus" ELSE status END,
+            "updatedAt" = NOW()
+        WHERE id = ${claim.giveawayId} AND "claimedCount" > 0
+      `;
+
+      await tx.balance.update({
+        where: { userId_asset: { userId: creatorId, asset } },
+        data: {
+          lockedBalance: { decrement: amount },
+          availableBalance: { increment: amount },
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          userId: creatorId,
+          type: 'REFUND',
+          asset,
+          amount,
+          fee: 0,
+          netAmount: amount,
+          status: 'CONFIRMED',
+          idempotencyKey: `payout-unwind-${claimId}`,
+          metadata: { kind: 'payout_unwind', claimId, reason },
+        },
+      });
+    }
   });
 
-  logger.error(`Payout unwound for claim ${claimId}: ${amount} ${asset} returned to creator (${reason})`);
+  logger.error(`Payout unwound for claim ${claimId}: ${amount} ${asset} returned to creator, slot released (${reason})`);
 }
 
 /**
@@ -276,4 +315,4 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info('Payout worker started');
-             
+          
