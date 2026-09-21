@@ -47,6 +47,9 @@ export async function estimateCreationCost(totalAmount: number, maxClaimers: num
   return { platformFee, gasFee, fee, total: Number((totalAmount + fee).toFixed(6)), gasUnits };
 }
 
+/** Claim statuses that still hold an escrowed share (not yet PAID/FAILED/released) */
+const FUNDED_CLAIM_STATUSES = ['RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING'];
+
 class GiveawayService {
   async createGiveaway(data: {
     creatorId: string;
@@ -432,45 +435,60 @@ class GiveawayService {
 
     if (!giveaway) return { success: false, reason: 'Giveaway not found' };
     if (giveaway.creatorId !== userId) return { success: false, reason: 'Not authorized' };
-    if (giveaway.status === 'CANCELLED') return { success: false, reason: 'Already cancelled' };
     if (giveaway.claims.some((c) => c.status === 'PAID')) {
       return { success: false, reason: 'Cannot cancel: payouts already sent' };
     }
 
-    const unclaimedAmount = Number(giveaway.totalAmount) -
-      (giveaway.claims.filter((c) => c.status === 'PAID').length * Number(giveaway.amountPerUser));
+    // ATOMIC transition: exactly one caller can move out of ACTIVE/FULL.
+    // A double-tap, or an unwind racing a cancel, gets count 0 → no refund.
+    const transitioned = await prisma.giveaway.updateMany({
+      where: { id: giveawayId, status: { in: ['ACTIVE', 'FULL'] } },
+      data: { status: 'CANCELLED', cancelledAt: new Date() },
+    });
+    if (transitioned.count === 0) {
+      return { success: false, reason: 'Already cancelled' };
+    }
 
-    await prisma.$transaction(async (tx) => {
-      await tx.giveaway.update({
-        where: { id: giveawayId },
-        data: { status: 'CANCELLED', cancelledAt: new Date() },
-      });
+    // Re-read AFTER the transition: no new claims can start (status is now
+    // CANCELLED) and any unwind that already released a slot is reflected
+    // here. Count only slots that still hold escrow.
+    const fresh = await prisma.giveaway.findUnique({
+      where: { id: giveawayId },
+      include: { claims: true },
+    });
+    if (!fresh) return { success: false, reason: 'Giveaway not found' };
 
-      if (unclaimedAmount > 0) {
+    const fundedClaims = fresh.claims.filter((c) =>
+      (FUNDED_CLAIM_STATUSES as readonly string[]).includes(c.status)
+    );
+    const unclaimedAmount = Number(
+      (fundedClaims.length * Number(fresh.amountPerUser)).toFixed(6)
+    );
+
+    if (unclaimedAmount > 0) {
+      await prisma.$transaction(async (tx) => {
         await tx.balance.update({
-          where: { userId_asset: { userId: giveaway.creatorId, asset: giveaway.asset } },
+          where: { userId_asset: { userId: fresh.creatorId, asset: fresh.asset } },
           data: {
             availableBalance: { increment: unclaimedAmount },
             lockedBalance: { decrement: unclaimedAmount },
           },
         });
-      }
-    });
 
-    if (unclaimedAmount > 0) {
-      const { hashIdempotencyKey } = await import('../utils/encryption');
-      await prisma.transaction.create({
-        data: {
-          userId: giveaway.creatorId,
-          type: 'REFUND',
-          asset: giveaway.asset,
-          amount: unclaimedAmount,
-          fee: 0,
-          netAmount: unclaimedAmount,
-          status: 'CONFIRMED',
-          idempotencyKey: hashIdempotencyKey('refund', giveawayId),
-          metadata: { giveawayId },
-        },
+        const { hashIdempotencyKey } = await import('../utils/encryption');
+        await tx.transaction.create({
+          data: {
+            userId: fresh.creatorId,
+            type: 'REFUND',
+            asset: fresh.asset,
+            amount: unclaimedAmount,
+            fee: 0,
+            netAmount: unclaimedAmount,
+            status: 'CONFIRMED',
+            idempotencyKey: hashIdempotencyKey('refund', giveawayId),
+            metadata: { giveawayId },
+          },
+        });
       });
     }
 
@@ -478,7 +496,7 @@ class GiveawayService {
     return { success: true };
   }
 
-  async getGiveawayStats(giveawayId: string): Promise<{
+    async getGiveawayStats(giveawayId: string): Promise<{
     totalReward: number;
     totalSlots: number;
     linkOpens: number;
@@ -517,4 +535,3 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-        
