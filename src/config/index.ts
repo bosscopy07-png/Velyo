@@ -16,7 +16,7 @@ const envSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
 
   BSC_PRIMARY_RPC: z.string().min(1),
-  // QuickNode endpoint used by the 30-second-offset small scan (5 blocks).
+  // QuickNode endpoint (legacy small-scan provider, kept for failover).
   BSC_QUICKNODE_RPC: z
     .string()
     .url()
@@ -24,15 +24,21 @@ const envSchema = z.object({
   BSC_PUBLIC_RPCS: z.string().transform((s) => s.split(',').map((url) => url.trim())),
   BSC_CHAIN_ID: z.string().default('56').transform(Number),
 
+  // Dedicated RPC for ALL transaction sends (payouts, seeds, forwards) —
+  // isolated from the read/scan pools so scanning never delays or
+  // rate-limits broadcasting.
+  BSC_TX_RPC: z.string().min(1),
+  // Dedicated RPC for the SMALL safety scan only (30s after each BIG scan).
+  BSC_SMALL_SCAN_RPC: z.string().min(1),
+
   WALLET_ENCRYPTION_KEY: z.string().min(32),
   PLATFORM_FEE_WALLET: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
   // Encrypted private key of the operator/admin wallet (same wallet as
-  // PLATFORM_FEE_WALLET): supplies tiny BNB gas at giveaway creation and
-  // during fee sweeps, and receives fees.
+  // PLATFORM_FEE_WALLET): supplies tiny BNB gas and receives fees.
   OPERATOR_WALLET_KEY: z.string().optional(),
 
   PLATFORM_FEE_PERCENT: z.string().default('1.0').transform(Number),
-  MINIMUM_AMOUNT_USD: z.string().default('0.1').transform(Number),
+  MINIMUM_AMOUNT_USD: z.string().default('0.25').transform(Number),
   ENABLE_FEES: z.string().default('true').transform((s) => s === 'true'),
 
   // Deposit flat fee: standard tier, and the reduced tier for small deposits
@@ -42,8 +48,6 @@ const envSchema = z.object({
 
   PRICE_API_URL: z.string().default('https://api.coingecko.com/api/v3'),
   NGN_RATE_API_URL: z.string().default('https://api.exchangerate-api.com/v4/latest/USD'),
-  // CoinGecko demo API key — set via env var ONLY. Never hardcode keys here;
-  // this file is committed to git. Empty = anonymous rate limits (still works).
   COINGECKO_API_KEY: z.string().default(''),
 
   QUEUE_CONCURRENCY: z.string().default('5').transform(Number),
@@ -88,3 +92,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
+  
