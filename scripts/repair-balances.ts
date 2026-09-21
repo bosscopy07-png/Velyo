@@ -3,21 +3,22 @@ import { blockchain } from '../src/services/blockchain';
 import { config } from '../src/config';
 
 /**
- * One-time balance repair.
+ * EMERGENCY BALANCE REPAIR
  *
- * IMPORTANT:
- * This script makes the database balance match the LIVE
- * on-chain wallet balance exactly.
+ * Purpose:
+ *   Remove phantom DB credits by syncing availableBalance
+ *   to the wallet's CURRENT on-chain balance.
  *
- * No fee deduction.
- * No locked-balance deduction.
- * No redeem adjustment.
- * No clamping.
+ * Rules:
+ *   - availableBalance = live on-chain balance
+ *   - DO NOT subtract fees
+ *   - DO NOT add redeems/refunds
+ *   - DO NOT modify lockedBalance
+ *   - DO NOT modify pendingBalance
+ *   - Skip the platform fee wallet
  *
- * DB availableBalance = actual on-chain wallet balance
- *
- * Run from Render shell:
- * npx ts-node scripts/repair-balances.ts
+ * Run:
+ *   npx ts-node scripts/repair-balances.ts
  */
 
 async function main(): Promise<void> {
@@ -31,21 +32,37 @@ async function main(): Promise<void> {
   });
 
   console.log(`Found ${wallets.length} active wallets.`);
-  console.log('Starting live on-chain balance sync...\n');
+  console.log('Emergency balance repair starting...\n');
+
+  let repaired = 0;
+  let skipped = 0;
 
   for (const wallet of wallets) {
     for (const asset of ['BNB', 'USDT'] as const) {
       try {
-        // Get the CURRENT balance directly from the blockchain.
+        // Read LIVE blockchain balance
         const raw = await blockchain.getBalance(wallet.address, asset);
 
-        // Both BNB and USDT use 18 decimals on BSC in this service.
         const onChain = Number(raw) / 1e18;
 
         if (!Number.isFinite(onChain) || onChain < 0) {
           throw new Error(`Invalid on-chain balance: ${raw}`);
         }
 
+        const existing = await prisma.balance.findUnique({
+          where: {
+            userId_asset: {
+              userId: wallet.userId,
+              asset,
+            },
+          },
+        });
+
+        const oldAvailable = Number(existing?.availableBalance ?? 0);
+
+        // IMPORTANT:
+        // Only availableBalance is repaired.
+        // lockedBalance and pendingBalance are untouched.
         await prisma.balance.upsert({
           where: {
             userId_asset: {
@@ -53,7 +70,6 @@ async function main(): Promise<void> {
               asset,
             },
           },
-
           create: {
             userId: wallet.userId,
             asset,
@@ -61,19 +77,25 @@ async function main(): Promise<void> {
             lockedBalance: 0,
             pendingBalance: 0,
           },
-
           update: {
             availableBalance: onChain,
-            lockedBalance: 0,
           },
         });
 
+        const difference = onChain - oldAvailable;
+
         console.log(
           `${wallet.address} ${asset}: ` +
-          `LIVE=${onChain.toFixed(6)} → DB=${onChain.toFixed(6)}`
+          `DB=${oldAvailable.toFixed(6)} ` +
+          `CHAIN=${onChain.toFixed(6)} ` +
+          `DIFF=${difference >= 0 ? '+' : ''}${difference.toFixed(6)}`
         );
 
+        repaired++;
+
       } catch (err) {
+        skipped++;
+
         console.error(
           `SKIP ${wallet.address} ${asset}:`,
           err instanceof Error ? err.message : err
@@ -82,7 +104,11 @@ async function main(): Promise<void> {
     }
   }
 
-  console.log('\nBalance sync completed.');
+  console.log('\n================================');
+  console.log('Emergency repair completed');
+  console.log(`Repaired: ${repaired}`);
+  console.log(`Skipped:  ${skipped}`);
+  console.log('================================');
 }
 
 main()
