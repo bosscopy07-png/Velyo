@@ -40,11 +40,12 @@ import {
  *                 availableBalance + audit log. Deleting money that was
  *                 never real cannot hurt a user; it protects float.
  *
- *   Either way  → the discrepancy must persist across TWO consecutive
- *                 cycles (~10 min) before we touch anything, and any
- *                 in-flight deposit (monitor CONFIRMING/CONFIRMED rows)
- *                 or pending operator gas seed suppresses action — those
- *                 are the monitor's job, not ours.
+ *   Either way  → steady-state cron runs require the discrepancy to
+ *                 persist across TWO consecutive cycles (~10 min) before
+ *                 touching anything. The BOOT run (force=true) skips that
+ *                 gate — a diff that exists at startup is pre-existing
+ *                 and stable, not a tx in flight — but every in-flight
+ *                 guard (monitor rows, gas seeds) still applies.
  *
  * No Telegram notifications. Discrepancies that can't be attributed to a
  * real on-chain event are logged and left alone.
@@ -72,12 +73,19 @@ class BalanceSyncService {
   private isRunning = false;
 
   start(): void {
-    cron.schedule(CRON_SCHEDULE, () => void this.syncAll());
-    logger.info('Balance self-heal sync started (every 5 min, heal-through-monitor, no alerts)');
+    // Heal immediately on boot: a fresh deploy must not display wrong
+    // balances for 5 minutes waiting for the first cron tick. The boot run
+    // skips the two-cycle persistence gate (a discrepancy that already
+    // exists at boot is pre-existing and stable, not a tx in flight), but
+    // keeps every in-flight guard (monitor rows, gas seeds).
+    void this.syncAll(true);
+
+    cron.schedule(CRON_SCHEDULE, () => void this.syncAll(false));
+    logger.info('Balance self-heal sync started (immediate boot heal + every 5 min, no alerts)');
   }
 
-  private async syncAll(): Promise<void> {
-    if (this.isRunning) return; // prevent overlapping runs
+  private async syncAll(force = false): Promise<void> {
+    if (this.isRunning) return; // prevent overlapping runs (boot run vs cron tick)
     this.isRunning = true;
 
     try {
@@ -94,7 +102,7 @@ class BalanceSyncService {
       for (const wallet of wallets) {
         for (const asset of SYNC_ASSETS) {
           try {
-            await this.checkOne(wallet.userId, wallet.address, asset);
+            await this.checkOne(wallet.userId, wallet.address, asset, force);
           } catch (err) {
             const msg = (err as Error).message ?? '';
             if (msg.includes('rate limit') || msg.includes('-32005') || msg.includes('limit exceeded')) {
@@ -119,10 +127,10 @@ class BalanceSyncService {
 
   /**
    * One wallet × one asset. Compare on-chain to expected; heal in the
-   * appropriate direction only after the diff proves persistent and no
-   * in-flight explanation exists.
+   * appropriate direction only after the diff proves persistent (or the
+   * run is the boot run) and no in-flight explanation exists.
    */
-  private async checkOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
+  private async checkOne(userId: string, address: string, asset: SyncAsset, force = false): Promise<void> {
     const ctx = await gatherBalanceComponents(userId, address, asset);
 
     const tol = SYNC_TOLERANCE[asset];
@@ -133,7 +141,8 @@ class BalanceSyncService {
       return;
     }
 
-    // ── Transient explanations first: never heal what the monitor owns ──
+    // ── Transient guards ALWAYS apply — even on the boot run ──
+    // Never heal what the monitor owns.
     if (await this.hasInFlightDeposit(address, asset)) {
       logger.info(
         `Balance sync (${asset}) ${address}: diff ${fmt(diff)} — deposit in flight, monitor owns it. Skipping.`
@@ -148,8 +157,8 @@ class BalanceSyncService {
       return;
     }
 
-    // ── Persistence gate: a diff must survive two cycles before we touch it ──
-    if (!(await this.isPersistentDrift(userId, asset, diff, tol))) {
+    // ── Persistence gate: skipped on the boot run only ──
+    if (!force && !(await this.isPersistentDrift(userId, asset, diff, tol))) {
       logger.info(`Balance sync (${asset}) ${address}: diff ${fmt(diff)} first sight — watching one more cycle.`);
       return;
     }
@@ -308,8 +317,9 @@ class BalanceSyncService {
   }
 
   /**
-   * Two-cycle persistence gate. First sight of a diff: store it, do
-   * nothing. If the SAME sign reappears next cycle with a comparable
+   * Two-cycle persistence gate (steady-state only — the boot run passes
+   * force=true and never reaches this). First sight of a diff: store it,
+   * do nothing. If the SAME sign reappears next cycle with a comparable
    * magnitude, the diff is stable (not a tx in flight) → act. Any cycle
    * with no diff clears the stored state.
    */
@@ -362,4 +372,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
-                               
+    
