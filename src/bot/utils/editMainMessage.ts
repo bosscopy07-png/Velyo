@@ -26,6 +26,9 @@ function isNotModifiedError(err: unknown): boolean {
  * IMPORTANT: an edit WITHOUT reply_markup leaves old buttons in place.
  * When no keyboard is provided we pass an EMPTY keyboard so stale buttons
  * are always cleared.
+ *
+ * Log policy: failed caption/media attempts are debug-level noise; a single
+ * warn is emitted only when we genuinely fall back to delete+resend.
  */
 export async function editMainMessage(
   ctx: Context,
@@ -77,7 +80,10 @@ export async function editMainMessage(
     return;
   } catch (err) {
     if (isNotModifiedError(err)) return; // success no-op
-    logger.warn(`editMainMessage: caption edit failed for ${telegramId} (msg ${messageId}): ${(err as any)?.response?.description ?? (err as Error).message}`);
+    logger.debug(
+      `editMainMessage: caption edit failed for ${telegramId} (msg ${messageId}): ` +
+      `${(err as any)?.response?.description ?? (err as Error).message}`
+    );
   }
 
   // 2. Try media edit
@@ -92,7 +98,10 @@ export async function editMainMessage(
     return;
   } catch (err) {
     if (isNotModifiedError(err)) return; // success no-op
-    logger.warn(`editMainMessage: media edit failed for ${telegramId} (msg ${messageId}): ${(err as any)?.response?.description ?? (err as Error).message}`);
+    logger.debug(
+      `editMainMessage: media edit failed for ${telegramId} (msg ${messageId}): ` +
+      `${(err as any)?.response?.description ?? (err as Error).message}`
+    );
   }
 
   // 3. Editing genuinely impossible — delete old, send new, remember the new ID
@@ -116,5 +125,4 @@ export async function editMainMessage(
   } catch (err) {
     logger.error('editMainMessage: failed to send replacement message:', err);
   }
-      }
-      
+             }
