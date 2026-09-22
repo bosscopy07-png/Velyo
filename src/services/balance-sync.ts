@@ -1,105 +1,87 @@
 import { prisma } from '../database';
+import { config } from '../config';
 import { redis } from './redis';
 import { blockchain } from './blockchain';
 import { depositMonitor } from './deposit-monitor';
-import { pendingGasSeedKey } from './gas';
-import { config } from '../config';
 import { logger } from '../utils/logger';
 import cron from 'node-cron';
 import {
   SYNC_ASSETS,
   SYNC_TOLERANCE,
   gatherBalanceComponents,
+  solveAvailableForOnChain,
   type BalanceComponents,
   type SyncAsset,
 } from './balance-accounting';
 
 /**
  * ============================================================================
- * SELF-HEALING BALANCE SYNC (v3.1)
+ * WHAT THIS FILE DOES, AND WHY IT'S SAFE
  * ============================================================================
+ * Runs every 5 minutes, checks every active wallet against the chain, and
+ * self-heals two different kinds of drift automatically. No Telegram
+ * notifications — everything is silent, recorded to AuditLog only.
  *
- * v1 auto-credited the raw onChain-vs-expected gap as a txHash-less
- * "chain-sync" deposit → real deposits got credited twice (once here,
- * once by the monitor) = phantom money.
+ * A discrepancy only ever triggers action once it has persisted across TWO
+ * consecutive 5-minute checks (~8+ minutes). A wallet mid-giveaway-lock or
+ * mid-fee-forward looks momentarily "off" for a few seconds; requiring
+ * persistence means we never act on a wallet that's simply between two
+ * legitimate internal steps.
  *
- * v2 fixed that by going detect-and-alert only → discrepancies never
- * healed and admins got spammed.
+ * DIRECTION 1 — DB shows MORE than the chain (expected > onChain):
+ *   Auto-corrected DOWN to match the chain. This can never invent money —
+ *   it only ever removes balance that was never really backed on-chain —
+ *   so it's safe to automate. (Skipped, not forced, if the correction
+ *   would make availableBalance negative — that means something else is
+ *   wrong, e.g. corrupted lockedBalance, and needs a human look.)
  *
- * v3 (this file) heals automatically, but ONLY through evidence:
- *
- *   chain > DB  → find the actual Transfer event(s) explaining the gap
- *                 and feed them through depositMonitor.handleDepositCheck,
- *                 the SAME fee-aware, idempotent, confirmation-gated
- *                 pipeline normal deposits use. The fee question answers
- *                 itself: claimAndCredit deducts flat fee + 1% + gas.
- *                 Nothing is minted from a bare delta ever again.
- *
- *   DB > chain  → the DB holds a phantom credit (old bug residue, admin
- *                 error, etc). Auto-debit the excess from
- *                 availableBalance + audit log. Deleting money that was
- *                 never real cannot hurt a user; it protects float.
- *
- *   Either way  → steady-state cron runs require the discrepancy to
- *                 persist across TWO consecutive cycles (~10 min) before
- *                 touching anything. The BOOT run (force=true) skips that
- *                 gate — a diff that exists at startup is pre-existing
- *                 and stable, not a tx in flight — but every in-flight
- *                 guard (monitor rows, gas seeds) still applies.
- *
- * v3.1 adds component-level repair: the old double-refund bug left
- * `availableBalance` inflated and `lockedBalance` NEGATIVE by the same
- * amount. `expected` still matched chain (the two cancel out), so the
- * drift check was blind to it — but users saw phantom spendable money.
- * Negative locked is never legitimate; it's repaired in place (the shift
- * is purely between available and locked, so `expected` is unchanged).
- *
- * No Telegram notifications. Anything unexplained is logged and left alone.
+ * DIRECTION 2 — chain shows MORE than the DB (onChain > expected):
+ *   This is the dangerous direction to get wrong — it's exactly how the
+ *   old version of this file created real double-credits (see git history:
+ *   it used to just mint the raw gap). Instead of guessing at the amount,
+ *   this now goes and finds the ACTUAL on-chain deposit transaction
+ *   responsible (a targeted rescan of Transfer logs for that one address,
+ *   much further back than the normal scanner looks) and feeds it through
+ *   `depositMonitor.handleDepositCheck` — the exact same idempotent,
+ *   fee-aware, confirmation-gated path a normal deposit uses. If the
+ *   normal scanner already caught it (or catches it later), the shared
+ *   `DepositMonitor` dedup means this can never credit it twice. If
+ *   nothing new turns up on-chain, it's not a missed deposit — logged for
+ *   manual review instead of guessed at.
  * ============================================================================
  */
 
-// Every 5 minutes at second 30 — offset from the deposit monitor's scans.
 const CRON_SCHEDULE = '30 */5 * * * *';
 
-/**
- * A deposit can be legitimately "in flight" for a full detection cycle
- * plus its 15-confirmation wait. Anything newer than this is the monitor
- * doing its job, not a discrepancy.
- */
-const IN_FLIGHT_GRACE_MS = 25 * 60 * 1000;
+/** How long a discrepancy must persist, same direction, before acting. */
+const PERSISTENCE_MS = 8 * 60 * 1000;
 
-/** How far back to look for missed Transfer events when chain > DB. */
-const EVENT_LOOKBACK_BLOCKS = 1500;
+/** How far back to look for a missed USDT deposit — comfortably covers an extended scanner outage. */
+const DEEP_RESCAN_BLOCKS = 6000; // ~5 hours on BSC (~3s/block)
 
-/** Redis persistence gate: a diff must be seen twice (~10 min apart) before we act. */
-const driftKey = (userId: string, asset: string) => `sync:drift:${userId}:${asset}`;
-const DRIFT_TTL_SEC = 40 * 60;
+const IN_FLIGHT_GRACE_MS = 20 * 60 * 1000;
+
+interface PendingDrift {
+  direction: 'positive' | 'negative';
+  firstSeenAt: number;
+}
 
 class BalanceSyncService {
   private isRunning = false;
 
   start(): void {
-    // Heal immediately on boot: a fresh deploy must not display wrong
-    // balances for 5 minutes waiting for the first cron tick. The boot run
-    // skips the two-cycle persistence gate (a discrepancy that already
-    // exists at boot is pre-existing and stable, not a tx in flight), but
-    // keeps every in-flight guard (monitor rows, gas seeds).
-    void this.syncAll(true);
-
-    cron.schedule(CRON_SCHEDULE, () => void this.syncAll(false));
-    logger.info('Balance self-heal sync started (immediate boot heal + every 5 min, no alerts)');
+    cron.schedule(CRON_SCHEDULE, () => void this.syncAll());
+    logger.info('Balance drift monitor started (auto-heal, silent, every 5 min)');
   }
 
-  private async syncAll(force = false): Promise<void> {
-    if (this.isRunning) return; // prevent overlapping runs (boot run vs cron tick)
+  private async syncAll(): Promise<void> {
+    if (this.isRunning) return;
     this.isRunning = true;
 
     try {
       const wallets = await prisma.wallet.findMany({
         where: {
           status: 'ACTIVE',
-          // Operator wallet is synced explicitly via adjustOperatorBalance —
-          // its on-chain balance legitimately differs from any user ledger.
           address: { not: config.PLATFORM_FEE_WALLET },
         },
       });
@@ -108,7 +90,7 @@ class BalanceSyncService {
       for (const wallet of wallets) {
         for (const asset of SYNC_ASSETS) {
           try {
-            await this.checkOne(wallet.userId, wallet.address, asset, force);
+            await this.checkOne(wallet.userId, wallet.address, asset);
           } catch (err) {
             const msg = (err as Error).message ?? '';
             if (msg.includes('rate limit') || msg.includes('-32005') || msg.includes('limit exceeded')) {
@@ -118,7 +100,6 @@ class BalanceSyncService {
             }
             logger.error(`Balance sync failed for ${wallet.address} ${asset}: ${msg}`);
           }
-          // Pace calls so wallets don't burst the RPC in one batch
           await sleep(400);
         }
         if (rateLimited) break;
@@ -131,241 +112,70 @@ class BalanceSyncService {
     }
   }
 
-  /**
-   * One wallet × one asset. Component sanity first (negative locked is
-   * repaired regardless of totals), then compare on-chain to expected and
-   * heal in the appropriate direction only after the diff proves
-   * persistent (or the run is the boot run) and no in-flight explanation
-   * exists.
-   */
-  private async checkOne(userId: string, address: string, asset: SyncAsset, force = false): Promise<void> {
+  private pendingKey(address: string, asset: string): string {
+    return `sync:pending:${address.toLowerCase()}:${asset}`;
+  }
+
+  private async getPending(address: string, asset: string): Promise<PendingDrift | null> {
+    const raw = await redis.get(this.pendingKey(address, asset));
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as PendingDrift;
+    } catch {
+      return null;
+    }
+  }
+
+  private async setPending(address: string, asset: string, drift: PendingDrift): Promise<void> {
+    await redis.set(this.pendingKey(address, asset), JSON.stringify(drift), 'EX', 3600);
+  }
+
+  private async clearPending(address: string, asset: string): Promise<void> {
+    await redis.del(this.pendingKey(address, asset));
+  }
+
+  private async checkOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
     const ctx = await gatherBalanceComponents(userId, address, asset);
 
-    const tol = SYNC_TOLERANCE[asset];
-    const diff = ctx.onChain - ctx.expected; // positive: chain holds more
-
-    // ── Component sanity, independent of the chain comparison ──
-    // locked escrow can NEVER be negative. The old double-refund bug left
-    // availableBalance inflated and lockedBalance negative by the same
-    // amount — `expected` still matched chain, so the drift check alone
-    // can't see it, but the user sees phantom spendable money. Repairing
-    // the split in place leaves `expected` unchanged (the shift is purely
-    // between available and locked), so no drift is created.
-    if (ctx.locked < -tol) {
-      await this.healNegativeLocked(userId, asset, ctx);
-    }
+    const tol = SYNC_TOLERANCE[asset] ?? 0.000001;
+    const diff = ctx.onChain - ctx.expected;
 
     if (Math.abs(diff) < tol) {
-      await this.clearDrift(userId, asset);
+      await this.clearPending(address, asset);
       return;
     }
 
-    // ── Transient guards ALWAYS apply — even on the boot run ──
-    // Never heal what the monitor owns.
     if (await this.hasInFlightDeposit(address, asset)) {
-      logger.info(
-        `Balance sync (${asset}) ${address}: diff ${fmt(diff)} — deposit in flight, monitor owns it. Skipping.`
-      );
+      // Not a real discrepancy — the deposit monitor is mid-flight on this
+      // wallet right now. Don't let it start a persistence timer.
+      await this.clearPending(address, asset);
       return;
     }
 
-    if (asset === 'BNB' && (await this.pendingGasSeedBnb(address)) > 0) {
-      logger.info(
-        `Balance sync (BNB) ${address}: diff ${fmt(diff)} — operator gas seed in transit. Skipping.`
-      );
-      return;
+    const direction: PendingDrift['direction'] = diff > 0 ? 'positive' : 'negative';
+    const pending = await this.getPending(address, asset);
+
+    if (!pending || pending.direction !== direction) {
+      await this.setPending(address, asset, { direction, firstSeenAt: Date.now() });
+      return; // wait for the next cycle to confirm this isn't transient
     }
 
-    // ── Persistence gate: skipped on the boot run only ──
-    if (!force && !(await this.isPersistentDrift(userId, asset, diff, tol))) {
-      logger.info(`Balance sync (${asset}) ${address}: diff ${fmt(diff)} first sight — watching one more cycle.`);
-      return;
+    if (Date.now() - pending.firstSeenAt < PERSISTENCE_MS) {
+      return; // seen once already, not persistent enough yet
     }
 
-    if (diff > 0) {
-      await this.healMissingCredit(userId, address, asset, diff, ctx);
-    } else {
-      await this.healPhantomCredit(userId, asset, diff, ctx);
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // Negative lockedBalance repair. Never gated, never transient:
-  // escrow below zero is always bug residue (v3.1). Shifts the phantom
-  // out of `availableBalance` back into `lockedBalance` toward zero,
-  // capped at what's actually available so we never drive available
-  // negative. `expected` is unchanged by this shift.
-  // ------------------------------------------------------------------
-
-  private async healNegativeLocked(userId: string, asset: SyncAsset, ctx: BalanceComponents): Promise<void> {
-    const excess = Math.abs(ctx.locked);
-    const where = { userId_asset: { userId, asset } };
-
-    const applied = Math.min(excess, ctx.available);
-    const remainder = Number((excess - applied).toFixed(8));
-
-    await prisma.$transaction(async (tx) => {
-      if (applied > 0) {
-        await tx.balance.update({
-          where,
-          data: {
-            lockedBalance: { increment: applied },    // moves -X toward 0
-            availableBalance: { decrement: applied }, // removes the phantom display credit
-          },
-        });
+    // Persistent, confirmed discrepancy — act, then reset the timer either way.
+    try {
+      if (direction === 'negative') {
+        await this.healOverstated(ctx);
+      } else {
+        await this.investigateUnderstated(ctx);
       }
-
-      await tx.auditLog.create({
-        data: {
-          userId,
-          action: 'BALANCE_SYNC_LOCKED_REPAIR',
-          entityType: 'Balance',
-          entityId: `${userId}:${asset}`,
-          oldValue: { available: ctx.available, locked: ctx.locked },
-          newValue: {
-            availableAfter: Number((ctx.available - applied).toFixed(8)),
-            lockedAfter: Number((ctx.locked + applied).toFixed(8)),
-            unresolvedRemainder: remainder, // exceeded available — human review
-          },
-        },
-      });
-    });
-
-    logger.warn(
-      `[sync] Repaired negative locked ${asset} for user ${userId}: moved ${applied.toFixed(6)} from ` +
-      `available back to locked (was ${ctx.locked.toFixed(6)})` +
-      (remainder > 0 ? ` — REMAINDER ${remainder.toFixed(6)} exceeded available, needs review` : '')
-    );
+    } finally {
+      await this.clearPending(address, asset);
+    }
   }
 
-  // ------------------------------------------------------------------
-  // chain > DB: something arrived on-chain that the DB never credited.
-  // Find the REAL event and run it through the monitor's fee-aware
-  // crediting pipeline — this is where "check the reason, get the fee
-  // amount, match everything" actually happens.
-  // ------------------------------------------------------------------
-
-  private async healMissingCredit(
-    userId: string,
-    address: string,
-    asset: SyncAsset,
-    diff: number,
-    ctx: BalanceComponents
-  ): Promise<void> {
-    if (asset === 'BNB') {
-      // Native BNB has no Transfer log to attribute; the monitor's
-      // balance-delta sweep owns BNB crediting (with its gas-seed ledger).
-      // Reaching here means that sweep hasn't caught up — leave it alone.
-      logger.warn(
-        `[sync] Unexplained +${diff.toFixed(6)} BNB on ${address} (expected ${ctx.expected.toFixed(6)}) — ` +
-        `no discrete event to attribute; monitor's balance sweep owns BNB. Left alone.`
-      );
-      await this.clearDrift(userId, asset);
-      return;
-    }
-
-    const provider = await blockchain.getProvider();
-    const currentBlock = await provider.getBlockNumber();
-    const fromBlock = Math.max(1, currentBlock - EVENT_LOOKBACK_BLOCKS);
-
-    const eventsByAddress = await blockchain.getTokenTransferEventsForAddresses(
-      asset,
-      [address.toLowerCase()],
-      fromBlock,
-      currentBlock
-    );
-    const events = eventsByAddress.get(address.toLowerCase()) ?? [];
-
-    let fed = 0;
-    for (const ev of events) {
-      const known = await prisma.depositMonitor.findUnique({
-        where: { txHash_address: { txHash: ev.txHash, address } },
-      });
-
-      // PROCESSED/CONFIRMED: monitor already handled (or is handling) it.
-      // FAILED: proven invalid at some point — never revive.
-      // CONFIRMING: in flight — the monitor owns it.
-      if (known) continue;
-
-      // Unknown to the monitor — this is the missing credit. Feed it
-      // through the canonical pipeline: receipt check, confirmation
-      // gating, flat fee + 1% + gas deduction, idempotent credit.
-      await depositMonitor.handleDepositCheck(address, asset, ev.txHash, ev.amount, ev.from, ev.blockNumber);
-      fed++;
-    }
-
-    if (fed > 0) {
-      logger.info(
-        `[sync] Healed ${address} (${asset}): fed ${fed} missed deposit event(s) through the deposit monitor ` +
-        `(+${diff.toFixed(6)} diff — fees applied by the pipeline).`
-      );
-    } else {
-      logger.warn(
-        `[sync] Unexplained +${diff.toFixed(6)} ${asset} on ${address} — no unattributed Transfer event found ` +
-        `in the last ${EVENT_LOOKBACK_BLOCKS} blocks. Left alone (monitor may still catch it).`
-      );
-    }
-
-    await this.clearDrift(userId, asset);
-  }
-
-  // ------------------------------------------------------------------
-  // DB > chain: the DB credits money the chain doesn't have (phantom
-  // residue). Auto-debit the excess from availableBalance — capped at
-  // what's actually available — and audit everything.
-  // ------------------------------------------------------------------
-
-  private async healPhantomCredit(userId: string, asset: SyncAsset, diff: number, ctx: BalanceComponents): Promise<void> {
-    const debit = Math.abs(diff);
-    const where = { userId_asset: { userId, asset } };
-
-    const row = await prisma.balance.findUnique({ where });
-    const available = Number(row?.availableBalance ?? 0);
-    const applied = Math.min(debit, available);
-    const remainder = Number((debit - applied).toFixed(8));
-
-    await prisma.$transaction(async (tx) => {
-      if (applied > 0) {
-        await tx.balance.update({
-          where,
-          data: { availableBalance: { decrement: applied } },
-        });
-      }
-
-      await tx.auditLog.create({
-        data: {
-          userId,
-          action: 'BALANCE_SYNC_DEBIT',
-          entityType: 'Balance',
-          entityId: `${userId}:${asset}`,
-          oldValue: {
-            available,
-            locked: ctx.locked,
-            onChain: ctx.onChain,
-            expected: ctx.expected,
-          },
-          newValue: {
-            debited: applied,
-            unresolvedRemainder: remainder, // exceeds availableBalance — human review
-          },
-        },
-      });
-    });
-
-    logger.warn(
-      `[sync] Healed phantom ${asset} for user ${userId}: DB exceeded chain by ${debit.toFixed(6)}, ` +
-      `debited ${applied.toFixed(6)}` +
-      (remainder > 0 ? ` — REMAINDER ${remainder.toFixed(6)} exceeds availableBalance, needs human review` : '')
-    );
-
-    await this.clearDrift(userId, asset);
-  }
-
-  // ------------------------------------------------------------------
-  // Guards
-  // ------------------------------------------------------------------
-
-  /** A deposit the monitor has already seen but not yet finished crediting. */
   private async hasInFlightDeposit(address: string, asset: string): Promise<boolean> {
     const inFlight = await prisma.depositMonitor.findFirst({
       where: {
@@ -378,61 +188,143 @@ class BalanceSyncService {
     return !!inFlight;
   }
 
-  /** Operator gas seeds in transit fully explain a positive BNB delta. */
-  private async pendingGasSeedBnb(address: string): Promise<number> {
-    const raw = await redis.get(pendingGasSeedKey(address));
-    return raw ? parseFloat(raw) : 0;
+  /**
+   * DB believes there's more than the chain actually holds. Safe to
+   * correct automatically — this only ever removes balance, never
+   * invents it — UNLESS the correction would go negative, which means
+   * something else (e.g. corrupted lockedBalance) is going on and a
+   * human needs to look rather than have this silently paper over it.
+   */
+  private async healOverstated(ctx: BalanceComponents): Promise<void> {
+    const correctAvailable = solveAvailableForOnChain(ctx);
+
+    if (correctAvailable < 0) {
+      logger.warn(
+        `[BALANCE SYNC] ${ctx.asset} ${ctx.address}: correction would go negative (${correctAvailable.toFixed(6)}) — needs manual review, not auto-fixed.`
+      );
+
+      await prisma.auditLog.create({
+        data: {
+          userId: ctx.userId,
+          action: 'BALANCE_DRIFT_NEEDS_REVIEW',
+          entityType: 'Balance',
+          entityId: `${ctx.userId}:${ctx.asset}`,
+          oldValue: { available: ctx.available, locked: ctx.locked },
+          newValue: { onChain: ctx.onChain, wouldBeAvailable: correctAvailable },
+        },
+      });
+
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.balance.update({
+        where: { userId_asset: { userId: ctx.userId, asset: ctx.asset } },
+        data: { availableBalance: correctAvailable },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          userId: ctx.userId,
+          action: 'BALANCE_AUTO_CORRECTED_DOWN',
+          entityType: 'Balance',
+          entityId: `${ctx.userId}:${ctx.asset}`,
+          oldValue: { availableBalance: ctx.available },
+          newValue: { availableBalance: correctAvailable, onChain: ctx.onChain },
+        },
+      });
+    });
+
+    logger.info(
+      `[BALANCE SYNC] ${ctx.asset} ${ctx.address}: auto-corrected availableBalance ${ctx.available} → ${correctAvailable.toFixed(6)} (was overstated vs. chain)`
+    );
   }
 
   /**
-   * Two-cycle persistence gate (steady-state only — the boot run passes
-   * force=true and never reaches this). First sight of a diff: store it,
-   * do nothing. If the SAME sign reappears next cycle with a comparable
-   * magnitude, the diff is stable (not a tx in flight) → act. Any cycle
-   * with no diff clears the stored state.
+   * Chain holds more than the DB explains. Rather than crediting the raw
+   * gap (how the old double-credit bug happened), find the actual
+   * on-chain transaction responsible and run it through the exact same
+   * canonical deposit path the scanner uses — fee deduction included,
+   * fully idempotent against anything the scanner already processed.
    */
-  private async isPersistentDrift(userId: string, asset: string, diff: number, tol: number): Promise<boolean> {
-    const key = driftKey(userId, asset);
-    const raw = await redis.get(key);
+  private async investigateUnderstated(ctx: BalanceComponents): Promise<void> {
+    if (ctx.asset !== 'USDT') {
+      // BNB is already watched live, every cycle, by the delta method in
+      // deposit-monitor.ts's checkNativeBalance — a persistent unexplained
+      // BNB gap this check independently confirms is unusual enough to
+      // just flag rather than guess at.
+      logger.warn(
+        `[BALANCE SYNC] ${ctx.asset} ${ctx.address}: chain shows more than DB explains (diff +${(ctx.onChain - ctx.expected).toFixed(6)}) and it isn't a fresh deposit — needs manual review.`
+      );
 
-    if (!raw) {
-      await redis.set(key, JSON.stringify({ diff, at: Date.now() }), 'EX', DRIFT_TTL_SEC);
-      return false;
+      await prisma.auditLog.create({
+        data: {
+          userId: ctx.userId,
+          action: 'BALANCE_DRIFT_NEEDS_REVIEW',
+          entityType: 'Balance',
+          entityId: `${ctx.userId}:${ctx.asset}`,
+          oldValue: { expected: ctx.expected },
+          newValue: { onChain: ctx.onChain },
+        },
+      });
+
+      return;
     }
 
-    let prev: { diff: number; at: number };
     try {
-      prev = JSON.parse(raw);
-    } catch {
-      await redis.set(key, JSON.stringify({ diff, at: Date.now() }), 'EX', DRIFT_TTL_SEC);
-      return false;
+      const provider = await blockchain.getProvider();
+      const currentBlock = await provider.getBlockNumber();
+      const fromBlock = Math.max(1, currentBlock - DEEP_RESCAN_BLOCKS);
+
+      const eventsByAddress = await blockchain.getTokenTransferEventsForAddresses(
+        'USDT',
+        [ctx.address.toLowerCase()],
+        fromBlock,
+        currentBlock
+      );
+
+      const events = eventsByAddress.get(ctx.address.toLowerCase()) ?? [];
+
+      if (events.length === 0) {
+        logger.warn(
+          `[BALANCE SYNC] USDT ${ctx.address}: chain shows more than DB explains, but no Transfer event found in the last ${DEEP_RESCAN_BLOCKS} blocks — not a missed deposit, needs manual review.`
+        );
+
+        await prisma.auditLog.create({
+          data: {
+            userId: ctx.userId,
+            action: 'BALANCE_DRIFT_NEEDS_REVIEW',
+            entityType: 'Balance',
+            entityId: `${ctx.userId}:USDT`,
+            oldValue: { expected: ctx.expected },
+            newValue: { onChain: ctx.onChain },
+          },
+        });
+
+        return;
+      }
+
+      // handleDepositCheck is a no-op for anything already PROCESSED/
+      // CONFIRMED/FAILED in DepositMonitor — safe to just replay every
+      // event found, new or old.
+      for (const event of events) {
+        await depositMonitor.handleDepositCheck(
+          ctx.address,
+          'USDT',
+          event.txHash,
+          event.amount,
+          event.from,
+          event.blockNumber
+        );
+      }
+
+      logger.info(
+        `[BALANCE SYNC] USDT ${ctx.address}: rescanned ${events.length} Transfer event(s) from the last ${DEEP_RESCAN_BLOCKS} blocks and replayed them through the normal deposit path.`
+      );
+    } catch (err) {
+      logger.error(`[BALANCE SYNC] Deep rescan failed for ${ctx.address}:`, err);
     }
-
-    const ageMs = Date.now() - prev.at;
-    const sameSign = Math.sign(prev.diff) === Math.sign(diff);
-    const comparable = Math.abs(Math.abs(diff) - Math.abs(prev.diff)) <= Math.max(tol, 0.75 * Math.abs(prev.diff));
-
-    // Refresh the observation window.
-    await redis.set(key, JSON.stringify({ diff, at: Date.now() }), 'EX', DRIFT_TTL_SEC);
-
-    if (sameSign && comparable && ageMs >= 2 * 60 * 1000) {
-      return true;
-    }
-
-    return false;
   }
-
-  private async clearDrift(userId: string, asset: string): Promise<void> {
-    try {
-      await redis.del(driftKey(userId, asset));
-    } catch {
-      // ignore
-    }
-  }
-}
-
-function fmt(n: number): string {
-  return `${n > 0 ? '+' : ''}${n.toFixed(6)}`;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -440,4 +332,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
-      
+    
