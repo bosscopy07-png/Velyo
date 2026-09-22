@@ -1,5 +1,6 @@
 import { prisma } from '../src/database';
 import { ethers } from 'ethers';
+import { GiveawayStatus } from '@prisma/client';
 import { computeOutstandingEscrow } from '../src/services/giveaway';
 
 /**
@@ -24,7 +25,7 @@ import { computeOutstandingEscrow } from '../src/services/giveaway';
  *   npx ts-node scripts/sweep-terminal-giveaway-escrow.ts --confirm   (ALL users)
  */
 
-const TERMINAL_STATUSES = ['CANCELLED', 'EXPIRED'];
+const TERMINAL_STATUSES: GiveawayStatus[] = ['CANCELLED', 'EXPIRED'];
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
