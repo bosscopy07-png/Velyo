@@ -16,7 +16,7 @@ import {
 
 /**
  * ============================================================================
- * SELF-HEALING BALANCE SYNC (v3)
+ * SELF-HEALING BALANCE SYNC (v3.1)
  * ============================================================================
  *
  * v1 auto-credited the raw onChain-vs-expected gap as a txHash-less
@@ -47,8 +47,14 @@ import {
  *                 and stable, not a tx in flight — but every in-flight
  *                 guard (monitor rows, gas seeds) still applies.
  *
- * No Telegram notifications. Discrepancies that can't be attributed to a
- * real on-chain event are logged and left alone.
+ * v3.1 adds component-level repair: the old double-refund bug left
+ * `availableBalance` inflated and `lockedBalance` NEGATIVE by the same
+ * amount. `expected` still matched chain (the two cancel out), so the
+ * drift check was blind to it — but users saw phantom spendable money.
+ * Negative locked is never legitimate; it's repaired in place (the shift
+ * is purely between available and locked, so `expected` is unchanged).
+ *
+ * No Telegram notifications. Anything unexplained is logged and left alone.
  * ============================================================================
  */
 
@@ -126,15 +132,28 @@ class BalanceSyncService {
   }
 
   /**
-   * One wallet × one asset. Compare on-chain to expected; heal in the
-   * appropriate direction only after the diff proves persistent (or the
-   * run is the boot run) and no in-flight explanation exists.
+   * One wallet × one asset. Component sanity first (negative locked is
+   * repaired regardless of totals), then compare on-chain to expected and
+   * heal in the appropriate direction only after the diff proves
+   * persistent (or the run is the boot run) and no in-flight explanation
+   * exists.
    */
   private async checkOne(userId: string, address: string, asset: SyncAsset, force = false): Promise<void> {
     const ctx = await gatherBalanceComponents(userId, address, asset);
 
     const tol = SYNC_TOLERANCE[asset];
     const diff = ctx.onChain - ctx.expected; // positive: chain holds more
+
+    // ── Component sanity, independent of the chain comparison ──
+    // locked escrow can NEVER be negative. The old double-refund bug left
+    // availableBalance inflated and lockedBalance negative by the same
+    // amount — `expected` still matched chain, so the drift check alone
+    // can't see it, but the user sees phantom spendable money. Repairing
+    // the split in place leaves `expected` unchanged (the shift is purely
+    // between available and locked), so no drift is created.
+    if (ctx.locked < -tol) {
+      await this.healNegativeLocked(userId, asset, ctx);
+    }
 
     if (Math.abs(diff) < tol) {
       await this.clearDrift(userId, asset);
@@ -168,6 +187,55 @@ class BalanceSyncService {
     } else {
       await this.healPhantomCredit(userId, asset, diff, ctx);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Negative lockedBalance repair. Never gated, never transient:
+  // escrow below zero is always bug residue (v3.1). Shifts the phantom
+  // out of `availableBalance` back into `lockedBalance` toward zero,
+  // capped at what's actually available so we never drive available
+  // negative. `expected` is unchanged by this shift.
+  // ------------------------------------------------------------------
+
+  private async healNegativeLocked(userId: string, asset: SyncAsset, ctx: BalanceComponents): Promise<void> {
+    const excess = Math.abs(ctx.locked);
+    const where = { userId_asset: { userId, asset } };
+
+    const applied = Math.min(excess, ctx.available);
+    const remainder = Number((excess - applied).toFixed(8));
+
+    await prisma.$transaction(async (tx) => {
+      if (applied > 0) {
+        await tx.balance.update({
+          where,
+          data: {
+            lockedBalance: { increment: applied },    // moves -X toward 0
+            availableBalance: { decrement: applied }, // removes the phantom display credit
+          },
+        });
+      }
+
+      await tx.auditLog.create({
+        data: {
+          userId,
+          action: 'BALANCE_SYNC_LOCKED_REPAIR',
+          entityType: 'Balance',
+          entityId: `${userId}:${asset}`,
+          oldValue: { available: ctx.available, locked: ctx.locked },
+          newValue: {
+            availableAfter: Number((ctx.available - applied).toFixed(8)),
+            lockedAfter: Number((ctx.locked + applied).toFixed(8)),
+            unresolvedRemainder: remainder, // exceeded available — human review
+          },
+        },
+      });
+    });
+
+    logger.warn(
+      `[sync] Repaired negative locked ${asset} for user ${userId}: moved ${applied.toFixed(6)} from ` +
+      `available back to locked (was ${ctx.locked.toFixed(6)})` +
+      (remainder > 0 ? ` — REMAINDER ${remainder.toFixed(6)} exceeded available, needs review` : '')
+    );
   }
 
   // ------------------------------------------------------------------
@@ -372,4 +440,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
-    
+      
