@@ -1,137 +1,124 @@
-import { ethers } from 'ethers';
 import { prisma } from '../src/database';
-import { config, type AssetSymbol } from '../src/config';
-import {
-  gatherBalanceComponents,
-  solveAvailableForOnChain,
-  SYNC_ASSETS,
-  SYNC_TOLERANCE,
-} from '../src/services/balance-accounting';
+import { ethers } from 'ethers';
+import { computeOutstandingEscrow } from '../src/services/giveaway';
 
 /**
- * EMERGENCY BALANCE REPAIR
+ * REPAIR: locked/available split corrupted by the cleanup.ts double-refund
+ * bug (see comment above `computeOutstandingEscrow` in services/giveaway.ts).
  *
- * ------------------------------------------------------------------------
- * WHY THIS NO LONGER SETS availableBalance = raw on-chain balance
- * ------------------------------------------------------------------------
- * The previous version of this script did exactly that — and that formula
- * disagrees with the one `balance-sync.ts` uses to decide whether a wallet
- * looks wrong in the first place:
+ * This does NOT touch the blockchain and does NOT change a user's total
+ * balance (available + locked). The bug never moved real money — it's an
+ * internal bookkeeping split error, so the fix is purely internal too:
+ * recompute what `lockedBalance` SHOULD be (the sum of outstanding escrow
+ * across every giveaway this user has ever created, per asset) and move
+ * the difference back out of `availableBalance`.
  *
- *   old repair:     availableBalance := onChain
- *   balance-sync:   expected := available + locked + unsweptFees
- *                               - redeemCredits - gasRefunds
- *
- * Running the old repair would zero out legitimate redeem-code credits
- * (which have no on-chain backing at all) and hand a user any unswept
- * platform fee still sitting in the wallet, then guarantee balance-sync
- * found a fresh "discrepancy" on its very next tick. Repair, drift,
- * repeat.
- *
- * This version imports the exact same formula balance-sync uses
- * (`src/services/balance-accounting.ts`) so the two can never disagree.
- * It also runs in DRY-RUN mode by default — pass --confirm to actually
- * write changes.
+ * That's why `balance-sync.ts` / `repair-balances.ts` (on-chain vs DB)
+ * can never catch or fix this on their own: they only ever look at
+ * `available + locked` together.
  *
  * Usage:
  *   Inspect one wallet (no changes written):
- *     npx ts-node scripts/repair-balances.ts 0xYOUR_WALLET
+ *     npx ts-node scripts/repair-locked-balance.ts 0xYOUR_WALLET
  *
- *   Inspect ALL active wallets (no changes written):
- *     npx ts-node scripts/repair-balances.ts
+ *   Inspect ALL users with at least one giveaway (no changes written):
+ *     npx ts-node scripts/repair-locked-balance.ts
  *
  *   Actually apply the fix:
- *     npx ts-node scripts/repair-balances.ts --confirm
- *     npx ts-node scripts/repair-balances.ts 0xYOUR_WALLET --confirm
+ *     npx ts-node scripts/repair-locked-balance.ts --confirm
+ *     npx ts-node scripts/repair-locked-balance.ts 0xYOUR_WALLET --confirm
  */
 
-const ASSETS_TO_REPAIR: AssetSymbol[] = [...SYNC_ASSETS];
+const TOLERANCE = 0.000001;
 
-async function repairWallet(
-  wallet: { address: string; userId: string },
-  apply: boolean
-): Promise<{ repaired: number; skipped: number; unchanged: number }> {
-  let repaired = 0;
+async function correctLockedBalance(userId: string, asset: string): Promise<number> {
+  const giveaways = await prisma.giveaway.findMany({
+    where: { creatorId: userId, asset },
+    select: { id: true },
+  });
+
+  let total = 0;
+  for (const g of giveaways) {
+    const { outstanding } = await computeOutstandingEscrow(g.id);
+    total += outstanding;
+  }
+
+  return Number(total.toFixed(8));
+}
+
+async function repairUser(userId: string, label: string, apply: boolean): Promise<{ fixed: number; skipped: number; unchanged: number }> {
+  let fixed = 0;
   let skipped = 0;
   let unchanged = 0;
 
-  for (const asset of ASSETS_TO_REPAIR) {
-    try {
-      const ctx = await gatherBalanceComponents(wallet.userId, wallet.address, asset);
-      const suggestedAvailable = solveAvailableForOnChain(ctx);
-      const diff = ctx.onChain - ctx.expected;
-      const tol = SYNC_TOLERANCE[asset] ?? 0.000001;
+  const balances = await prisma.balance.findMany({ where: { userId } });
 
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`Wallet:             ${wallet.address}`);
-      console.log(`Asset:              ${asset}`);
-      console.log(`On-chain:           ${ctx.onChain}`);
-      console.log(`DB availableBalance:${ctx.available}`);
-      console.log(`lockedBalance:      ${ctx.locked}`);
-      console.log(`unswept fees:       ${ctx.unsweptFees}`);
-      console.log(`redeem credits:     ${ctx.redeemCredits}`);
-      console.log(`gas refunds:        ${ctx.gasRefunds}`);
-      console.log(`expected on-chain:  ${ctx.expected.toFixed(8)}`);
-      console.log(`diff:               ${diff >= 0 ? '+' : ''}${diff.toFixed(8)}`);
-      console.log(`suggested new availableBalance: ${suggestedAvailable.toFixed(8)}`);
-      console.log(`${'='.repeat(60)}`);
+  for (const balance of balances) {
+    const currentAvailable = Number(balance.availableBalance);
+    const currentLocked = Number(balance.lockedBalance);
+    const total = currentAvailable + currentLocked;
 
-      if (Math.abs(diff) < tol) {
-        console.log(`✓ ${asset} within tolerance — no change needed.`);
-        unchanged++;
-        continue;
-      }
+    const correctLocked = await correctLockedBalance(userId, balance.asset);
+    const diff = currentLocked - correctLocked; // positive = locked overstated; negative (our bug) = locked understated (went negative)
 
-      if (suggestedAvailable < 0) {
-        console.error(
-          `✗ SKIP ${asset}: suggested availableBalance is negative (${suggestedAvailable.toFixed(8)}) — ` +
-            `this wallet needs a human to look at unswept fees / redeem history before touching it. Not applying.`
-        );
-        skipped++;
-        continue;
-      }
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Wallet/user:      ${label}`);
+    console.log(`Asset:            ${balance.asset}`);
+    console.log(`Current available:${currentAvailable}`);
+    console.log(`Current locked:   ${currentLocked}`);
+    console.log(`Correct locked:   ${correctLocked}  (sum of outstanding escrow across all giveaways created)`);
+    console.log(`Locked diff:      ${diff >= 0 ? '+' : ''}${diff.toFixed(8)}`);
 
-      if (!apply) {
-        console.log(`(dry run — would set availableBalance to ${suggestedAvailable.toFixed(8)}. Pass --confirm to apply.)`);
-        continue;
-      }
+    if (Math.abs(diff) < TOLERANCE) {
+      console.log(`✓ within tolerance — no change needed.`);
+      unchanged++;
+      continue;
+    }
 
-      const before = ctx.available;
+    const correctAvailable = Number((total - correctLocked).toFixed(8));
 
-      await prisma.$transaction(async (tx) => {
-        await tx.balance.upsert({
-          where: { userId_asset: { userId: wallet.userId, asset } },
-          create: {
-            userId: wallet.userId,
-            asset,
-            availableBalance: suggestedAvailable,
-            lockedBalance: 0,
-            pendingBalance: 0,
-          },
-          update: { availableBalance: suggestedAvailable },
-        });
+    console.log(`Suggested available: ${correctAvailable}  (total unchanged: ${total})`);
 
-        await tx.auditLog.create({
-          data: {
-            userId: wallet.userId,
-            action: 'BALANCE_MANUAL_REPAIR',
-            entityType: 'Balance',
-            entityId: `${wallet.userId}:${asset}`,
-            oldValue: { availableBalance: before },
-            newValue: { availableBalance: suggestedAvailable, onChain: ctx.onChain },
-          },
-        });
+    if (correctAvailable < 0) {
+      console.error(
+        `✗ SKIP: suggested availableBalance would be negative (${correctAvailable}). ` +
+          `This user's giveaway history needs a human look before touching it.`
+      );
+      skipped++;
+      continue;
+    }
+
+    if (!apply) {
+      console.log(`(dry run — pass --confirm to apply.)`);
+      continue;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.balance.update({
+        where: { userId_asset: { userId, asset: balance.asset } },
+        data: {
+          availableBalance: correctAvailable,
+          lockedBalance: correctLocked,
+        },
       });
 
-      console.log(`✓ ${asset} availableBalance: ${before} → ${suggestedAvailable.toFixed(8)}`);
-      repaired++;
-    } catch (err) {
-      skipped++;
-      console.error(`✗ SKIP ${wallet.address} ${asset}:`, err instanceof Error ? err.message : err);
-    }
+      await tx.auditLog.create({
+        data: {
+          userId,
+          action: 'LOCKED_BALANCE_REPAIR',
+          entityType: 'Balance',
+          entityId: `${userId}:${balance.asset}`,
+          oldValue: { availableBalance: currentAvailable, lockedBalance: currentLocked },
+          newValue: { availableBalance: correctAvailable, lockedBalance: correctLocked },
+        },
+      });
+    });
+
+    console.log(`✓ Fixed: available ${currentAvailable} → ${correctAvailable}, locked ${currentLocked} → ${correctLocked}`);
+    fixed++;
   }
 
-  return { repaired, skipped, unchanged };
+  return { fixed, skipped, unchanged };
 }
 
 async function main(): Promise<void> {
@@ -143,62 +130,51 @@ async function main(): Promise<void> {
     console.log('DRY RUN — no balances will be changed. Pass --confirm to apply.\n');
   }
 
-  let wallets;
+  let users: { id: string; address: string }[];
 
   if (requestedAddress) {
     if (!ethers.isAddress(requestedAddress)) {
       throw new Error(`Invalid wallet address: ${requestedAddress}`);
     }
 
-    console.log(`Single-wallet mode.`);
-    console.log(`Address: ${requestedAddress}\n`);
-
-    wallets = await prisma.wallet.findMany({
-      where: { status: 'ACTIVE', address: { equals: requestedAddress } },
+    const wallet = await prisma.wallet.findFirst({
+      where: { address: { equals: requestedAddress, mode: 'insensitive' } },
     });
 
-    if (wallets.length === 0) {
-      wallets = await prisma.wallet.findMany({
-        where: { status: 'ACTIVE', address: { equals: requestedAddress, mode: 'insensitive' } },
-      });
-    }
+    if (!wallet) throw new Error(`No wallet found for ${requestedAddress}`);
+
+    users = [{ id: wallet.userId, address: wallet.address }];
   } else {
-    console.log(`ALL-WALLET mode.`);
-
-    wallets = await prisma.wallet.findMany({
-      where: { status: 'ACTIVE', address: { not: config.PLATFORM_FEE_WALLET } },
+    // Only users who have ever created a giveaway can possibly have this bug.
+    const creators = await prisma.giveaway.findMany({
+      distinct: ['creatorId'],
+      select: { creatorId: true, creator: { select: { wallet: { select: { address: true } } } } },
     });
+
+    users = creators.map((c) => ({ id: c.creatorId, address: c.creator.wallet?.address ?? '(no wallet)' }));
   }
 
-  if (wallets.length === 0) {
-    throw new Error(requestedAddress ? `No ACTIVE wallet found for ${requestedAddress}` : 'No active wallets found.');
-  }
+  console.log(`Found ${users.length} user(s) to check.\n`);
 
-  const filteredWallets = wallets.filter(
-    (wallet) => wallet.address.toLowerCase() !== config.PLATFORM_FEE_WALLET.toLowerCase()
-  );
-
-  console.log(`Found ${filteredWallets.length} wallet(s).\n`);
-
-  let repaired = 0;
+  let fixed = 0;
   let skipped = 0;
   let unchanged = 0;
 
-  for (const wallet of filteredWallets) {
+  for (const user of users) {
     console.log(`\n############################################`);
-    console.log(`# ${wallet.address}`);
+    console.log(`# ${user.address} (userId ${user.id})`);
     console.log(`############################################`);
 
-    const result = await repairWallet(wallet, apply);
-    repaired += result.repaired;
+    const result = await repairUser(user.id, user.address, apply);
+    fixed += result.fixed;
     skipped += result.skipped;
     unchanged += result.unchanged;
   }
 
   console.log('\n================================');
   console.log(apply ? 'Repair completed' : 'Dry run completed');
-  console.log(`Wallets processed: ${filteredWallets.length}`);
-  console.log(`${apply ? 'Repaired' : 'Would repair'}:          ${repaired}`);
+  console.log(`Users checked:     ${users.length}`);
+  console.log(`${apply ? 'Fixed' : 'Would fix'}:            ${fixed}`);
   console.log(`Unchanged:         ${unchanged}`);
   console.log(`Skipped:           ${skipped}`);
   console.log('================================');
@@ -212,4 +188,3 @@ main()
   .finally(async () => {
     await prisma.$disconnect();
   });
-              
