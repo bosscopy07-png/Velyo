@@ -47,8 +47,77 @@ export async function estimateCreationCost(totalAmount: number, maxClaimers: num
   return { platformFee, gasFee, fee, total: Number((totalAmount + fee).toFixed(6)), gasUnits };
 }
 
-/** Claim statuses that still hold an escrowed share (not yet PAID/FAILED/released) */
-const FUNDED_CLAIM_STATUSES = ['RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING'];
+/**
+ * ============================================================================
+ * WHY THIS FUNCTION EXISTS — the second phantom-balance bug
+ * ============================================================================
+ * Three different places used to each compute "how much escrow to give
+ * back to the creator" independently, from different (incomplete) inputs:
+ *
+ *   - claim-expiry.ts:  refunds `amountPerUser` for ONE expired claim
+ *   - payout.ts:         refunds `amountPerUser` for ONE permanently-failed claim
+ *   - cleanup.ts (OLD):  refunded `totalAmount - claimedCount * amountPerUser`
+ *                        for the WHOLE giveaway when it naturally expired
+ *
+ * `claimedCount` reflects currently-occupied slots, not "ever claimed" —
+ * it's decremented the moment a claim expires or its payout is unwound, so
+ * a slot that was already refunded by claim-expiry.ts still looks
+ * "unclaimed" to cleanup.ts's math. Result: cleanup.ts refunded the ENTIRE
+ * remaining pot as if nothing had ever been given back, on top of whatever
+ * claim-expiry.ts or payout.ts had already refunded for that same slot —
+ * a real double-refund. It shows up as `lockedBalance` going negative and
+ * `availableBalance` inflated by the same amount, with ZERO on-chain
+ * footprint (this is pure internal bookkeeping — no blockchain transaction
+ * happens on refund), so `balance-sync.ts`'s on-chain drift check can never
+ * catch it: `available + locked` is unchanged, only the split between them
+ * is wrong.
+ *
+ * Fix: ONE canonical calculation, driven by evidence already in the DB
+ * (which claims were actually PAID, which REFUND transactions already
+ * exist for this giveaway — tagged by `metadata.giveawayId`, whichever
+ * code path created them) rather than by trusting `claimedCount`. Every
+ * release path now asks this function "how much is still outstanding?"
+ * and refunds exactly that — never more than once, never by guesswork.
+ * ============================================================================
+ */
+export async function computeOutstandingEscrow(giveawayId: string): Promise<{
+  giveaway: { id: string; creatorId: string; asset: string; totalAmount: unknown };
+  outstanding: number;
+}> {
+  const giveaway = await prisma.giveaway.findUnique({
+    where: { id: giveawayId },
+    include: { claims: true },
+  });
+
+  if (!giveaway) {
+    throw new Error(`computeOutstandingEscrow: giveaway ${giveawayId} not found`);
+  }
+
+  const amountPerUser = Number(giveaway.amountPerUser);
+
+  // Money that actually left the wallet on-chain — genuinely consumed, never refundable.
+  const paidOut = giveaway.claims.filter((c) => c.status === 'PAID').length * amountPerUser;
+
+  // Every REFUND transaction already recorded for this giveaway, from ANY
+  // code path (claim-expiry, payout-unwind, a previous cancel/expiry run).
+  const alreadyRefundedAgg = await prisma.transaction.aggregate({
+    where: {
+      userId: giveaway.creatorId,
+      asset: giveaway.asset,
+      type: 'REFUND',
+      metadata: { path: ['giveawayId'], equals: giveawayId },
+    },
+    _sum: { amount: true },
+  });
+  const alreadyRefunded = Number(alreadyRefundedAgg._sum.amount ?? 0);
+
+  const outstanding = Math.max(
+    0,
+    Number((Number(giveaway.totalAmount) - paidOut - alreadyRefunded).toFixed(8))
+  );
+
+  return { giveaway, outstanding };
+}
 
 class GiveawayService {
   async createGiveaway(data: {
@@ -451,27 +520,22 @@ class GiveawayService {
 
     // Re-read AFTER the transition: no new claims can start (status is now
     // CANCELLED) and any unwind that already released a slot is reflected
-    // here. Count only slots that still hold escrow.
+    // here.
     const fresh = await prisma.giveaway.findUnique({
       where: { id: giveawayId },
       include: { claims: true },
     });
     if (!fresh) return { success: false, reason: 'Giveaway not found' };
 
-    const fundedClaims = fresh.claims.filter((c) =>
-      (FUNDED_CLAIM_STATUSES as readonly string[]).includes(c.status)
-    );
-    const unclaimedAmount = Number(
-      (fundedClaims.length * Number(fresh.amountPerUser)).toFixed(6)
-    );
+    const { outstanding } = await computeOutstandingEscrow(giveawayId);
 
-    if (unclaimedAmount > 0) {
+    if (outstanding > 0) {
       await prisma.$transaction(async (tx) => {
         await tx.balance.update({
           where: { userId_asset: { userId: fresh.creatorId, asset: fresh.asset } },
           data: {
-            availableBalance: { increment: unclaimedAmount },
-            lockedBalance: { decrement: unclaimedAmount },
+            availableBalance: { increment: outstanding },
+            lockedBalance: { decrement: outstanding },
           },
         });
 
@@ -481,12 +545,12 @@ class GiveawayService {
             userId: fresh.creatorId,
             type: 'REFUND',
             asset: fresh.asset,
-            amount: unclaimedAmount,
+            amount: outstanding,
             fee: 0,
-            netAmount: unclaimedAmount,
+            netAmount: outstanding,
             status: 'CONFIRMED',
             idempotencyKey: hashIdempotencyKey('refund', giveawayId),
-            metadata: { giveawayId },
+            metadata: { giveawayId, kind: 'cancel' },
           },
         });
       });
