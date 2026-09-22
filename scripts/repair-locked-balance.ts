@@ -1,5 +1,6 @@
 import { prisma } from '../src/database';
 import { ethers } from 'ethers';
+import { GiveawayStatus } from '@prisma/client';
 import { computeOutstandingEscrow } from '../src/services/giveaway';
 
 /**
@@ -38,8 +39,9 @@ const TOLERANCE = 0.000001;
  * first), not money that should still count as "locked".
  */
 async function correctLockedBalance(userId: string, asset: string): Promise<number> {
+  const ongoingStatuses: GiveawayStatus[] = ['ACTIVE', 'FULL'];
   const giveaways = await prisma.giveaway.findMany({
-    where: { creatorId: userId, asset, status: { in: ['ACTIVE', 'FULL'] } },
+    where: { creatorId: userId, asset, status: { in: ongoingStatuses } },
     select: { id: true },
   });
 
@@ -57,8 +59,9 @@ async function repairUser(userId: string, label: string, apply: boolean): Promis
   let skipped = 0;
   let unchanged = 0;
 
+  const terminalStatuses: GiveawayStatus[] = ['CANCELLED', 'EXPIRED'];
   const terminalWithOutstanding = await prisma.giveaway.findMany({
-    where: { creatorId: userId, status: { in: ['CANCELLED', 'EXPIRED'] } },
+    where: { creatorId: userId, status: { in: terminalStatuses } },
   });
   for (const g of terminalWithOutstanding) {
     const { outstanding } = await computeOutstandingEscrow(g.id);
@@ -207,4 +210,4 @@ main()
   .finally(async () => {
     await prisma.$disconnect();
   });
-                                    
+      
