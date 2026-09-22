@@ -13,6 +13,14 @@ export async function handleStart(ctx: Context): Promise<void> {
   const from = ctx.from;
   if (!from) return;
 
+  // FIX: delete the /start command message itself (e.g. "/start giveaway_xxx")
+  // so the chat stays clean — same policy as the text handler.
+  try {
+    await ctx.deleteMessage();
+  } catch {
+    // too old, already gone, or not deletable — non-fatal
+  }
+
   const telegramId = from.id.toString();
   const isAdmin = config.ADMIN_TELEGRAM_IDS.includes(telegramId);
 
@@ -209,4 +217,4 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     backKeyboard('main')
   );
       }
-                            
+      
