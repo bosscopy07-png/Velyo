@@ -11,6 +11,7 @@ import {
   SYNC_TOLERANCE,
   gatherBalanceComponents,
   type BalanceComponents,
+  type SyncAsset,
 } from './balance-accounting';
 
 /**
@@ -121,10 +122,10 @@ class BalanceSyncService {
    * appropriate direction only after the diff proves persistent and no
    * in-flight explanation exists.
    */
-  private async checkOne(userId: string, address: string, asset: (typeof SYNC_ASSETS)[number]): Promise<void> {
+  private async checkOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
     const ctx = await gatherBalanceComponents(userId, address, asset);
 
-    const tol = SYNC_TOLERANCE[asset] ?? 0.000001;
+    const tol = SYNC_TOLERANCE[asset];
     const diff = ctx.onChain - ctx.expected; // positive: chain holds more
 
     if (Math.abs(diff) < tol) {
@@ -170,7 +171,7 @@ class BalanceSyncService {
   private async healMissingCredit(
     userId: string,
     address: string,
-    asset: string,
+    asset: SyncAsset,
     diff: number,
     ctx: BalanceComponents
   ): Promise<void> {
@@ -237,7 +238,7 @@ class BalanceSyncService {
   // what's actually available — and audit everything.
   // ------------------------------------------------------------------
 
-  private async healPhantomCredit(userId: string, asset: string, diff: number, ctx: BalanceComponents): Promise<void> {
+  private async healPhantomCredit(userId: string, asset: SyncAsset, diff: number, ctx: BalanceComponents): Promise<void> {
     const debit = Math.abs(diff);
     const where = { userId_asset: { userId, asset } };
 
@@ -361,4 +362,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
-                                       
+                               
