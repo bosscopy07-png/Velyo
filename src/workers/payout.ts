@@ -2,23 +2,36 @@ import { Worker, UnrecoverableError } from 'bullmq';
 import { prisma } from '../database';
 import { bullmqConnection } from '../services/redis';
 import { blockchain } from '../services/blockchain';
+import { ensureGas, estimateBnbTransferCost } from '../services/gas';
 import { config, ASSETS } from '../config';
 import { logger } from '../utils/logger';
 
-const MIN_GAS_WEI = 1500000000000000n; // 0.0015 BNB
 const CONFIRMATIONS = 15;
 const CONFIRM_TIMEOUT_MS = 300_000;
 
 /** Claim states that are allowed to enter PROCESSING (terminal states excluded) */
 const PAYOUTABLE_STATUSES = ['QUEUED', 'RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'PROCESSING'] as const;
 
-/** Errors where retrying is pointless — the tx will revert identically every time. */
+/**
+ * Errors where retrying is pointless — the ASSET transfer itself will
+ * revert identically every time (e.g. the creator wallet genuinely doesn't
+ * hold enough USDT).
+ *
+ * NOTE: "insufficient funds" for GAS is deliberately NOT permanent anymore.
+ * ensureGas() tops the wallet up from the operator wallet before every
+ * send; if it's still short, the operator wallet is dry — that's transient
+ * (retry later), not a reason to touch creator funds.
+ *
+ * Policy on permanent failure: DO NOT unwind. No refund, no slot release,
+ * no FAILED bookkeeping. The claim simply returns to QUEUED and stops
+ * retrying; the CREATOR cancels the giveaway to reclaim the escrow, which
+ * refunds exactly the right amount exactly once via
+ * computeOutstandingEscrow (PAID claims + existing REFUND rows).
+ */
 function isPermanentRevert(err: unknown): boolean {
   const msg = (err as Error)?.message ?? '';
   return (
     msg.includes('transfer amount exceeds balance') ||
-    msg.includes('insufficient funds') ||
-    msg.includes('INSUFFICIENT_FUNDS') ||
     (msg.includes('execution reverted') && msg.includes('BEP20'))
   );
 }
@@ -86,21 +99,24 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   const assetConfig = ASSETS[assetKey];
   const amountBigInt = BigInt(Math.floor(amount * 10 ** assetConfig.decimals));
 
-  const [onChainAsset, gasBal] = await Promise.all([
-    blockchain.getBalance(creatorWallet.address, assetKey),
-    blockchain.getBalance(creatorWallet.address, 'BNB'),
-  ]);
+  const onChainAsset = await blockchain.getBalance(creatorWallet.address, assetKey);
 
   if (onChainAsset < amountBigInt) {
-    await unwindFailedPayout(claim, amount, 'CREATOR_WALLET_UNDERFUNDED');
+    // NO unwind, NO refund, NO slot release — just stop.
+    // Creator cancels the giveaway to reclaim; or tops up and an admin/
+    // future job can requeue. State is left untouched (still QUEUED).
     throw new UnrecoverableError(
       `Creator wallet ${creatorWallet.address} holds ${onChainAsset} ${asset}, needs ${amountBigInt}. ` +
-      `Claim unwound; manual review required.`
+      `Payout left pending — no funds moved. Creator can cancel the giveaway for a full refund.`
     );
   }
-  if (gasBal < MIN_GAS_WEI) {
-    logger.warn(`Creator wallet ${creatorWallet.address} low on BNB (${gasBal} wei) — payout may fail`);
-  }
+
+  // ── Gas top-up BEFORE marking PROCESSING ──
+  // ensureGas seeds from the operator wallet to the CURRENT network cost
+  // and waits for the seed to mine, so the payout can never hit the
+  // INSUFFICIENT_FUNDS unwind path anymore. Runs BEFORE the PROCESSING
+  // transition so a failure here leaves the claim cleanly in QUEUED.
+  await ensureGas(creatorWallet.address, await estimateBnbTransferCost(), `payout-${claimId}`);
 
   // ── Mark PROCESSING (guarded — only one worker wins per claim) ──
   const marked = await prisma.giveawayClaim.updateMany({
@@ -139,12 +155,23 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
     const msg = (err as Error).message;
 
     if (isPermanentRevert(err)) {
-      // Guaranteed to revert again — unwind and stop forever
-      await unwindFailedPayout(claim, amount, msg);
+      // Guaranteed to revert again. Per policy: DO NOT refund, DO NOT
+      // release the slot, DO NOT mark FAILED. Just put the claim back to
+      // QUEUED so the state is clean, then stop retrying. The creator
+      // cancels the giveaway to reclaim the escrow.
+      await prisma.giveawayClaim.update({
+        where: { id: claimId },
+        data: { status: 'QUEUED', payoutTransactionHash: null },
+      });
+      logger.error(
+        `Permanent payout failure for claim ${claimId}: ${msg}. ` +
+        `Left QUEUED — no refund issued. Creator can cancel the giveaway to reclaim funds.`
+      );
       throw new UnrecoverableError(`Permanent payout failure for claim ${claimId}: ${msg}`);
     }
 
-    // Transient (RPC, network, timeout) — revert to QUEUED for a clean retry
+    // Transient (RPC, network, timeout, operator-wallet-dry gas seed) —
+    // revert to QUEUED for a clean retry.
     logger.error(`Transient payout failure for claim ${claimId}: ${msg} — will retry`);
     await prisma.giveawayClaim.update({
       where: { id: claimId },
@@ -158,94 +185,21 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 });
 
 /**
- * A payout that can never succeed: return the locked slice to the creator's
- * available balance AND release the claim's slot on the giveaway atomically.
- *
- * Releasing the slot is what prevents the double-refund: once released, a
- * later cancelGiveaway no longer counts this share as escrowed, so it is
- * never refunded a second time. FULL giveaways reopen (status → ACTIVE).
- *
- * Race safety vs cancel: the whole thing runs in one transaction. If the
- * giveaway was already CANCELLED, cancel already refunded every funded slot
- * — so we skip our refund entirely (cancel owns it). The guarded FAILED
- * transition makes the whole path idempotent.
- */
-async function unwindFailedPayout(
-  claim: ClaimWithGiveaway,
-  amount: number,
-  reason: string
-): Promise<void> {
-  const claimId = claim.id;
-  const creatorId = claim.giveaway.creatorId;
-  const asset = claim.giveaway.asset;
-
-  // Guarded terminal transition — a double-call never double-refunds.
-  const res = await prisma.giveawayClaim.updateMany({
-    where: { id: claimId, status: { notIn: ['PAID', 'FAILED'] } },
-    data: { status: 'FAILED', failedReason: reason.slice(0, 500) },
-  });
-  if (res.count === 0) return; // already terminal
-
-  await prisma.$transaction(async (tx) => {
-    // Re-check giveaway status inside the tx: if a cancel won the race,
-    // cancel already refunded this share — releasing the slot AND refunding
-    // here would double-pay the creator.
-    const giveaway = await tx.giveaway.findUnique({
-      where: { id: claim.giveawayId },
-      select: { status: true },
-    });
-
-    if (giveaway && giveaway.status !== 'CANCELLED') {
-      // Release the slot so a later cancel won't refund this share again,
-      // and reopen the giveaway if it had gone FULL.
-      await tx.$queryRaw`
-        UPDATE giveaways
-        SET "claimedCount" = "claimedCount" - 1,
-            status = CASE WHEN status = 'FULL' THEN 'ACTIVE'::"GiveawayStatus" ELSE status END,
-            "updatedAt" = NOW()
-        WHERE id = ${claim.giveawayId} AND "claimedCount" > 0
-      `;
-
-      await tx.balance.update({
-        where: { userId_asset: { userId: creatorId, asset } },
-        data: {
-          lockedBalance: { decrement: amount },
-          availableBalance: { increment: amount },
-        },
-      });
-
-      await tx.transaction.create({
-        data: {
-          userId: creatorId,
-          type: 'REFUND',
-          asset,
-          amount,
-          fee: 0,
-          netAmount: amount,
-          status: 'CONFIRMED',
-          idempotencyKey: `payout-unwind-${claimId}`,
-          metadata: { kind: 'payout_unwind', claimId, giveawayId: claim.giveawayId, reason },
-        },
-      });
-    }
-  });
-
-  logger.error(`Payout unwound for claim ${claimId}: ${amount} ${asset} returned to creator, slot released (${reason})`);
-}
-
-/**
- * Reclaim seeded gas once every claim is in a terminal state (PAID or FAILED).
- * Requiring ALL claims PAID would strand the BNB seed forever when one fails.
+ * Reclaim seeded gas once every claim is in a terminal state (PAID).
+ * Note: failed-then-left-QUEUED claims keep the giveaway out of the
+ * reclaim condition until the creator cancels (cancelGiveaway →
+ * reclaimGas handles it there). That's intentional — the seed stays
+ * available in case the payout is ever requeued after a top-up.
  */
 async function maybeReclaimGas(giveawayId: string): Promise<void> {
   try {
-    const [totalClaims, terminalClaims] = await Promise.all([
+    const [totalClaims, paidClaims] = await Promise.all([
       prisma.giveawayClaim.count({ where: { giveawayId } }),
       prisma.giveawayClaim.count({
-        where: { giveawayId, status: { in: ['PAID', 'FAILED'] } },
+        where: { giveawayId, status: 'PAID' },
       }),
     ]);
-    if (totalClaims > 0 && terminalClaims >= totalClaims) {
+    if (totalClaims > 0 && paidClaims >= totalClaims) {
       const { giveawayService } = await import('../services/giveaway');
       await giveawayService.reclaimGas(giveawayId);
     }
@@ -308,12 +262,11 @@ worker.on('completed', (job) => {
 
 worker.on('failed', (job, err) => {
   if (err instanceof UnrecoverableError) {
-    logger.error(`Payout job ${job?.id} permanently failed (no more retries): ${err.message}`);
+    logger.error(`Payout job ${job?.id} permanently stopped (no more retries): ${err.message}`);
   } else {
     logger.error(`Payout job ${job?.id} failed (will retry):`, err);
   }
 });
 
 logger.info('Payout worker started');
-
-      
+         
