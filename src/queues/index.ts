@@ -34,7 +34,18 @@ export async function queueDepositCheck(data: {
   address: string;
   asset: string;
   txHash: string;
-  amount: number;
+  /**
+   * Raw on-chain integer amount (wei), as a string — BullMQ job data is
+   * JSON, which can't carry a bigint directly. The consumer
+   * (`workers/deposit.ts`) converts it back with `BigInt(rawAmount)`
+   * before handing it to `depositMonitor.handleDepositCheck`, which is
+   * the same canonical entry point the cron scanner uses — so this MUST
+   * be the raw integer amount, not a pre-divided decimal, or the two
+   * paths will disagree about how much was actually deposited.
+   */
+  rawAmount: string;
+  from?: string;
+  blockNumber?: number;
 }): Promise<Job> {
   return depositQueue.add('check-deposit', data, {
     attempts: 10,
@@ -44,6 +55,10 @@ export async function queueDepositCheck(data: {
     },
     removeOnComplete: 100,
     removeOnFail: 50,
+    // Same (txHash, address) pair can never be enqueued twice — BullMQ
+    // itself rejects a duplicate jobId outright, a second layer of
+    // protection on top of depositMonitor's own DepositMonitor-table dedup.
+    jobId: `${data.txHash}:${data.address.toLowerCase()}`,
   });
 }
 
@@ -56,4 +71,4 @@ export async function queueNotification(data: {
     attempts: 3,
     backoff: { type: 'fixed', delay: 5000 },
   });
-  }
+}
