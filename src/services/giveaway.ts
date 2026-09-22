@@ -5,26 +5,32 @@ import { walletService } from './wallet';
 import { config } from '../config';
 import { generateSecureCode } from '../utils/validation';
 import { logger } from '../utils/logger';
+import { ensureGas, estimateBnbTransferCost } from './gas';
+import { randomUUID } from 'crypto';
 import type { AssetSymbol } from '../config';
 
 /**
- * Gas economics. One BEP20 transfer costs ≈ 0.00000174 BNB; we budget
- * 0.000002 BNB per unit = 2×10^12 wei.
+ * Gas economics — DYNAMIC.
+ *
+ * The old static 0.000002 BNB/tx budget fell BELOW the real network cost
+ * (~0.0000026 BNB at the time of the INSUFFICIENT_FUNDS payout failures),
+ * so every seeded wallet was underfunded and payouts/permanent unwinds
+ * followed. Per-tx cost now comes from estimateBnbTransferCost()
+ * (live gas price + 1.5× headroom) — never a stale constant.
  */
-export const GAS_PER_CLAIM_BNB = 0.000002;
-const GAS_SEED_PER_PAYOUT = 2000000000000n;
 const BNB_USD_FALLBACK = 550;
 /** Extra seeded units: 1 buffer for claim rounding + 1 for the fee-forward tx */
 const GAS_BUFFER_UNITS = 2;
 
-/** USDT value of `units × 0.000002` BNB (for charging gas to users) */
+/** USDT value of `units` real BEP20 transfers (for charging gas to users) */
 export async function estimateGasUSDT(units: number): Promise<number> {
+  const bnbCost = (await estimateBnbTransferCost()) * units;
   let usd = 0;
   try {
     const { pricing } = await import('./pricing');
-    usd = await pricing.convertToUSD('BNB', units * GAS_PER_CLAIM_BNB);
+    usd = await pricing.convertToUSD('BNB', bnbCost);
   } catch {}
-  if (!usd || usd <= 0) usd = units * GAS_PER_CLAIM_BNB * BNB_USD_FALLBACK;
+  if (!usd || usd <= 0) usd = bnbCost * BNB_USD_FALLBACK;
   return Number(usd.toFixed(6));
 }
 
@@ -129,6 +135,9 @@ class GiveawayService {
   }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number }> {
     const amountPerUser = data.totalAmount / data.maxClaimers;
     const secureCode = generateSecureCode(20);
+    // Client-generated ID so gas can be seeded BEFORE any DB write — if the
+    // seed fails, createGiveaway throws and no funds ever move.
+    const giveawayId = randomUUID();
     const { hashIdempotencyKey } = await import('../utils/encryption');
 
     const cost = await estimateCreationCost(data.totalAmount, data.maxClaimers);
@@ -161,6 +170,13 @@ class GiveawayService {
       }
     }
 
+    // ── SEED GAS FIRST ──────────────────────────────────────────────────
+    // Fail fast: if the operator wallet can't fund the gas budget, we throw
+    // BEFORE the giveaway exists — no locked funds, no unpayable giveaway.
+    // (Old behavior: seed after creation, swallow failures, discover the
+    // empty wallet at payout time as a permanent INSUFFICIENT_FUNDS unwind.)
+    const seedHash = await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
+
     const giveaway = await prisma.$transaction(async (tx) => {
       const balance = await tx.balance.findUnique({
         where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
@@ -183,6 +199,7 @@ class GiveawayService {
 
       const g = await tx.giveaway.create({
         data: {
+          id: giveawayId,
           creatorId: data.creatorId,
           asset: data.asset,
           totalAmount: data.totalAmount,
@@ -251,11 +268,8 @@ class GiveawayService {
       return g;
     });
 
-    // 1) Seed BNB (payout gas + buffer + 1 unit for the fee-forward below)
-    const seedHash = await this.seedPayoutGas(data.creatorId, giveaway.id, data.maxClaimers + GAS_BUFFER_UNITS);
-
-    // 2) Immediately forward the full creation fee on-chain to the platform
-    //    wallet — waits for the seed to MINE first (cross-wallet ordering).
+    // Immediately forward the full creation fee on-chain to the platform
+    // wallet — waits for the seed to MINE first (cross-wallet ordering).
     await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, fee, seedHash);
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${fee})`);
@@ -288,6 +302,11 @@ class GiveawayService {
       const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
       if (!wallet) return;
 
+      // Belt-and-braces: top up to the CURRENT network cost before signing.
+      // Covers "no seed was needed at creation" wallets and any drift between
+      // the seed and now. No-op when the wallet is already funded.
+      await ensureGas(wallet.address, await estimateBnbTransferCost(), `creation-fwd-${giveawayId}`);
+
       const raw = BigInt(Math.floor(amount * 1e18));
       const { hash } = await blockchain.sendTransaction(
         wallet.encryptedPrivateKey,
@@ -311,50 +330,38 @@ class GiveawayService {
     }
   }
 
-  /** Seeds gas from the admin wallet; returns the seed tx hash (or null). */
+  /**
+   * Seeds gas from the admin wallet; returns the seed tx hash (or null).
+   *
+   * THROWS on failure — ensureGas propagates, and so do we. Seeding must
+   * never fail silently again: an unseeded wallet means a guaranteed
+   * INSUFFICIENT_FUNDS payout unwind later.
+   */
   private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<string | null> {
-    try {
-      let wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
-      if (!wallet) {
-        await walletService.createWallet(creatorId);
-        wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
-        if (!wallet) return null;
-      }
-
-      const baseline = await blockchain.getBalance(wallet.address, 'BNB');
-      const needed = BigInt(units) * GAS_SEED_PER_PAYOUT;
-      let seeded = 0n;
-      let seedHash: string | null = null;
-
-      if (baseline < needed) {
-        if (!config.OPERATOR_WALLET_KEY) {
-          logger.warn(`OPERATOR_WALLET_KEY not set — cannot seed gas for giveaway ${giveawayId}`);
-        } else {
-          const { hashIdempotencyKey } = await import('../utils/encryption');
-          seeded = needed - baseline;
-          const sent = await blockchain.sendTransaction(
-            config.OPERATOR_WALLET_KEY,
-            wallet.address,
-            seeded,
-            'BNB',
-            hashIdempotencyKey('create-seed', giveawayId)
-          );
-          seedHash = sent.hash;
-          logger.info(`Gas seeded for giveaway ${giveawayId}: ${seedHash} (${Number(seeded) / 1e18} BNB for ${units} units)`);
-          await walletService.adjustOperatorBalance('BNB', -Number(seeded) / 1e18);
-        }
-      }
-
-      await redis.set(
-        `gas:credit:${giveawayId}`,
-        JSON.stringify({ address: wallet.address, baseline: baseline.toString(), seeded: seeded.toString() }),
-        'EX', 60 * 60 * 24 * 30
-      );
-      return seedHash;
-    } catch (err) {
-      logger.error(`Gas seed failed for giveaway ${giveawayId}: ${(err as Error).message}`);
-      return null;
+    let wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+    if (!wallet) {
+      await walletService.createWallet(creatorId);
+      wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+      if (!wallet) throw new Error(`seedPayoutGas: wallet provisioning failed for ${creatorId}`);
     }
+
+    const baseline = await blockchain.getBalance(wallet.address, 'BNB');
+    // Dynamic, network-derived budget — (maxClaimers + buffer) × current
+    // transfer cost with headroom. Never the old static 0.000002 constant.
+    const neededBnb = Number((units * (await estimateBnbTransferCost())).toFixed(8));
+
+    const { seededBnb, hash } = await ensureGas(wallet.address, neededBnb, `giveaway-${giveawayId}`);
+
+    await redis.set(
+      `gas:credit:${giveawayId}`,
+      JSON.stringify({
+        address: wallet.address,
+        baseline: baseline.toString(),
+        seeded: BigInt(Math.floor(seededBnb * 1e18)).toString(),
+      }),
+      'EX', 60 * 60 * 24 * 30
+    );
+    return hash;
   }
 
   /**
@@ -382,7 +389,9 @@ class GiveawayService {
       const current = await blockchain.getBalance(credit.address, 'BNB');
       const ours = current - BigInt(credit.baseline);
 
-      const reclaimTxGas = 1800000000000n; // 0.0000018 BNB
+      // Dynamic reclaim cost — the old hardcoded 0.0000018 was also below
+      // the real network cost, so the reclaim tx itself could fail.
+      const reclaimTxGas = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18));
 
       if (ours <= reclaimTxGas) {
         logger.info(`Gas reclaim for ${giveawayId}: leftover ${ours} wei below reclaim cost — kept as wallet float.`);
@@ -401,7 +410,16 @@ class GiveawayService {
       logger.info(`Gas reclaimed for ${giveawayId}: ${Number(sendBack) / 1e18} BNB → admin (tx ${hash})`);
       await walletService.adjustOperatorBalance('BNB', Number(sendBack) / 1e18);
 
-      const refundUSDT = await estimateGasUSDT(Number(sendBack) / 1e18 / GAS_PER_CLAIM_BNB);
+      // Refund the USD value of the reclaimed BNB (USDT ≈ USD).
+      const reclaimedBnb = Number(sendBack) / 1e18;
+      let usd = 0;
+      try {
+        const { pricing } = await import('./pricing');
+        usd = await pricing.convertToUSD('BNB', reclaimedBnb);
+      } catch {}
+      if (!usd || usd <= 0) usd = reclaimedBnb * BNB_USD_FALLBACK;
+      const refundUSDT = Number(usd.toFixed(6));
+
       if (refundUSDT > 0) {
         await walletService.creditFunds(wallet.userId, 'USDT', refundUSDT);
         const { hashIdempotencyKey } = await import('../utils/encryption');
@@ -415,7 +433,7 @@ class GiveawayService {
             netAmount: refundUSDT,
             status: 'CONFIRMED',
             idempotencyKey: hashIdempotencyKey('gas-refund', giveawayId),
-            metadata: { kind: 'gas_refund', giveawayId, reclaimedBNB: Number(sendBack) / 1e18 },
+            metadata: { kind: 'gas_refund', giveawayId, reclaimedBNB: reclaimedBnb },
           },
         });
         logger.info(`Gas refund for ${giveawayId}: ${refundUSDT} USDT credited to creator`);
@@ -560,7 +578,7 @@ class GiveawayService {
     return { success: true };
   }
 
-    async getGiveawayStats(giveawayId: string): Promise<{
+  async getGiveawayStats(giveawayId: string): Promise<{
     totalReward: number;
     totalSlots: number;
     linkOpens: number;
