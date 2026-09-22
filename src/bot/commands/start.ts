@@ -61,7 +61,9 @@ export async function handleStart(ctx: Context): Promise<void> {
 
     if (startPayload?.startsWith('giveaway_')) {
       const code = startPayload.replace('giveaway_', '');
-      await deleteMainMessage(ctx, user!);
+      // FIX: do NOT delete the stored main message here.
+      // handleGiveawayDeepLink edits it in place — deleting it first was the
+      // cause of the "bad edit" warnings on every step of the claim flow.
       await handleGiveawayDeepLink(ctx, user!.id, code);
       return;
     }
@@ -109,8 +111,10 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       include: { claims: true, creator: true },
     });
 
+    // FIX: error/terminal states show a single Back button that returns to
+    // the dashboard ('main'), not the full inline main menu.
     if (!giveaway) {
-      await editMainMessage(ctx, `${e('warning')} Giveaway not found or expired.`, mainKeyboard(false));
+      await editMainMessage(ctx, `${e('warning')} Giveaway not found or expired.`, backKeyboard('main'));
       return;
     }
 
@@ -125,10 +129,10 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         await editMainMessage(
           ctx,
           `${e('check')} You already received your reward for this giveaway!\n\nTx: <code>${existingClaim.payoutTransactionHash || 'Pending'}</code>`,
-          mainKeyboard(false)
+          backKeyboard('main')
         );
       } else if (existingClaim.status === 'ADDRESS_CONFIRMED' || existingClaim.status === 'QUEUED' || existingClaim.status === 'PROCESSING') {
-        await editMainMessage(ctx, `${e('clock')} Your reward is being processed. Please wait.`, mainKeyboard(false));
+        await editMainMessage(ctx, `${e('clock')} Your reward is being processed. Please wait.`, backKeyboard('main'));
       } else if (
         existingClaim.status === 'RESERVED' ||
         existingClaim.status === 'ADDRESS_PENDING' ||
@@ -136,7 +140,7 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       ) {
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
       } else {
-        await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, mainKeyboard(false));
+        await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, backKeyboard('main'));
       }
       return;
     }
@@ -145,25 +149,25 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       await editMainMessage(
         ctx,
         `${e('warning')} <b>GIVEAWAY FULL</b>\n\nAll available spots have already been claimed.\n\nBetter luck next time.`,
-        mainKeyboard(false)
+        backKeyboard('main')
       );
       return;
     }
 
     if (giveaway.status !== 'ACTIVE') {
-      await editMainMessage(ctx, `${e('warning')} This giveaway is no longer active.`, mainKeyboard(false));
+      await editMainMessage(ctx, `${e('warning')} This giveaway is no longer active.`, backKeyboard('main'));
       return;
     }
 
     if (giveaway.expiresAt && giveaway.expiresAt < new Date()) {
-      await editMainMessage(ctx, `${e('warning')} This giveaway has expired.`, mainKeyboard(false));
+      await editMainMessage(ctx, `${e('warning')} This giveaway has expired.`, backKeyboard('main'));
       return;
     }
 
     const result = await giveawayService.claimGiveaway(giveaway.id, userId);
 
     if (!result.success) {
-      await editMainMessage(ctx, `${e('warning')} ${result.reason}`, mainKeyboard(false));
+      await editMainMessage(ctx, `${e('warning')} ${result.reason}`, backKeyboard('main'));
       return;
     }
 
@@ -180,7 +184,7 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
     await promptForAddress(ctx, giveaway.asset, claim!.id);
   } catch (err) {
     logger.error('Giveaway deep link error:', err);
-    await editMainMessage(ctx, `${e('warning')} Unable to process giveaway claim.`, mainKeyboard(false));
+    await editMainMessage(ctx, `${e('warning')} Unable to process giveaway claim.`, backKeyboard('main'));
   }
 }
 
@@ -204,4 +208,5 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
   );
-}
+      }
+                            
