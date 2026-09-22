@@ -1,94 +1,65 @@
-
 import { Worker } from 'bullmq';
-import { prisma } from '../database';
 import { bullmqConnection } from '../services/redis';
-import { blockchain } from '../services/blockchain';
-import { config } from '../config';
+import { depositMonitor } from '../services/deposit-monitor';
 import { logger } from '../utils/logger';
-import { hashIdempotencyKey } from '../utils/encryption';
 
-const worker = new Worker('deposits', async (job) => {
-  const { address, asset, txHash, amount } = job.data;
+/**
+ * This worker used to contain its OWN copy of the deposit-crediting logic,
+ * with its own dedup check (`Transaction.findFirst({ transactionHash })`,
+ * global, no wallet-address scoping) and its own idempotency key
+ * (`hash('deposit', txHash)` — missing the address that the scanner's key
+ * includes). Two different keys for the same real-world deposit meant the
+ * `Transaction.idempotencyKey` unique constraint could NOT catch a double
+ * credit between this worker and the cron scanner in `deposit-monitor.ts`.
+ *
+ * Fixed by deleting the duplicate logic entirely. This worker now only
+ * validates its job payload and calls back into the exact same code path
+ * the scanner uses (`depositMonitor.handleDepositCheck`), so there is
+ * exactly one implementation of "credit a deposit" in the whole app.
+ *
+ * Nothing in the current codebase enqueues jobs onto the `'deposits'`
+ * queue (see `queues/index.ts::queueDepositCheck`) — this worker is kept
+ * running only so any future manual/admin "recheck this deposit" tool has
+ * a safe, already-idempotent place to land.
+ */
+const worker = new Worker(
+  'deposits',
+  async (job) => {
+    const { address, asset, txHash, rawAmount, from, blockNumber } = job.data as {
+      address: string;
+      asset: string;
+      txHash: string;
+      /** Raw on-chain integer amount (wei), as a string — see queueDepositCheck. */
+      rawAmount: string;
+      from?: string;
+      blockNumber?: number;
+    };
 
-  try {
-    const existing = await prisma.transaction.findFirst({
-      where: { transactionHash: txHash },
-    });
-
-    if (existing) {
-      logger.info(`Deposit ${txHash} already processed`);
-      return { status: 'already_processed' };
+    if (!address || !asset || !txHash || !rawAmount) {
+      throw new Error(`Deposit job missing required fields: ${JSON.stringify(job.data)}`);
     }
 
-    const receipt = await blockchain.getTransactionReceipt(txHash);
-    if (!receipt || receipt.status !== 1) {
-      throw new Error('Transaction not confirmed or failed');
-    }
+    await depositMonitor.handleDepositCheck(
+      address,
+      asset,
+      txHash,
+      BigInt(rawAmount),
+      from ?? '',
+      blockNumber
+    );
 
-    const wallet = await prisma.wallet.findUnique({ where: { address } });
-    if (!wallet) throw new Error('Wallet not found');
+    logger.info(`Deposit queue job delegated to depositMonitor for ${txHash} (${address})`);
 
-    const feePercent = config.ENABLE_FEES ? config.PLATFORM_FEE_PERCENT : 0;
-    const fee = amount * (feePercent / 100);
-    const netAmount = amount - fee;
-
-    await prisma.$transaction(async (tx) => {
-      await tx.balance.upsert({
-        where: { userId_asset: { userId: wallet.userId, asset } },
-        create: {
-          userId: wallet.userId,
-          asset,
-          availableBalance: netAmount,
-          lockedBalance: 0,
-          pendingBalance: 0,
-        },
-        update: {
-          availableBalance: { increment: netAmount },
-        },
-      });
-
-      const depositTx = await tx.transaction.create({
-        data: {
-          userId: wallet.userId,
-          type: 'DEPOSIT',
-          asset,
-          amount,
-          fee,
-          netAmount,
-          status: 'CONFIRMED',
-          transactionHash: txHash,
-          toAddress: address,
-          idempotencyKey: hashIdempotencyKey('deposit', txHash),
-        },
-      });
-
-      if (fee > 0) {
-        await tx.platformFee.create({
-          data: {
-            transactionId: depositTx.id,
-            asset,
-            amount: fee,
-            feeWallet: config.PLATFORM_FEE_WALLET,
-          },
-        });
-      }
-    });
-
-    await prisma.depositMonitor.updateMany({
-      where: { txHash },
-      data: { status: 'PROCESSED', processedAt: new Date() },
-    });
-
-    logger.info(`Deposit processed: ${txHash} - ${netAmount} ${asset}`);
-    return { status: 'completed', netAmount };
-  } catch (err) {
-    logger.error(`Deposit check failed for ${txHash}:`, err);
-    throw err;
+    return { status: 'delegated' };
+  },
+  {
+    connection: bullmqConnection,
+    concurrency: 3,
   }
-}, {
-  connection: bullmqConnection,
-  concurrency: 3,
+);
+
+worker.on('failed', (job, err) => {
+  logger.error(`Deposit queue job failed for ${job?.id}:`, err);
 });
 
-logger.info('Deposit worker started');
-        
+logger.info('Deposit worker started (delegates to depositMonitor — single credit path)');
