@@ -3,6 +3,7 @@ import { blockchain } from './blockchain';
 import { redis } from './redis';
 import { walletService } from './wallet';
 import { estimateGasUSDT } from './giveaway';
+import { ensureGas, estimateBnbTransferCost, pendingGasSeedKey } from './gas';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { hashIdempotencyKey } from '../utils/encryption';
@@ -43,31 +44,11 @@ const SMALL_SCAN_BLOCK_WINDOW = 5;
 const SCAN_LOCK_KEY = 'monitor:scan:lock';
 const SCAN_LOCK_TTL_SEC = 240;
 
-/** 0.000002 BNB = 2×10^12 wei — enough for one BEP20 forward */
-const FORWARD_GAS_SEED = 2000000000000n;
-
-const MIN_DEPOSIT: Record<string, number> = {
-  BNB: 0.0001,
-  USDT: config.MINIMUM_AMOUNT_USD,
-};
-
 /**
- * BNB balance sweep pacing — bounded concurrency with a small delay,
- * comfortably under a 15 req/s provider ceiling, with an extra
- * backoff pause whenever a batch hits a rate-limit error.
+ * Pending gas-seed ledger TTL is owned by services/gas.ts (same Redis
+ * key, `monitor:seed:pending:<address>`). This module only SUBTRACTS the
+ * ledger in checkNativeBalance — all seeding goes through ensureGas().
  */
-const BNB_CHECK_CONCURRENCY = 4;
-const BNB_CHECK_BATCH_DELAY_MS = 300;
-const BNB_RATE_LIMIT_BACKOFF_MS = 2000;
-
-/**
- * Pending gas-seed ledger TTL. When VEYLO seeds BNB gas into a user
- * wallet before forwarding USDT fees, the seed amount is recorded in
- * Redis and consumed by the next balance sweep so the seed is never
- * misread as a user BNB deposit. 600s comfortably covers
- * seed-then-forward latency.
- */
-const SEED_LEDGER_TTL_SEC = 600;
 
 /**
  * Required confirmation depth before a Transfer-log-based (USDT) deposit
@@ -386,9 +367,8 @@ class DepositMonitorService {
     } finally {
       await this.releaseScanLock();
     }
-  }
-
-  // ------------------------------------------------------------------
+}
+        // ------------------------------------------------------------------
   // SMALL scan — every 60s at second 30 — getblock.io, last 5 blocks.
   // Fast idempotent safety net for ALL wallets. Does NOT advance the
   // cursor and does NOT touch BNB balances.
@@ -478,14 +458,14 @@ class DepositMonitorService {
   //   from "user BNB deposit", so the seed would be credited to the
   //   user as a fake deposit.
   //
-  //   Fix: a Redis pending-seed ledger. processDeposit() records the
-  //   intended seed BEFORE broadcasting; checkNativeBalance() subtracts
-  //   the recorded seeds from the delta and consumes the ledger.
+  //   Fix: a Redis pending-seed ledger, owned by services/gas.ts.
+  //   ensureGas() records the intended seed BEFORE broadcasting and
+  //   this sweep subtracts + consumes the ledger.
   //
   //   Properties:
   //    - seed + real deposit in the same window → remainder math still
   //      credits exactly the deposit portion;
-  //    - seed tx failure → the ledger entry is rolled back in catch;
+  //    - seed tx failure → the ledger entry is rolled back in gas.ts;
   //    - 600s TTL → a lost entry can never suppress deposits forever.
   //
   //   NOTE: unlike USDT, this method has no discrete on-chain event to
@@ -499,31 +479,6 @@ class DepositMonitorService {
   //   would require tracking multi-cycle persistence and is a reasonable
   //   follow-up, not done here.
   // ------------------------------------------------------------------
-
-  private pendingSeedKey(address: string): string {
-    return `monitor:seed:pending:${address.toLowerCase()}`;
-  }
-
-  private async recordPendingGasSeed(
-    address: string,
-    seedAmount: bigint
-  ): Promise<void> {
-    const key = this.pendingSeedKey(address);
-    const amountBnb = Number(seedAmount) / 1e18;
-
-    await redis.incrbyfloat(key, amountBnb);
-    await redis.expire(key, SEED_LEDGER_TTL_SEC);
-  }
-
-  private async clearPendingGasSeed(
-    address: string,
-    seedAmount: bigint
-  ): Promise<void> {
-    const key = this.pendingSeedKey(address);
-    const amountBnb = Number(seedAmount) / 1e18;
-
-    await redis.incrbyfloat(key, -amountBnb);
-  }
 
   private async checkNativeBalance(
     wallet: MonitoredWallet,
@@ -560,10 +515,10 @@ class DepositMonitorService {
 
     /**
      * Subtract operator gas seeds recorded since the previous
-     * snapshot, then consume the ledger.
+     * snapshot, then consume the ledger. Key format owned by gas.ts.
      */
     const seedKey =
-      this.pendingSeedKey(wallet.address);
+      pendingGasSeedKey(wallet.address);
 
     const pendingSeedsStr =
       await redis.get(seedKey);
@@ -575,7 +530,7 @@ class DepositMonitorService {
 
     if (pendingSeeds > 0) {
       await redis.incrbyfloat(seedKey, -pendingSeeds);
-      await redis.expire(seedKey, SEED_LEDGER_TTL_SEC);
+      await redis.expire(seedKey, 600);
     }
 
     const adjustedDiff =
@@ -1042,65 +997,25 @@ class DepositMonitorService {
     );
 
     /**
-     * Fee forwarding, with the gas-seed ledger recorded BEFORE
-     * broadcasting so the monitor can never misattribute it. Sends go
-     * through the Chainstack TX RPC via blockchain.sendTransaction.
+     * Fee forwarding. GAS FIX: seeding now goes through ensureGas(), which
+     * (a) budgets the CURRENT network cost (the old static 0.000002 BNB
+     * was below the real ~0.0000026 BNB tx cost) and (b) WAITS for the
+     * seed to mine before the USDT forward is broadcast — the old code
+     * fired both back-to-back, so the forward was validated against a
+     * confirmed balance that didn't include the seed (INSUFFICIENT_FUNDS)
+     * and the fee stayed pending forever. The pending-seed ledger is
+     * recorded inside ensureGas (same Redis key this monitor subtracts).
      */
-    if (
+        if (
       platformFee > 0 &&
       asset === 'USDT'
     ) {
       try {
-        const baseline =
-          await blockchain.getBalance(
-            wallet.address,
-            'BNB'
-          );
-
-        if (
-          baseline <
-          FORWARD_GAS_SEED
-        ) {
-          if (!config.OPERATOR_WALLET_KEY) {
-            throw new Error(
-              'OPERATOR_WALLET_KEY not configured'
-            );
-          }
-
-          const seedAmount =
-            FORWARD_GAS_SEED -
-            baseline;
-
-          await this.recordPendingGasSeed(
-            wallet.address,
-            seedAmount
-          );
-
-          try {
-            await blockchain.sendTransaction(
-              config.OPERATOR_WALLET_KEY,
-              wallet.address,
-              seedAmount,
-              'BNB',
-              hashIdempotencyKey(
-                'fwd-seed',
-                event.txHash
-              )
-            );
-          } catch (seedErr) {
-            await this.clearPendingGasSeed(
-              wallet.address,
-              seedAmount
-            );
-
-            throw seedErr;
-          }
-
-          await walletService.adjustOperatorBalance(
-            'BNB',
-            -Number(seedAmount) / 1e18
-          );
-        }
+        await ensureGas(
+          wallet.address,
+          await estimateBnbTransferCost(),
+          `fee-fwd-${event.txHash}`
+        );
 
         const rawFee =
           BigInt(
@@ -1273,4 +1188,3 @@ function sleep(
 
 export const depositMonitor =
   new DepositMonitorService();
-      
