@@ -1,42 +1,58 @@
 import { prisma } from '../database';
-import { blockchain } from './blockchain';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { hashIdempotencyKey } from '../utils/encryption';
 import cron from 'node-cron';
+import {
+  SYNC_ASSETS,
+  SYNC_TOLERANCE,
+  gatherBalanceComponents,
+  solveAvailableForOnChain,
+  type BalanceComponents,
+} from './balance-accounting';
 
-/** Ignore differences smaller than this (chain dust / rounding) */
-const SYNC_TOLERANCE: Record<string, number> = {
-  USDT: 0.001,
-  BNB: 0.00001,
-};
-
-const SYNC_ASSETS = ['USDT', 'BNB'] as const;
-type SyncAsset = (typeof SYNC_ASSETS)[number];
+/**
+ * ============================================================================
+ * WHY THIS FILE NO LONGER TOUCHES `availableBalance`
+ * ============================================================================
+ *
+ * This job used to auto-credit (or auto-debit) `availableBalance` by the raw
+ * gap between the live on-chain balance and a computed "expected" figure,
+ * with NO check against the deposit monitor's own ledger (`DepositMonitor`).
+ *
+ * That created real, reproducible phantom credits: a deposit lands on-chain,
+ * this job runs BEFORE the deposit monitor's cron has credited it (normal
+ * detection window is up to ~90s, much longer during an RPC stall/backlog),
+ * sees `onChain > expected`, and "self-heals" by minting the gap as a brand
+ * new, txHash-less "chain-sync" deposit. Minutes later the deposit monitor
+ * ALSO credits the same real Transfer event through its own (correct,
+ * idempotent) path. Net result: one real deposit, credited twice.
+ *
+ * A blockchain deposit must be credited in exactly one place:
+ * `deposit-monitor.ts::processDeposit` / `claimAndCredit`, guarded by the
+ * `DepositMonitor` table and the `Transaction.idempotencyKey` unique
+ * constraint. This job's only job now is to DETECT drift and tell a human,
+ * never to mint or burn balance on its own.
+ * ============================================================================
+ */
 
 // Every 5 minutes at second 30 — deliberately offset from the deposit monitor
-// (second 0 of every minute) so the two never burst the RPC simultaneously
+// (second 0/30 of every minute) so the two never burst the RPC simultaneously.
 const CRON_SCHEDULE = '30 */5 * * * *';
-const SYNC_KEY_WINDOW_MS = 300000; // matches the 5-min cycle
 
-interface SyncContext {
-  userId: string;
-  address: string;
-  asset: SyncAsset;
-  onChain: number;
-  available: number;
-  locked: number;
-  unsweptFees: number;
-  redeemCredits: number;
-  gasRefunds: number;
-}
+/**
+ * A deposit can be legitimately "in flight" — seen on-chain, not yet
+ * credited — for one full detection cycle plus its confirmation wait.
+ * Anything newer than this grace window is not a discrepancy, it's just
+ * the deposit monitor doing its job; skip it rather than flag it.
+ */
+const IN_FLIGHT_GRACE_MS = 20 * 60 * 1000; // 20 minutes, comfortably covers 15-confirmation waits
 
 class BalanceSyncService {
   private isRunning = false;
 
   start(): void {
     cron.schedule(CRON_SCHEDULE, () => void this.syncAll());
-    logger.info('Balance sync started (on-chain → DB, every 5 min, offset from deposit monitor)');
+    logger.info('Balance drift monitor started (detect-and-flag only, every 5 min)');
   }
 
   private async syncAll(): Promise<void> {
@@ -48,7 +64,7 @@ class BalanceSyncService {
         where: {
           status: 'ACTIVE',
           // Operator wallet is synced explicitly via adjustOperatorBalance —
-          // its on-chain balance legitimately differs from any user ledger
+          // its on-chain balance legitimately differs from any user ledger.
           address: { not: config.PLATFORM_FEE_WALLET },
         },
       });
@@ -57,15 +73,15 @@ class BalanceSyncService {
       for (const wallet of wallets) {
         for (const asset of SYNC_ASSETS) {
           try {
-            await this.syncOne(wallet.userId, wallet.address, asset);
+            await this.checkOne(wallet.userId, wallet.address, asset);
           } catch (err) {
             const msg = (err as Error).message ?? '';
             if (msg.includes('rate limit') || msg.includes('-32005') || msg.includes('limit exceeded')) {
               rateLimited = true;
-              logger.warn('Balance sync: rate limited — aborting this cycle, next window retries.');
+              logger.warn('Balance drift check: rate limited — aborting this cycle, next window retries.');
               break;
             }
-            logger.error(`Balance sync failed for ${wallet.address} ${asset}: ${msg}`);
+            logger.error(`Balance drift check failed for ${wallet.address} ${asset}: ${msg}`);
           }
           // Pace calls so wallets don't burst the RPC in one batch
           await sleep(400);
@@ -74,147 +90,113 @@ class BalanceSyncService {
         await sleep(500);
       }
     } catch (err) {
-      logger.error('Balance sync run failed:', err);
+      logger.error('Balance drift run failed:', err);
     } finally {
       this.isRunning = false;
     }
   }
 
   /**
-   * expectedOnChain = available + locked + unsweptFees − redeemCredits − gasRefunds
-   *
-   *   available     → user's spendable balance (what they could withdraw)
-   *   locked        → giveaway escrow held for the creator
-   *   unsweptFees   → USDT fees owed to platform, still sitting in the wallet
-   *   redeemCredits → USDT credited via redeem codes, NOT funded on-chain
-   *   gasRefunds    → USDT refunded for unused seeded BNB (reclaimGas) —
-   *                   app credit, no on-chain movement
-   *
-   * Anything beyond tolerance = a movement the deposit monitor missed → self-heal.
+   * Compares live on-chain balance to what the app believes it should be.
+   * NEVER mutates `availableBalance`. Any discrepancy beyond dust tolerance
+   * is either (a) a deposit still in flight — skipped, or (b) genuinely
+   * unexplained — flagged via AuditLog + a best-effort admin alert.
    */
-  private async syncOne(userId: string, address: string, asset: SyncAsset): Promise<void> {
-    const ctx = await this.gatherState(userId, address, asset);
+  private async checkOne(userId: string, address: string, asset: (typeof SYNC_ASSETS)[number]): Promise<void> {
+    const ctx = await gatherBalanceComponents(userId, address, asset);
 
-    // NEVER heal a debtor: a negative available balance means the user owes
-    // the platform (phantom-era over-credit). Matching on-chain by crediting
-    // them would mint money from nothing. Their balance stays negative until
-    // real deposits cover it.
     const tol = SYNC_TOLERANCE[asset] ?? 0.000001;
-    if (ctx.available < -tol) {
-      logger.warn(
-        `Balance sync (${asset}) ${address}: debtor (available ${ctx.available.toFixed(6)}) — skipped, no auto-credit`
+    const diff = ctx.onChain - ctx.expected;
+
+    if (Math.abs(diff) < tol) return;
+
+    if (await this.hasInFlightDeposit(address, asset)) {
+      logger.info(
+        `Balance drift (${asset}) ${address}: diff ${diff.toFixed(6)} — deposit in flight, skipping this cycle.`
       );
       return;
     }
 
-    const expected =
-      ctx.available + ctx.locked + ctx.unsweptFees - ctx.redeemCredits - ctx.gasRefunds;
-    const diff = ctx.onChain - expected;
-
-    if (Math.abs(diff) < tol) return;
-
-    await this.applyAdjustment(ctx, expected, diff);
-
-    logger.warn(
-      `Balance sync (${asset}) ${address}: adjusted ${diff > 0 ? '+' : ''}${diff} ` +
-      `(on-chain ${ctx.onChain} vs expected ${expected.toFixed(6)})`
-    );
+    await this.flagDiscrepancy(ctx, diff);
   }
 
-  /** Reads on-chain balance + every app-side component of the expectation. */
-  private async gatherState(userId: string, address: string, asset: SyncAsset): Promise<SyncContext> {
-    const raw = await blockchain.getBalance(address, asset);
-    const onChain = Number(raw) / 1e18;
-
-    const balance = await prisma.balance.findUnique({
-      where: { userId_asset: { userId, asset } },
+  /** A deposit the monitor has already seen but not yet finished crediting. */
+  private async hasInFlightDeposit(address: string, asset: string): Promise<boolean> {
+    const inFlight = await prisma.depositMonitor.findFirst({
+      where: {
+        address,
+        asset,
+        status: { in: ['PENDING', 'CONFIRMING', 'CONFIRMED'] },
+        createdAt: { gte: new Date(Date.now() - IN_FLIGHT_GRACE_MS) },
+      },
     });
-
-    const [feesAgg, redeemAgg, gasRefundAgg] = await Promise.all([
-      prisma.platformFee.aggregate({
-        where: { sweptAt: null, asset, transaction: { userId } },
-        _sum: { amount: true },
-      }),
-      prisma.codeRedemption.aggregate({
-        where: { userId, code: { asset } },
-        _sum: { amount: true },
-      }),
-      // Gas refunds (kind: 'gas_refund') are app-credit USDT — subtract them
-      // from the expectation just like redeem credits.
-      prisma.transaction.aggregate({
-        where: {
-          userId,
-          asset,
-          type: 'REFUND',
-          metadata: { path: ['kind'], equals: 'gas_refund' },
-        },
-        _sum: { amount: true },
-      }),
-    ]);
-
-    return {
-      userId,
-      address,
-      asset,
-      onChain,
-      available: Number(balance?.availableBalance ?? 0),
-      locked: Number(balance?.lockedBalance ?? 0),
-      unsweptFees: Number(feesAgg._sum.amount ?? 0),
-      redeemCredits: Number(redeemAgg._sum.amount ?? 0),
-      gasRefunds: Number(gasRefundAgg._sum.amount ?? 0),
-    };
+    return !!inFlight;
   }
 
   /**
-   * Applies the drift correction: nudge `availableBalance` by `diff` and
-   * record an audit trail row.
-   *
-   * Idempotency: adjustments for the same user+asset inside the same 5-minute
-   * window share a bucket key. On unique-constraint collision (rare), we log
-   * and rethrow so the next tick retries cleanly.
+   * Records the discrepancy for a human to investigate. Deliberately does
+   * NOT touch `Balance` — minting money automatically was the bug; a
+   * negative diff (app believes more exists than the chain shows) is just
+   * as dangerous to "auto-fix" as a positive one, since it would silently
+   * debit a user who may be owed an explanation instead.
    */
-  private async applyAdjustment(ctx: SyncContext, expected: number, diff: number): Promise<void> {
-    const bucket = String(Math.floor(Date.now() / SYNC_KEY_WINDOW_MS));
+  private async flagDiscrepancy(ctx: BalanceComponents, diff: number): Promise<void> {
+    const suggestedAvailable = solveAvailableForOnChain(ctx);
+
+    logger.warn(
+      `[BALANCE DRIFT] ${ctx.asset} ${ctx.address} (user ${ctx.userId}): ` +
+        `onChain=${ctx.onChain} expected=${ctx.expected.toFixed(6)} diff=${diff > 0 ? '+' : ''}${diff.toFixed(6)} ` +
+        `— NOT auto-adjusted. Suggested availableBalance if legitimate: ${suggestedAvailable.toFixed(6)}.`
+    );
 
     try {
-      await prisma.$transaction(async (tx) => {
-        await tx.balance.upsert({
-          where: { userId_asset: { userId: ctx.userId, asset: ctx.asset } },
-          create: {
-            userId: ctx.userId,
-            asset: ctx.asset,
-            availableBalance: diff,
-            lockedBalance: 0,
-            pendingBalance: 0,
+      await prisma.auditLog.create({
+        data: {
+          userId: ctx.userId,
+          action: 'BALANCE_DRIFT_DETECTED',
+          entityType: 'Balance',
+          entityId: `${ctx.userId}:${ctx.asset}`,
+          oldValue: {
+            available: ctx.available,
+            locked: ctx.locked,
+            unsweptFees: ctx.unsweptFees,
+            redeemCredits: ctx.redeemCredits,
+            gasRefunds: ctx.gasRefunds,
+            expected: ctx.expected,
           },
-          update: { availableBalance: { increment: diff } },
-        });
-
-        await tx.transaction.create({
-          data: {
-            userId: ctx.userId,
-            type: 'DEPOSIT',
-            asset: ctx.asset,
-            amount: Math.abs(diff),
-            fee: 0,
-            netAmount: diff,
-            status: 'CONFIRMED',
-            idempotencyKey: hashIdempotencyKey('chain-sync', ctx.userId, ctx.asset, bucket),
-            metadata: {
-              kind: 'chain-sync',
-              address: ctx.address,
-              onChain: ctx.onChain,
-              expected,
-              diff,
-            },
+          newValue: {
+            onChain: ctx.onChain,
+            diff,
+            suggestedAvailable,
           },
-        });
+        },
       });
     } catch (err) {
-      logger.warn(
-        `Balance sync adjustment for ${ctx.address} ${ctx.asset} deferred: ${(err as Error).message}`
-      );
-      throw err;
+      logger.error('Failed to record balance-drift audit log:', err);
+    }
+
+    await this.notifyAdmins(
+      `⚠️ <b>BALANCE DRIFT DETECTED</b>\n\n` +
+        `<b>Asset:</b> ${ctx.asset}\n` +
+        `<b>Wallet:</b> <code>${ctx.address}</code>\n` +
+        `<b>On-chain:</b> ${ctx.onChain}\n` +
+        `<b>Expected:</b> ${ctx.expected.toFixed(6)}\n` +
+        `<b>Diff:</b> ${diff > 0 ? '+' : ''}${diff.toFixed(6)}\n\n` +
+        `No auto-adjustment made. Review manually.`
+    );
+  }
+
+  private async notifyAdmins(html: string): Promise<void> {
+    for (const telegramId of config.ADMIN_TELEGRAM_IDS) {
+      try {
+        await fetch(`https://api.telegram.org/bot${config.BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: telegramId, text: html, parse_mode: 'HTML' }),
+        });
+      } catch (err) {
+        logger.error(`Balance drift admin notify failed for ${telegramId}:`, err);
+      }
     }
   }
 }
@@ -224,3 +206,4 @@ function sleep(ms: number): Promise<void> {
 }
 
 export const balanceSync = new BalanceSyncService();
+  
