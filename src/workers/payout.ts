@@ -224,7 +224,7 @@ async function unwindFailedPayout(
           netAmount: amount,
           status: 'CONFIRMED',
           idempotencyKey: `payout-unwind-${claimId}`,
-          metadata: { kind: 'payout_unwind', claimId, reason },
+          metadata: { kind: 'payout_unwind', claimId, giveawayId: claim.giveawayId, reason },
         },
       });
     }
@@ -315,4 +315,5 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info('Payout worker started');
-          
+
+      
