@@ -70,6 +70,18 @@ const BNB_RATE_LIMIT_BACKOFF_MS = 2000;
 const SEED_LEDGER_TTL_SEC = 600;
 
 /**
+ * Required confirmation depth before a Transfer-log-based (USDT) deposit
+ * is credited. Matches the schema default (`DepositMonitor.requiredConfirmations`)
+ * and the confirmation depth outgoing payouts already wait for
+ * (`payout.ts::CONFIRMATIONS`). Deposits are NOT credited on first sight —
+ * they're recorded as CONFIRMING and only credited once `checkPendingConfirmations`
+ * (or an immediate check, if already mature) proves this depth on a receipt
+ * that is STILL valid at credit time. This is what actually protects against
+ * a reorg reverting a deposit after it's already been credited.
+ */
+const REQUIRED_CONFIRMATIONS_USDT = 15;
+
+/**
  * Tiered flat fee: small deposits (< tier) pay the reduced flat fee so
  * they're still worth collecting; everything else pays the standard flat.
  */
@@ -90,6 +102,14 @@ type MonitoredWallet = {
   };
 };
 
+interface RawDepositEvent {
+  from: string;
+  amount: bigint;
+  txHash: string;
+  /** Present for real on-chain Transfer events (USDT); absent for the BNB balance-delta method. */
+  blockNumber?: number;
+}
+
 class DepositMonitorService {
   private isRunning = false;
 
@@ -97,6 +117,7 @@ class DepositMonitorService {
     /**
      * t=0s, 60s, 120s ...  → BIG scan (read pool, active wallets, cursor)
      * t=30s, 90s, 150s ... → SMALL scan (getblock, ALL wallets, no cursor)
+     * t=15s, 45s ...       → confirmation checker (matures CONFIRMING rows)
      */
     cron.schedule('0 * * * * *', () => {
       void this.runBigScan();
@@ -106,8 +127,12 @@ class DepositMonitorService {
       void this.runSmallScan();
     });
 
+    cron.schedule('15,45 * * * * *', () => {
+      void this.checkPendingConfirmations();
+    });
+
     logger.info(
-      'Deposit monitor started: BIG read-pool scan @0s (150 blk, active wallets), SMALL getblock scan @30s (5 blk, all wallets), mutually exclusive; TX via Chainstack'
+      'Deposit monitor started: BIG read-pool scan @0s (150 blk, active wallets), SMALL getblock scan @30s (5 blk, all wallets), confirmation checker @15s/45s; mutually exclusive; TX via Chainstack'
     );
   }
 
@@ -171,6 +196,18 @@ class DepositMonitorService {
     });
 
     return wallets as MonitoredWallet[];
+  }
+
+  /** Looks up a single active wallet by address, for the deferred confirmation path. */
+  private async getWalletByAddress(address: string): Promise<MonitoredWallet | null> {
+    const wallet = await prisma.wallet.findUnique({
+      where: { address },
+      include: { user: true },
+    });
+
+    if (!wallet || wallet.status !== 'ACTIVE') return null;
+
+    return wallet as unknown as MonitoredWallet;
   }
 
   // ------------------------------------------------------------------
@@ -251,7 +288,9 @@ class DepositMonitorService {
                   from: event.from,
                   amount: event.amount,
                   txHash: event.txHash,
-                }
+                  blockNumber: event.blockNumber,
+                },
+                currentBlock
               );
 
               depositsMatched++;
@@ -412,7 +451,9 @@ class DepositMonitorService {
               from: event.from,
               amount: event.amount,
               txHash: event.txHash,
-            }
+              blockNumber: event.blockNumber,
+            },
+            currentBlock
           );
 
           depositsMatched++;
@@ -427,8 +468,9 @@ class DepositMonitorService {
     } finally {
       await this.releaseScanLock();
     }
-        }
-                  // ------------------------------------------------------------------
+  }
+
+  // ------------------------------------------------------------------
   // BNB native balance sweep (balance-delta method).
   //
   //   VEYLO seeds BNB gas into a user wallet before forwarding USDT
@@ -445,6 +487,17 @@ class DepositMonitorService {
   //      credits exactly the deposit portion;
   //    - seed tx failure → the ledger entry is rolled back in catch;
   //    - 600s TTL → a lost entry can never suppress deposits forever.
+  //
+  //   NOTE: unlike USDT, this method has no discrete on-chain event to
+  //   attach a confirmation count to — the delta itself only exists
+  //   once the underlying transfer is already reflected in "latest"
+  //   chain state. It is credited immediately (see REQUIRED_CONFIRMATIONS_USDT
+  //   usage in processDeposit) and does NOT go through getTransactionReceipt,
+  //   since its synthetic txHash isn't a real transaction hash — passing it
+  //   to getTransactionReceipt would throw. This remains a narrower window
+  //   of reorg exposure than USDT had before this fix; tightening it further
+  //   would require tracking multi-cycle persistence and is a reasonable
+  //   follow-up, not done here.
   // ------------------------------------------------------------------
 
   private pendingSeedKey(address: string): string {
@@ -546,24 +599,86 @@ class DepositMonitorService {
         ),
         txHash:
           `bnb-diff:${wallet.address}:${currentBlock}`,
-      }
+        // Deliberately no blockNumber — see the note above processDeposit's
+        // asset branch: this signals "no real receipt to check".
+      },
+      currentBlock
+    );
+  }
+
+  /**
+   * Public entry point for anything OUTSIDE the cron scans that has
+   * independently observed a possible deposit — currently
+   * `workers/deposit.ts` (the queued/manual recheck path).
+   *
+   * This is the fix for the two-pipelines bug: there used to be a
+   * SECOND, hand-rolled credit implementation in workers/deposit.ts with
+   * its own (weaker, mismatched) dedup key, so the exact same real
+   * deposit could be credited once by the scanner and once by the queue
+   * worker without either one noticing. Now there is exactly one
+   * implementation — `processDeposit` / `claimAndCredit` — and every
+   * caller, cron or queue, goes through it.
+   *
+   * @param rawAmount Raw on-chain integer amount (wei), NOT a decimal.
+   * @param blockNumber Pass the real block the event/tx was mined in for a
+   *   USDT deposit, so confirmation depth can be measured; omit only for
+   *   the BNB balance-delta method.
+   */
+  async handleDepositCheck(
+    address: string,
+    asset: string,
+    txHash: string,
+    rawAmount: bigint,
+    from: string,
+    blockNumber?: number
+  ): Promise<void> {
+    const wallet = await this.getWalletByAddress(address);
+
+    if (!wallet) {
+      logger.error(`handleDepositCheck: no active wallet found for ${address}`);
+      return;
+    }
+
+    const provider = await blockchain.getProvider();
+    const currentBlock = await provider.getBlockNumber();
+
+    await this.processDeposit(
+      wallet,
+      asset,
+      { from, amount: rawAmount, txHash, blockNumber },
+      currentBlock
     );
   }
 
   // ------------------------------------------------------------------
-  // Deposit processing. Idempotency: (txHash, walletAddress) — never a
-  // global txHash check, so two wallets receiving transfers in the same
-  // tx are both credited. All sends route via the Chainstack TX RPC.
+  // Deposit processing.
+  //
+  // Idempotency across TWO layers:
+  //   1. `DepositMonitor` unique(txHash, address) — never a global txHash
+  //      check, so two wallets receiving transfers in the same tx are both
+  //      credited independently.
+  //   2. `Transaction.idempotencyKey` — the actual balance mutation only
+  //      ever happens inside `claimAndCredit`'s single `$transaction`,
+  //      keyed by hash(txHash:address). This is now the ONLY place in the
+  //      whole app allowed to credit a deposit — `workers/deposit.ts` calls
+  //      back into this same method rather than duplicating the logic with
+  //      a different (and previously mismatched) key.
+  //
+  // Confirmation gating: a USDT deposit is not credited on first sight.
+  // It's recorded as CONFIRMING with its current confirmation depth; only
+  // once it reaches REQUIRED_CONFIRMATIONS_USDT — verified against a FRESH
+  // receipt read at credit time, not the one from first sight — does it
+  // get atomically claimed (CONFIRMING -> CONFIRMED, guarded so only one
+  // caller ever wins) and credited. A transaction that reverted/vanished
+  // between first sight and maturity (reorg) is marked FAILED and never
+  // credited. All sends route via the Chainstack TX RPC.
   // ------------------------------------------------------------------
 
   private async processDeposit(
     wallet: MonitoredWallet,
     asset: string,
-    event: {
-      from: string;
-      amount: bigint;
-      txHash: string;
-    }
+    event: RawDepositEvent,
+    currentBlock: number
   ): Promise<void> {
     const decimals =
       ASSET_DECIMALS[asset] ?? 18;
@@ -593,22 +708,204 @@ class DepositMonitorService {
         },
       });
 
-    if (seen?.status === 'PROCESSED') {
+    // PROCESSED = already credited. CONFIRMED = claimed by the confirmation
+    // checker and being credited right now. Either way, nothing to do here.
+    if (seen?.status === 'PROCESSED' || seen?.status === 'CONFIRMED') {
+      return;
+    }
+
+    if (seen?.status === 'FAILED') {
+      // Previously proven invalid (reverted / reorged out). Never revive it.
       return;
     }
 
     /**
-     * Receipt verification: ERC20 Transfer logs can appear in failed
-     * transactions, so only successful txs are credited.
+     * Receipt verification for real on-chain events (USDT). ERC20 Transfer
+     * logs can appear in failed transactions, so only successful txs are
+     * ever considered. The BNB delta method has no real txHash (see
+     * checkNativeBalance) — calling getTransactionReceipt on its synthetic
+     * "bnb-diff:..." string would throw, so it's skipped for that path.
      */
-    const receipt =
-      await blockchain.getTransactionReceipt(
-        event.txHash
+    const isRealEvent = typeof event.blockNumber === 'number';
+
+    if (isRealEvent) {
+      const receipt = await blockchain.getTransactionReceipt(event.txHash);
+
+      if (!receipt || receipt.status !== 1) {
+        return;
+      }
+    }
+
+    const requiredConfirmations = asset === 'USDT' ? REQUIRED_CONFIRMATIONS_USDT : 1;
+
+    const confirmations = isRealEvent
+      ? Math.max(0, currentBlock - (event.blockNumber as number) + 1)
+      : requiredConfirmations; // BNB delta: no per-event depth to track, treat as immediately mature.
+
+    await prisma.depositMonitor.upsert({
+      where: {
+        txHash_address: {
+          txHash: event.txHash,
+          address: wallet.address,
+        },
+      },
+      create: {
+        address: wallet.address,
+        asset,
+        txHash: event.txHash,
+        amount,
+        confirmations,
+        requiredConfirmations,
+        status: 'CONFIRMING',
+      },
+      update: {
+        confirmations,
+      },
+    });
+
+    if (confirmations < requiredConfirmations) {
+      logger.info(
+        `Deposit ${event.txHash} (${wallet.address}) waiting on confirmations: ${confirmations}/${requiredConfirmations}`
       );
 
-    if (!receipt || receipt.status !== 1) {
+      return; // Matured later by checkPendingConfirmations().
+    }
+
+    const claimed = await prisma.depositMonitor.updateMany({
+      where: {
+        txHash: event.txHash,
+        address: wallet.address,
+        status: 'CONFIRMING',
+      },
+      data: { status: 'CONFIRMED', confirmations },
+    });
+
+    if (claimed.count === 0) {
+      // Another scan/check already claimed this exact row between our
+      // upsert and here — it's being (or has been) credited elsewhere.
       return;
     }
+
+    await this.claimAndCredit(wallet, asset, {
+      amount,
+      txHash: event.txHash,
+      from: event.from,
+    });
+  }
+
+  /**
+   * Re-checks every CONFIRMING deposit and matures/claims/credits or fails
+   * the ones that are ready. This is what actually advances confirmation
+   * depth over time for deposits that weren't already mature on first
+   * sight — `processDeposit` only checks depth ONCE, at the moment the
+   * event is first observed by a scan.
+   */
+  private async checkPendingConfirmations(): Promise<void> {
+    let pending;
+
+    try {
+      pending = await prisma.depositMonitor.findMany({
+        where: { status: 'CONFIRMING' },
+        take: 200,
+      });
+    } catch (err) {
+      logger.error('checkPendingConfirmations: failed to load pending rows:', err);
+      return;
+    }
+
+    if (pending.length === 0) return;
+
+    let currentBlock: number;
+
+    try {
+      const provider = await blockchain.getProvider();
+      currentBlock = await provider.getBlockNumber();
+    } catch (err) {
+      logger.warn('checkPendingConfirmations: could not read current block, retrying next tick:', this.getErrorMessage(err));
+      return;
+    }
+
+    for (const row of pending) {
+      try {
+        // BNB delta rows are created already-mature (requiredConfirmations=1
+        // met at insert time) and claimed inline by processDeposit, so any
+        // BNB row still CONFIRMING here means its inline claim raced and
+        // lost, or crashed between claiming and crediting — retry the claim.
+        const isRealEvent = row.asset === 'USDT';
+
+        if (isRealEvent) {
+          const receipt = await blockchain.getTransactionReceipt(row.txHash);
+
+          if (!receipt || receipt.status !== 1) {
+            await prisma.depositMonitor.updateMany({
+              where: { id: row.id, status: 'CONFIRMING' },
+              data: { status: 'FAILED' },
+            });
+
+            logger.warn(
+              `Deposit ${row.txHash} (${row.address}) no longer valid on-chain (reorg?) — marked FAILED, never credited.`
+            );
+
+            continue;
+          }
+
+          const confirmations = Math.max(0, currentBlock - receipt.blockNumber + 1);
+
+          if (confirmations < row.requiredConfirmations) {
+            await prisma.depositMonitor.updateMany({
+              where: { id: row.id, status: 'CONFIRMING' },
+              data: { confirmations },
+            });
+
+            continue;
+          }
+        }
+
+        // Atomic claim: only one process, one tick, ever moves a given row
+        // from CONFIRMING to CONFIRMED. A concurrent claim (another instance,
+        // or the inline check in processDeposit) loses this race harmlessly.
+        const claimed = await prisma.depositMonitor.updateMany({
+          where: { id: row.id, status: 'CONFIRMING' },
+          data: { status: 'CONFIRMED' },
+        });
+
+        if (claimed.count === 0) continue;
+
+        const wallet = await this.getWalletByAddress(row.address);
+
+        if (!wallet) {
+          logger.error(
+            `Confirmed deposit ${row.txHash} has no matching active wallet for ${row.address} — left CONFIRMED for manual review.`
+          );
+
+          continue;
+        }
+
+        await this.claimAndCredit(wallet, row.asset, {
+          amount: Number(row.amount),
+          txHash: row.txHash,
+          from: '',
+        });
+      } catch (err) {
+        logger.error(`checkPendingConfirmations failed for ${row.txHash}:`, err);
+      }
+    }
+  }
+
+  /**
+   * The ONLY place in the app that mutates `availableBalance` for a
+   * deposit. Called either immediately (deposit already mature at first
+   * sight) or later (matured by checkPendingConfirmations). By the time
+   * this runs, the caller has already atomically claimed the DepositMonitor
+   * row (CONFIRMING -> CONFIRMED), so this never runs twice for the same
+   * deposit even under concurrent scans/processes.
+   */
+  private async claimAndCredit(
+    wallet: MonitoredWallet,
+    asset: string,
+    event: { amount: number; txHash: string; from: string }
+  ): Promise<void> {
+    const amount = event.amount;
 
     /**
      * Fees: tiered flat fee + percentage platform fee + BNB gas
@@ -640,32 +937,25 @@ class DepositMonitorService {
 
     /**
      * Safety: never credit negative — if fees would swallow the whole
-     * deposit, skip it entirely (it stays on-chain, user keeps it there)
+     * deposit, skip it entirely (it stays on-chain, user keeps it there).
+     * Roll the claimed row back so it doesn't get stuck CONFIRMED forever.
      */
     if (netAmount <= 0) {
       logger.warn(
         `Deposit ${amount} ${asset} below fee floor (${totalFee}) — ignored, not credited`
       );
 
-      return;
-    }
-
-    await prisma.depositMonitor.upsert({
-      where: {
-        txHash_address: {
+      await prisma.depositMonitor.updateMany({
+        where: {
           txHash: event.txHash,
           address: wallet.address,
+          status: 'CONFIRMED',
         },
-      },
-      create: {
-        address: wallet.address,
-        asset,
-        txHash: event.txHash,
-        amount,
-        status: 'CONFIRMING',
-      },
-      update: {},
-    });
+        data: { status: 'FAILED' },
+      });
+
+      return;
+    }
 
     let feeRowId = '';
 
@@ -983,4 +1273,4 @@ function sleep(
 
 export const depositMonitor =
   new DepositMonitorService();
-                              
+      
