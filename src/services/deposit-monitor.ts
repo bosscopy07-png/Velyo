@@ -45,10 +45,26 @@ const SCAN_LOCK_KEY = 'monitor:scan:lock';
 const SCAN_LOCK_TTL_SEC = 240;
 
 /**
- * Pending gas-seed ledger TTL is owned by services/gas.ts (same Redis
- * key, `monitor:seed:pending:<address>`). This module only SUBTRACTS the
- * ledger in checkNativeBalance — all seeding goes through ensureGas().
+ * BNB balance sweep pacing — bounded concurrency with a small delay,
+ * comfortably under a 15 req/s provider ceiling, with an extra
+ * backoff pause whenever a batch hits a rate-limit error.
  */
+const BNB_CHECK_CONCURRENCY = 4;
+const BNB_CHECK_BATCH_DELAY_MS = 300;
+const BNB_RATE_LIMIT_BACKOFF_MS = 2000;
+
+/**
+ * Pending gas-seed ledger TTL. When VEYLO seeds BNB gas into a user
+ * wallet before forwarding USDT fees, the seed amount is recorded in
+ * Redis and consumed by the next balance sweep so the seed is never
+ * misread as a user BNB deposit. 600s comfortably covers
+ * seed-then-forward latency.
+ *
+ * Owned by services/gas.ts (same Redis key, `monitor:seed:pending:<address>`)
+ * since the ensureGas() refactor — this module only SUBTRACTS the ledger
+ * in checkNativeBalance; all seeding goes through ensureGas().
+ */
+const SEED_LEDGER_TTL_SEC = 600;
 
 /**
  * Required confirmation depth before a Transfer-log-based (USDT) deposit
@@ -61,6 +77,15 @@ const SCAN_LOCK_TTL_SEC = 240;
  * a reorg reverting a deposit after it's already been credited.
  */
 const REQUIRED_CONFIRMATIONS_USDT = 15;
+
+/**
+ * Minimum deposit worth crediting, per asset. Anything smaller is dust
+ * and is ignored (see processDeposit's minAmount check).
+ */
+const MIN_DEPOSIT: Record<string, number> = {
+  BNB: 0.0001,
+  USDT: config.MINIMUM_AMOUNT_USD,
+};
 
 /**
  * Tiered flat fee: small deposits (< tier) pay the reduced flat fee so
@@ -190,8 +215,7 @@ class DepositMonitorService {
 
     return wallet as unknown as MonitoredWallet;
   }
-
-  // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
   // BIG scan — every 60s (second 0) — read pool, active wallets.
   // ------------------------------------------------------------------
 
@@ -367,8 +391,9 @@ class DepositMonitorService {
     } finally {
       await this.releaseScanLock();
     }
-}
-        // ------------------------------------------------------------------
+  }
+
+  // ------------------------------------------------------------------
   // SMALL scan — every 60s at second 30 — getblock.io, last 5 blocks.
   // Fast idempotent safety net for ALL wallets. Does NOT advance the
   // cursor and does NOT touch BNB balances.
@@ -458,9 +483,10 @@ class DepositMonitorService {
   //   from "user BNB deposit", so the seed would be credited to the
   //   user as a fake deposit.
   //
-  //   Fix: a Redis pending-seed ledger, owned by services/gas.ts.
-  //   ensureGas() records the intended seed BEFORE broadcasting and
-  //   this sweep subtracts + consumes the ledger.
+  //   Fix: a Redis pending-seed ledger. services/gas.ts (ensureGas)
+  //   records the intended seed BEFORE broadcasting; this sweep
+  //   subtracts the recorded seeds from the delta and consumes the
+  //   ledger.
   //
   //   Properties:
   //    - seed + real deposit in the same window → remainder math still
@@ -515,7 +541,7 @@ class DepositMonitorService {
 
     /**
      * Subtract operator gas seeds recorded since the previous
-     * snapshot, then consume the ledger. Key format owned by gas.ts.
+     * snapshot, then consume the ledger.
      */
     const seedKey =
       pendingGasSeedKey(wallet.address);
@@ -530,7 +556,7 @@ class DepositMonitorService {
 
     if (pendingSeeds > 0) {
       await redis.incrbyfloat(seedKey, -pendingSeeds);
-      await redis.expire(seedKey, 600);
+      await redis.expire(seedKey, SEED_LEDGER_TTL_SEC);
     }
 
     const adjustedDiff =
@@ -564,7 +590,8 @@ class DepositMonitorService {
   /**
    * Public entry point for anything OUTSIDE the cron scans that has
    * independently observed a possible deposit — currently
-   * `workers/deposit.ts` (the queued/manual recheck path).
+   * `workers/deposit.ts` (the queued/manual recheck path) and
+   * `balance-sync.ts` (the self-heal path feeding missed events back in).
    *
    * This is the fix for the two-pipelines bug: there used to be a
    * SECOND, hand-rolled credit implementation in workers/deposit.ts with
@@ -604,8 +631,7 @@ class DepositMonitorService {
       currentBlock
     );
   }
-
-  // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
   // Deposit processing.
   //
   // Idempotency across TWO layers:
@@ -997,16 +1023,19 @@ class DepositMonitorService {
     );
 
     /**
-     * Fee forwarding. GAS FIX: seeding now goes through ensureGas(), which
-     * (a) budgets the CURRENT network cost (the old static 0.000002 BNB
-     * was below the real ~0.0000026 BNB tx cost) and (b) WAITS for the
-     * seed to mine before the USDT forward is broadcast — the old code
-     * fired both back-to-back, so the forward was validated against a
-     * confirmed balance that didn't include the seed (INSUFFICIENT_FUNDS)
-     * and the fee stayed pending forever. The pending-seed ledger is
-     * recorded inside ensureGas (same Redis key this monitor subtracts).
+     * Fee forwarding. GAS FIX (ensureGas):
+     *  (a) budgets the CURRENT network cost — the old static
+     *      0.000002 BNB (FORWARD_GAS_SEED) fell below the real
+     *      ~0.0000026 BNB tx cost, so the forward always failed;
+     *  (b) WAITS for the seed to mine before the USDT forward is
+     *      broadcast — the old code fired both back-to-back, so the
+     *      forward validated against a confirmed balance that didn't
+     *      include the seed (INSUFFICIENT_FUNDS) and the fee stayed
+     *      pending forever.
+     * The pending-seed ledger is recorded inside ensureGas (same Redis
+     * key this monitor subtracts in checkNativeBalance).
      */
-        if (
+    if (
       platformFee > 0 &&
       asset === 'USDT'
     ) {
@@ -1188,3 +1217,4 @@ function sleep(
 
 export const depositMonitor =
   new DepositMonitorService();
+  
