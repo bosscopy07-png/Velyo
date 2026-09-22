@@ -161,7 +161,7 @@ class WalletService {
         { availableBalance: unknown; lockedBalance: unknown }[]
       >`
         SELECT "availableBalance", "lockedBalance"
-        FROM "Balance"
+        FROM "balances"
         WHERE "userId" = ${userId} AND "asset" = ${asset}
         FOR UPDATE
       `;
@@ -208,4 +208,5 @@ class WalletService {
 }
 
 export const walletService = new WalletService();
-  
+
+      
