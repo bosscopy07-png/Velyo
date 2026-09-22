@@ -31,9 +31,15 @@ import { computeOutstandingEscrow } from '../src/services/giveaway';
 
 const TOLERANCE = 0.000001;
 
+/**
+ * Only ACTIVE/FULL giveaways represent genuinely ongoing escrow. A
+ * CANCELLED/EXPIRED giveaway's correct resting `outstanding` is always 0 —
+ * if it isn't, that's a missed refund (run scripts/sweep-terminal-giveaway-escrow.ts
+ * first), not money that should still count as "locked".
+ */
 async function correctLockedBalance(userId: string, asset: string): Promise<number> {
   const giveaways = await prisma.giveaway.findMany({
-    where: { creatorId: userId, asset },
+    where: { creatorId: userId, asset, status: { in: ['ACTIVE', 'FULL'] } },
     select: { id: true },
   });
 
@@ -50,6 +56,19 @@ async function repairUser(userId: string, label: string, apply: boolean): Promis
   let fixed = 0;
   let skipped = 0;
   let unchanged = 0;
+
+  const terminalWithOutstanding = await prisma.giveaway.findMany({
+    where: { creatorId: userId, status: { in: ['CANCELLED', 'EXPIRED'] } },
+  });
+  for (const g of terminalWithOutstanding) {
+    const { outstanding } = await computeOutstandingEscrow(g.id);
+    if (outstanding > TOLERANCE) {
+      console.warn(
+        `⚠ ${label}: terminal giveaway ${g.id} (${g.status}) still has ${outstanding} ${g.asset} unswept. ` +
+          `Run scripts/sweep-terminal-giveaway-escrow.ts FIRST, or this repair's numbers will be wrong.`
+      );
+    }
+  }
 
   const balances = await prisma.balance.findMany({ where: { userId } });
 
@@ -188,4 +207,4 @@ main()
   .finally(async () => {
     await prisma.$disconnect();
   });
-      
+                                    
