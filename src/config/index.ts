@@ -56,7 +56,11 @@ const envSchema = z.object({
   ENABLE_DEPOSITS: z.string().default('true').transform((s) => s === 'true'),
   ENABLE_GIVEAWAYS: z.string().default('true').transform((s) => s === 'true'),
   ENABLE_PAYOUTS: z.string().default('true').transform((s) => s === 'true'),
+  // Initial default only — the live maintenance state is stored in the database
+  // (SystemConfig 'maintenance_mode') and toggled from the admin panel.
   MAINTENANCE_MODE: z.string().default('false').transform((s) => s === 'true'),
+  // Shown in the maintenance notice so users can follow updates.
+  COMMUNITY_CHANNEL_URL: z.string().url().default('https://t.me/VeyloNetwork'),
 });
 
 export const config = envSchema.parse(process.env);
@@ -92,4 +96,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
-  
+
