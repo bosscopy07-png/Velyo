@@ -1,6 +1,13 @@
-import { Context } from 'telegraf';
+import { Context, Markup } from 'telegraf';
 import { config } from '../../config';
-import { checkRateLimit } from '../../services/redis';
+import { checkRateLimit, getUserSession, clearUserSession } from '../../services/redis';
+import { maintenance } from '../../services/maintenance';
+import {
+  MaintenanceCheckInput,
+  isBlockedDuringMaintenance,
+  shouldClearSessionOnBlock,
+} from '../../services/maintenance-policy';
+import { formatMaintenanceMessage, MAINTENANCE_ALERT_TEXT } from '../messages';
 import { logger } from '../../utils/logger';
 import { e } from '../../utils/emoji';
 
@@ -12,14 +19,11 @@ export async function securityMiddleware(ctx: Context, next: () => Promise<void>
 
   const telegramId = from.id.toString();
 
-  // Maintenance mode check (admins bypass)
-  if (config.MAINTENANCE_MODE && !ADMIN_IDS.has(telegramId)) {
-    await ctx.reply(
-      `${e('warning')} <b>MAINTENANCE MODE</b>\n\n` +
-      `VEYLO is currently under maintenance. Please check back later.`,
-      { parse_mode: 'HTML' }
-    );
-    return;
+  // Maintenance mode (admins bypass). State comes from the database (cached
+  // for ~2s), NOT from the environment. Runs first so stale inline keyboards,
+  // old wizard sessions and deep links are all re-checked on every update.
+  if (!ADMIN_IDS.has(telegramId) && (await maintenance.isEnabled())) {
+    if (await blockedByMaintenance(ctx, telegramId)) return;
   }
 
   // Rate limiting
@@ -47,3 +51,54 @@ export async function securityMiddleware(ctx: Context, next: () => Promise<void>
 export function isAdmin(ctx: Context): boolean {
   return ADMIN_IDS.has(ctx.from?.id.toString() || '');
 }
+
+
+/**
+ * Returns true (and answers the user) when this non-admin update must not run
+ * because maintenance is ON. Read-only actions return false and proceed.
+ */
+async function blockedByMaintenance(ctx: Context, telegramId: string): Promise<boolean> {
+  const cbData = (ctx.callbackQuery as { data?: string } | undefined)?.data;
+  const text = ctx.message && 'text' in ctx.message ? ctx.message.text : undefined;
+
+  let input: MaintenanceCheckInput = { type: 'other' };
+  let sessionState: string | null = null;
+
+  if (ctx.callbackQuery) {
+    input = { type: 'callback', data: cbData ?? '' };
+  } else if (typeof text === 'string') {
+    try {
+      const session = await getUserSession(telegramId);
+      sessionState = (session?.state as string | undefined) ?? null;
+    } catch (err) {
+      // Fail closed while maintenance is active: treat as "mid-flow".
+      logger.warn(`Session read failed during maintenance for ${telegramId}: ${(err as Error).message}`);
+      sessionState = 'unknown';
+    }
+    input = { type: 'text', text, sessionState };
+  }
+
+  if (!isBlockedDuringMaintenance(input)) return false;
+
+  logger.info(`[maintenance] blocked ${input.type} from ${telegramId}`);
+
+  try {
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery(MAINTENANCE_ALERT_TEXT, { show_alert: true });
+      return true;
+    }
+
+    if (shouldClearSessionOnBlock(sessionState)) {
+      await clearUserSession(telegramId);
+    }
+    try { await ctx.deleteMessage(); } catch { /* keep chat tidy, best effort */ }
+
+    await ctx.reply(formatMaintenanceMessage(), {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([[Markup.button.url('📢 Updates', config.COMMUNITY_CHANNEL_URL)]]),
+    });
+  } catch (err) {
+    logger.warn(`Failed to send maintenance notice to ${telegramId}: ${(err as Error).message}`);
+  }
+  return true;
+  }
