@@ -11,6 +11,8 @@ import { logger } from '../../utils/logger';
 import { isValidEVMAddress, normalizeAddress, isValidAmount, hashIdempotencyKey } from '../../utils/validation';
 import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
+import { assertUserOperational } from '../../services/maintenance';
+import { formatMaintenanceMessage } from '../messages';
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
 
@@ -213,6 +215,10 @@ export function registerTextHandlers(bot: any): void {
             return;
           }
 
+          // Maintenance gate — before the balance credit (defence in depth;
+          // the security middleware already blocks this step).
+          await assertUserOperational(user.id);
+
           await prisma.$transaction(async (tx) => {
             await tx.codeRedemption.create({
               data: { codeId: redeemCode.id, userId: user.id, amount: Number(redeemCode.rewardAmount) },
@@ -378,6 +384,12 @@ export function registerTextHandlers(bot: any): void {
           await clearUserSession(telegramId);
       }
     } catch (err) {
+      if ((err as { code?: string }).code === 'MAINTENANCE_ACTIVE') {
+        // Toggled between the middleware check and the guarded step — nothing was mutated.
+        await clearUserSession(telegramId);
+        await editMainMessage(ctx, formatMaintenanceMessage(), backKeyboard('main'));
+        return;
+      }
       logger.error('Text handler error:', err);
       await editMainMessage(
         ctx,
@@ -512,24 +524,4 @@ export function registerTextHandlers(bot: any): void {
       asset: claim.giveaway.asset,
     });
 
-    await editMainMessage(
-      ctx,
-      `${e('deposit')} <b>SEND YOUR ${claim.giveaway.asset} BEP20 WALLET ADDRESS</b>\n\n` +
-      `Type or paste the address below.\n\n` +
-      `⚠️ Must support BNB Smart Chain (BEP20)`,
-      backKeyboard('main')
-    );
-    await ctx.answerCbQuery();
-  });
-
-  bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
-    const from = ctx.from!;
-    await clearUserSession(from.id.toString());
-    await editMainMessage(
-      ctx,
-      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
-      backKeyboard('main')
-    );
-    await ctx.answerCbQuery();
-  });
-}
+   
