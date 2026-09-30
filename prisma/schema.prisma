@@ -185,7 +185,7 @@ model PlatformFee {
   asset         String
   amount        Decimal     @db.Decimal(36, 18)
   feeWallet     String
-  sweptAt       DateTime?   // ← NEW: set when the admin sweep collects this fee
+  sweptAt       DateTime?   // 鈫� NEW: set when the admin sweep collects this fee
   createdAt     DateTime    @default(now())
 
   @@index([transactionId])
@@ -309,4 +309,51 @@ enum MonitorStatus {
   CONFIRMED
   PROCESSED
   FAILED
+}
+
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ BROADCASTS 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+model Broadcast {
+  id            String          @id @default(cuid())
+  createdBy     String          // admin telegramId
+  text          String          @db.Text
+  entities      Json?           // Telegram formatting entities (bold, links, ...)
+  status        BroadcastStatus @default(SENDING)
+  expireMinutes Int             // hard cap: delete even if never opened
+  targetCount   Int             @default(0)
+  sentCount     Int             @default(0)
+  failedCount   Int             @default(0)
+  createdAt     DateTime        @default(now())
+  finishedAt    DateTime?
+
+  deliveries BroadcastDelivery[]
+
+  @@index([createdAt])
+  @@map("broadcasts")
+}
+
+model BroadcastDelivery {
+  id          String    @id @default(cuid())
+  broadcastId String
+  broadcast   Broadcast @relation(fields: [broadcastId], references: [id])
+  telegramId  String
+  chatId      String
+  messageId   Int
+  sentAt      DateTime  @default(now())
+  openedAt    DateTime? // first time the user interacted with the bot after receiving it
+  deleteAt    DateTime  // when the message is removed (hard cap, pulled earlier when opened)
+  deletedAt   DateTime?
+  attempts    Int       @default(0)
+
+  @@index([broadcastId])
+  @@index([telegramId, openedAt, deletedAt])
+  @@index([deletedAt, deleteAt])
+  @@map("broadcast_deliveries")
+}
+
+enum BroadcastStatus {
+  SENDING
+  COMPLETED
+  INTERRUPTED
+  RECALLED
 }
