@@ -7,6 +7,9 @@ import { handleClaim } from './commands/claim';
 import { registerCallbacks } from './callbacks';
 import { registerTextHandlers } from './handlers/text';
 import { registerAdminCommands } from '../admin/commands';
+import { registerBroadcastAdmin } from '../admin/broadcast';
+import { registerUserAdmin } from '../admin/users';
+import { broadcastService } from '../services/broadcast';
 import { depositMonitor } from '../services/deposit-monitor';
 import { claimExpiry } from '../services/claim-expiry';
 import { balanceSync } from '../services/balance-sync';
@@ -31,6 +34,9 @@ bot.command('claim', handleClaim);
 registerCallbacks(bot);
 registerTextHandlers(bot);
 registerAdminCommands(bot);
+registerBroadcastAdmin(bot);
+registerUserAdmin(bot);
+broadcastService.start(bot.telegram);
 
 // Error handling
 bot.catch((err: unknown, ctx: any) => {
