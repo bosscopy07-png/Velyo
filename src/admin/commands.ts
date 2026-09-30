@@ -11,6 +11,7 @@ import { blockchain } from '../services/blockchain';
 import { walletService } from '../services/wallet';
 import { config } from '../config';
 import { formatAddress } from '../utils/validation';
+import { maintenance } from '../services/maintenance';
 
 /** 0.000002 BNB = 2×10^12 wei (2,000,000,000,000) */
 const SWEEP_GAS_SEED = 2000000000000n;
@@ -57,6 +58,45 @@ function pager(prefix: string, page: number, totalPages: number, totalLabel: str
   row.push(Markup.button.callback(`${page + 1}/${totalPages} · ${totalLabel}`, `${prefix}:noop`));
   if (page < totalPages - 1) row.push(Markup.button.callback('Next ▶️', `${prefix}:${page + 1}`));
   return row;
+}
+
+function fmtUtc(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return `${d.toISOString().replace('T', ' ').slice(0, 16)} UTC`;
+}
+
+async function renderMaintenancePanel(ctx: Context, notice?: string): Promise<void> {
+  // Force a fresh DB read so the admin always sees the real persisted state.
+  const st = await maintenance.getState({ force: true });
+
+  let text =
+    `🔧 <b>MAINTENANCE MODE</b>\n${DIVIDER}\n\n` +
+    (notice ? `${notice}\n\n` : '') +
+    `Status: ${st.enabled ? '🔴 <b>ENABLED</b>' : '🟢 <b>DISABLED</b>'}\n`;
+
+  if (st.enabled && st.enabledAt) {
+    text += `Enabled: ${fmtUtc(st.enabledAt)}${st.enabledBy ? ` by <code>${st.enabledBy}</code>` : ''}\n`;
+  }
+  text += `Last change: ${fmtUtc(st.changedAt)}${st.changedBy ? ` by <code>${st.changedBy}</code>` : ''}\n\n`;
+  text += st.enabled
+    ? `<i>Users cannot create/claim giveaways, deposit, redeem codes or confirm payouts. Balances, history and help stay readable. Admins are unaffected. Background deposit monitoring and already-queued payouts keep running.</i>`
+    : `<i>Enabling blocks state-changing user actions only. Admins are unaffected.</i>`;
+
+  await editMainMessage(
+    ctx,
+    text,
+    Markup.inlineKeyboard([
+      [
+        st.enabled
+          ? Markup.button.callback('✅ Disable Maintenance', 'admin:maintenance:set:off')
+          : Markup.button.callback('🔧 Enable Maintenance', 'admin:maintenance:set:on'),
+      ],
+      [Markup.button.callback(`${eb('refresh')} Refresh`, 'admin:maintenance')],
+      [Markup.button.callback(`${eb('back')} Back`, 'admin:emergency')],
+    ])
+  );
 }
 
 // ─────────────────────────── REGISTRATION ───────────────────────────
@@ -353,10 +393,49 @@ export function registerAdminCommands(bot: any): void {
     logger.warn(`Admin ${ctx.from!.id} paused ${feature}`);
   });
 
+  // ─────────────────────────── MAINTENANCE MODE ───────────────────────────
+
   bot.action('admin:maintenance', async (ctx: Context) => {
-    if (!isAdmin(ctx)) return;
-    await ctx.answerCbQuery('Maintenance mode toggled!');
-    logger.warn(`Admin ${ctx.from!.id} toggled maintenance mode`);
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await ctx.answerCbQuery();
+    await renderMaintenancePanel(ctx);
+  });
+
+  bot.action(/^admin:maintenance:set:(on|off)$/, async (ctx: Context) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    const enable = (ctx as any).match[1] === 'on';
+    const adminId = ctx.from!.id.toString();
+
+    try {
+      // Persists to the DB + writes the audit log in one transaction, then
+      // re-reads the DB to confirm. Throws if anything fails.
+      const { changed } = await maintenance.setEnabled(enable, adminId);
+      logger.warn(
+        `Admin ${adminId} ${enable ? 'ENABLED' : 'DISABLED'} maintenance mode${changed ? '' : ' (no change)'}`
+      );
+      await ctx.answerCbQuery(enable ? '🔧 Maintenance Mode ENABLED' : '✅ Maintenance Mode DISABLED', {
+        show_alert: true,
+      });
+      await renderMaintenancePanel(
+        ctx,
+        enable
+          ? `${e('warning')} <b>Maintenance Mode ENABLED</b> — users are now blocked from state-changing actions.`
+          : `${e('check')} <b>Maintenance Mode DISABLED</b> — normal operations resumed.`
+      );
+    } catch (err) {
+      logger.error(`Maintenance toggle failed for admin ${adminId}: ${(err as Error).message}`);
+      try {
+        await ctx.answerCbQuery('Failed to change maintenance mode. State was NOT changed — check logs.', {
+          show_alert: true,
+        });
+      } catch { /* ignore */ }
+    }
   });
 
   bot.action('admin:back', async (ctx: Context) => {
@@ -767,4 +846,5 @@ async function getAdminStats() {
     pendingPayouts,
   };
     }
-    
+
+  
