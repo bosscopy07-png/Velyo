@@ -1,4 +1,5 @@
 import { prisma } from '../database';
+import { assertUserOperational } from './maintenance';
 import { redis, acquireLock, releaseLock } from './redis';
 import { blockchain } from './blockchain';
 import { walletService } from './wallet';
@@ -133,6 +134,10 @@ class GiveawayService {
     maxClaimers: number;
     expiresAt?: Date;
   }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number }> {
+    // Maintenance gate — MUST stay first: before gas seeding, wallet creation
+    // or any balance/ledger write. Throws a user-safe MaintenanceError.
+    await assertUserOperational(data.creatorId);
+
     const amountPerUser = data.totalAmount / data.maxClaimers;
     const secureCode = generateSecureCode(20);
     // Client-generated ID so gas can be seeded BEFORE any DB write — if the
@@ -445,7 +450,17 @@ class GiveawayService {
     }
   }
 
-  async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+    // Maintenance gate — before the claim lock and any claim/ledger write.
+    try {
+      await assertUserOperational(userId);
+    } catch (err) {
+      if ((err as { code?: string }).code === 'MAINTENANCE_ACTIVE') {
+        return { success: false, reason: '🔧 VEYLO is under maintenance. Please try again later.' };
+      }
+      throw err;
+    }
+
     const lockKey = `giveaway:claim:${giveawayId}`;
     const lockToken = await acquireLock(lockKey, 5000);
 
