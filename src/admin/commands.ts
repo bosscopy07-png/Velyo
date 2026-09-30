@@ -81,8 +81,8 @@ async function renderMaintenancePanel(ctx: Context, notice?: string): Promise<vo
   }
   text += `Last change: ${fmtUtc(st.changedAt)}${st.changedBy ? ` by <code>${st.changedBy}</code>` : ''}\n\n`;
   text += st.enabled
-    ? `<i>Users cannot create/claim giveaways, deposit, redeem codes or confirm payouts. Balances, history and help stay readable. Admins are unaffected. Background deposit monitoring and already-queued payouts keep running.</i>`
-    : `<i>Enabling blocks state-changing user actions only. Admins are unaffected.</i>`;
+    ? `<i>Every button a user taps (except Back) shows the maintenance screen with a Back button and the channel link. Admins are unaffected. Background deposit monitoring and already-queued payouts keep running.</i>`
+    : `<i>Enabling blocks all user actions (Back + channel link only). Admins are unaffected.</i>`;
 
   await editMainMessage(
     ctx,
@@ -425,7 +425,7 @@ export function registerAdminCommands(bot: any): void {
       await renderMaintenancePanel(
         ctx,
         enable
-          ? `${e('warning')} <b>Maintenance Mode ENABLED</b> — users are now blocked from state-changing actions.`
+          ? `${e('warning')} <b>Maintenance Mode ENABLED</b> — users now only see the maintenance screen (Back + channel link).`
           : `${e('check')} <b>Maintenance Mode DISABLED</b> — normal operations resumed.`
       );
     } catch (err) {
@@ -478,8 +478,8 @@ export function registerAdminCommands(bot: any): void {
       ])
     );
   });
-          }
-      // ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
+}
+// ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
 
 async function renderUsersPage(ctx: Context, page: number): Promise<void> {
   const totalUsers = await prisma.user.count();
@@ -846,5 +846,3 @@ async function getAdminStats() {
     pendingPayouts,
   };
     }
-
-  
