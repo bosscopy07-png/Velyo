@@ -1,4 +1,4 @@
-import { Context, Markup } from 'telegraf';
+import { Context } from 'telegraf';
 import { config } from '../../config';
 import { checkRateLimit, getUserSession, clearUserSession } from '../../services/redis';
 import { maintenance } from '../../services/maintenance';
@@ -7,7 +7,9 @@ import {
   isBlockedDuringMaintenance,
   shouldClearSessionOnBlock,
 } from '../../services/maintenance-policy';
-import { formatMaintenanceMessage, MAINTENANCE_ALERT_TEXT } from '../messages';
+import { formatMaintenanceMessage } from '../messages';
+import { maintenanceKeyboard } from '../keyboards/main';
+import { editMainMessage } from '../utils/editMainMessage';
 import { logger } from '../../utils/logger';
 import { e } from '../../utils/emoji';
 
@@ -52,10 +54,9 @@ export function isAdmin(ctx: Context): boolean {
   return ADMIN_IDS.has(ctx.from?.id.toString() || '');
 }
 
-
 /**
  * Returns true (and answers the user) when this non-admin update must not run
- * because maintenance is ON. Read-only actions return false and proceed.
+ * because maintenance is ON. Only the Back button proceeds.
  */
 async function blockedByMaintenance(ctx: Context, telegramId: string): Promise<boolean> {
   const cbData = (ctx.callbackQuery as { data?: string } | undefined)?.data;
@@ -84,7 +85,10 @@ async function blockedByMaintenance(ctx: Context, telegramId: string): Promise<b
 
   try {
     if (ctx.callbackQuery) {
-      await ctx.answerCbQuery(MAINTENANCE_ALERT_TEXT, { show_alert: true });
+      // Stop the loading spinner silently, then turn the tapped message
+      // itself into the maintenance screen (edit, never a new message).
+      await ctx.answerCbQuery().catch(() => undefined);
+      await showMaintenanceScreen(ctx);
       return true;
     }
 
@@ -93,12 +97,30 @@ async function blockedByMaintenance(ctx: Context, telegramId: string): Promise<b
     }
     try { await ctx.deleteMessage(); } catch { /* keep chat tidy, best effort */ }
 
-    await ctx.reply(formatMaintenanceMessage(), {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([[Markup.button.url('📢 Updates', config.COMMUNITY_CHANNEL_URL)]]),
-    });
+    await showMaintenanceScreen(ctx);
   } catch (err) {
     logger.warn(`Failed to send maintenance notice to ${telegramId}: ${(err as Error).message}`);
   }
   return true;
+}
+
+function isNotModified(err: unknown): boolean {
+  const d = (err as any)?.response?.description ?? (err as Error)?.message ?? '';
+  return typeof d === 'string' && d.toLowerCase().includes('not modified');
+}
+
+/** Edits the tapped message into the maintenance screen (Back + channel link). */
+async function showMaintenanceScreen(ctx: Context): Promise<void> {
+  const text = formatMaintenanceMessage();
+  const keyboard = maintenanceKeyboard();
+  const extra = { parse_mode: 'HTML' as const, reply_markup: keyboard.reply_markup };
+
+  if (ctx.callbackQuery) {
+    try { await ctx.editMessageCaption(text, extra); return; }
+    catch (err) { if (isNotModified(err)) return; }
+    try { await ctx.editMessageText(text, extra); return; }
+    catch (err) { if (isNotModified(err)) return; }
   }
+  // Text update or tapped message not editable: edit the stored main message.
+  await editMainMessage(ctx, text, keyboard);
+      }
