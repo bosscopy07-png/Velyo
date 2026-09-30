@@ -13,6 +13,8 @@ import { backKeyboard, confirmCancelKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
 import { assertUserOperational } from '../../services/maintenance';
 import { formatMaintenanceMessage } from '../messages';
+import { handleBroadcastDraft } from '../../admin/broadcast';
+import { handleUserSearch } from '../../admin/users';
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
 
@@ -295,38 +297,23 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
-        // === ADMIN BROADCAST ===
+        // === ADMIN BROADCAST (compose → preview → send lives in admin/broadcast.ts) ===
         case 'admin_broadcast': {
           if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
             await clearUserSession(telegramId);
             return;
           }
+          await handleBroadcastDraft(ctx);
+          break;
+        }
 
-          const users = await prisma.user.findMany({
-            where: { chatId: { not: null } },
-            select: { chatId: true },
-          });
-
-          let sent = 0;
-          let failed = 0;
-          for (const u of users) {
-            try {
-              await ctx.telegram.sendMessage(u.chatId!, text);
-              sent++;
-            } catch {
-              failed++;
-            }
-            await new Promise((r) => setTimeout(r, 50));
+        // === ADMIN: FIND USER (ID / @username / name / wallet) ===
+        case 'admin_search_user': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
           }
-
-          await clearUserSession(telegramId);
-          await editMainMessage(
-            ctx,
-            `${e('check')} <b>BROADCAST COMPLETE</b>\n${DIVIDER}\n\n` +
-            `${e('people')} Delivered: <b>${sent}</b>\n` +
-            `${e('cancel')} Failed/blocked: <b>${failed}</b>`,
-            backKeyboard('admin')
-          );
+          await handleUserSearch(ctx);
           break;
         }
 
@@ -531,19 +518,4 @@ export function registerTextHandlers(bot: any): void {
       `⚠️ Must support BNB Smart Chain (BEP20)`,
       backKeyboard('main')
     );
-    await ctx.answerCbQuery();
-  });
-
-  bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
-    const from = ctx.from!;
-    await clearUserSession(from.id.toString());
-    await editMainMessage(
-      ctx,
-      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
-      backKeyboard('main')
-    );
-    await ctx.answerCbQuery();
-  });
-}
-
-   
+    await ctx.answer
