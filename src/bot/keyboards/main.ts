@@ -1,5 +1,6 @@
 import { Markup } from 'telegraf';
 import { eb } from '../../utils/emoji';
+import { config } from '../../config';
 
 // mainKeyboard is now a function — pass isAdmin to reveal the Admin button
 export const mainKeyboard = (isAdmin = false) => {
@@ -78,4 +79,9 @@ export const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback(`${eb('people')} Broadcast`, 'admin:broadcast')],
   [Markup.button.callback(`${eb('back')} Back`, 'main')],
 ]);
-  
+
+/** Maintenance screen: Back (to main menu) + channel link. Nothing else. */
+export const maintenanceKeyboard = () => Markup.inlineKeyboard([
+  [Markup.button.callback(`${eb('back')} Back`, 'main')],
+  [Markup.button.url('📢 Join our channel', config.COMMUNITY_CHANNEL_URL)],
+]);
