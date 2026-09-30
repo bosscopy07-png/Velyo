@@ -2,28 +2,18 @@
  * Maintenance policy — decides which non-admin updates are blocked while
  * maintenance is ON. Pure (no I/O) so it is trivially testable.
  *
- * Callbacks are DEFAULT-DENY: only an explicit read-only allow-list passes.
- * That way any future money-moving button is protected automatically, and
- * stale inline keyboards (opened before maintenance began) are blocked too.
+ * Callbacks are DEFAULT-DENY: only the Back button passes. Any button —
+ * including future ones and stale keyboards opened before maintenance began —
+ * is blocked automatically.
  */
 
-/** Read-only callback actions that stay available during maintenance. */
-const READ_ONLY_CALLBACKS: RegExp[] = [
-  /^main$/,
-  /^wallet$/,
-  /^wallet:refresh$/,
-  /^wallet:copy:(BNB|USDT)$/,
-  /^wallet:check:(BNB|USDT)$/,
-  /^wallet:history$/,
-  /^history$/,
-  /^account$/,
-  /^help$/,
-  /^giveaway$/, // menu only — every creation step behind it is blocked
-  /^giveaway:mine$/,
-  /^giveaway:stats:.+$/,
-  /^giveaway:copy:.+$/,
-  /^payout:cancel:.+$/, // only clears the user's own pending session
-];
+/**
+ * Callback actions that stay available during maintenance.
+ * ONLY the Back button (`main`) — it returns the user to the main menu.
+ * Every other button (wallet, history, account, help, giveaway, ...) is
+ * replaced by the maintenance screen until maintenance is switched OFF.
+ */
+const ALLOWED_CALLBACKS: RegExp[] = [/^main$/];
 
 export type MaintenanceCheckInput =
   | { type: 'callback'; data: string }
@@ -33,7 +23,7 @@ export type MaintenanceCheckInput =
 export function isBlockedDuringMaintenance(input: MaintenanceCheckInput): boolean {
   switch (input.type) {
     case 'callback':
-      return !READ_ONLY_CALLBACKS.some((re) => re.test(input.data));
+      return !ALLOWED_CALLBACKS.some((re) => re.test(input.data));
 
     case 'text': {
       const text = input.text.trim();
@@ -48,8 +38,6 @@ export function isBlockedDuringMaintenance(input: MaintenanceCheckInput): boolea
       // Anything else is free text. It only does something if the user is
       // mid-flow (giveaway wizard, redeem code, payout address...) — and every
       // such flow is state-changing, so block it whenever a session exists.
-      // (Unknown /commands fall through to the text handler too, so they are
-      // treated the same way.)
       return !!input.sessionState;
     }
 
