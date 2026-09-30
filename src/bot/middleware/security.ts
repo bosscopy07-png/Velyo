@@ -11,6 +11,7 @@ import { formatMaintenanceMessage } from '../messages';
 import { maintenanceKeyboard } from '../keyboards/main';
 import { editMainMessage } from '../utils/editMainMessage';
 import { logger } from '../../utils/logger';
+import { broadcastService } from '../../services/broadcast';
 import { e } from '../../utils/emoji';
 
 const ADMIN_IDS = new Set(config.ADMIN_TELEGRAM_IDS);
@@ -20,6 +21,11 @@ export async function securityMiddleware(ctx: Context, next: () => Promise<void>
   if (!from) return;
 
   const telegramId = from.id.toString();
+
+  // Any interaction = the user is in the chat and has seen pending broadcasts:
+  // start their auto-delete countdown. Runs BEFORE the maintenance gate so it
+  // also works for maintenance announcements. Fire-and-forget, never throws.
+  void broadcastService.onUserActivity(telegramId);
 
   // Maintenance mode (admins bypass). State comes from the database (cached
   // for ~2s), NOT from the environment. Runs first so stale inline keyboards,
@@ -123,4 +129,4 @@ async function showMaintenanceScreen(ctx: Context): Promise<void> {
   }
   // Text update or tapped message not editable: edit the stored main message.
   await editMainMessage(ctx, text, keyboard);
-      }
+  }
