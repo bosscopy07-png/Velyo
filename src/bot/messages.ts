@@ -112,18 +112,12 @@ export function formatAccountMessage(user: {
   ].join('\n');
 }
 
-
-/** Short text for callback-button alerts (Telegram caps alerts at 200 chars). */
-export const MAINTENANCE_ALERT_TEXT =
-  '🔧 VEYLO is under maintenance. Some features are temporarily unavailable. Please try again later.';
-
-/** One reusable maintenance notice — no internal details, no admin info. */
+/** One reusable maintenance screen — no internal details, no admin info. */
 export function formatMaintenanceMessage(): string {
   return (
     `${e('warning')} <b>MAINTENANCE MODE</b>\n\n` +
     `🔧 VEYLO is currently under maintenance.\n\n` +
-    `Some features are temporarily unavailable. You can still view your balance, history and giveaways.\n\n` +
-    `Please try again later.`
+    `All features are temporarily unavailable. You can go back, or join our channel for updates.\n\n` +
+    `We'll be back shortly.`
   );
-    }
-                        
+}
