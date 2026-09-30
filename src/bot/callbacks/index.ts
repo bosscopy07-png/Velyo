@@ -209,21 +209,6 @@ export function registerCallbacks(bot: any): void {
     );
   }));
 
-  // === ADMIN BROADCAST ===
-  bot.action('admin:broadcast', guard(async (ctx: Context) => {
-    if (!isAdmin(ctx)) {
-      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
-      return;
-    }
-    await ctx.answerCbQuery();
-    await setUserSession(ctx.from!.id.toString(), { state: 'admin_broadcast' });
-    await editMainMessage(
-      ctx,
-      `${e('people')} <b>BROADCAST</b>\n\nSend the message you want to broadcast to all users.\n\nIt will be delivered to every user the bot can reach.`,
-      backKeyboard('admin')
-    );
-  }));
-
   // === WALLET ===
   bot.action('wallet', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
@@ -549,4 +534,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-}
+      }
+                                                                         
