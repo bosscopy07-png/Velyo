@@ -524,3 +524,4 @@ export function registerTextHandlers(bot: any): void {
       asset: claim.giveaway.asset,
     });
   }
+)
