@@ -523,5 +523,27 @@ export function registerTextHandlers(bot: any): void {
       claimId,
       asset: claim.giveaway.asset,
     });
-  }
-)
+
+    await editMainMessage(
+      ctx,
+      `${e('deposit')} <b>SEND YOUR ${claim.giveaway.asset} BEP20 WALLET ADDRESS</b>\n\n` +
+      `Type or paste the address below.\n\n` +
+      `⚠️ Must support BNB Smart Chain (BEP20)`,
+      backKeyboard('main')
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
+    const from = ctx.from!;
+    await clearUserSession(from.id.toString());
+    await editMainMessage(
+      ctx,
+      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
+      backKeyboard('main')
+    );
+    await ctx.answerCbQuery();
+  });
+}
+
+   
