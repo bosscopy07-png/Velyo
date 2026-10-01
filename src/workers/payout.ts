@@ -89,24 +89,44 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
     }
   }
 
-  // ── Preflight: verify on-chain funds BEFORE broadcasting ──
-  const creatorWallet = await prisma.wallet.findUnique({
-    where: { userId: claim.giveaway.creatorId },
-  });
-  if (!creatorWallet) throw new UnrecoverableError('Creator wallet not found');
+  // ── UPGRADE (spec §23): select the signing wallet ──
+  // 'creator' (default/legacy): claimant is paid from the creator's
+  // custodial wallet (funds + seeded gas live there).
+  // 'platform': the platform payout wallet (OPERATOR_WALLET_KEY /
+  // PLATFORM_FEE_WALLET) sends the funds; the creator's balance lock is
+  // unchanged — the lock is an internal reservation either way.
+  const payoutOrigin = config.PAYOUT_ORIGIN;
+  let signerAddress: string;
+  let signerEncryptedKey: string;
+
+  if (payoutOrigin === 'platform') {
+    if (!config.OPERATOR_WALLET_KEY) {
+      throw new UnrecoverableError('PAYOUT_ORIGIN=platform but OPERATOR_WALLET_KEY is not configured');
+    }
+    signerAddress = config.PLATFORM_FEE_WALLET;
+    signerEncryptedKey = config.OPERATOR_WALLET_KEY;
+  } else {
+    const creatorWallet = await prisma.wallet.findUnique({
+      where: { userId: claim.giveaway.creatorId },
+    });
+    if (!creatorWallet) throw new UnrecoverableError('Creator wallet not found');
+    signerAddress = creatorWallet.address;
+    signerEncryptedKey = creatorWallet.encryptedPrivateKey;
+  }
 
   const assetKey = asset as keyof typeof ASSETS;
   const assetConfig = ASSETS[assetKey];
   const amountBigInt = BigInt(Math.floor(amount * 10 ** assetConfig.decimals));
 
-  const onChainAsset = await blockchain.getBalance(creatorWallet.address, assetKey);
+  // ── Preflight: verify on-chain funds BEFORE broadcasting ──
+  const onChainAsset = await blockchain.getBalance(signerAddress, assetKey);
 
   if (onChainAsset < amountBigInt) {
     // NO unwind, NO refund, NO slot release — just stop.
     // Creator cancels the giveaway to reclaim; or tops up and an admin/
     // future job can requeue. State is left untouched (still QUEUED).
     throw new UnrecoverableError(
-      `Creator wallet ${creatorWallet.address} holds ${onChainAsset} ${asset}, needs ${amountBigInt}. ` +
+      `Payout wallet ${signerAddress} holds ${onChainAsset} ${asset}, needs ${amountBigInt}. ` +
       `Payout left pending — no funds moved. Creator can cancel the giveaway for a full refund.`
     );
   }
@@ -116,7 +136,24 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   // and waits for the seed to mine, so the payout can never hit the
   // INSUFFICIENT_FUNDS unwind path anymore. Runs BEFORE the PROCESSING
   // transition so a failure here leaves the claim cleanly in QUEUED.
-  await ensureGas(creatorWallet.address, await estimateBnbTransferCost(), `payout-${claimId}`);
+  //
+  // UPGRADE: in platform mode the signer IS the operator wallet, so
+  // ensureGas (which tops up FROM the operator wallet) cannot fund itself.
+  // Instead we verify the payout wallet already holds enough BNB for one
+  // transfer; if not, this is a transient failure (retry) and the treasury
+  // monitor alerts the admins to top up gas.
+  if (payoutOrigin === 'platform') {
+    const needed = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18));
+    const bnbBalance = await blockchain.getBalance(signerAddress, 'BNB');
+    if (bnbBalance < needed) {
+      throw new Error(
+        `Platform payout wallet ${signerAddress} is short on BNB gas ` +
+        `(${bnbBalance} < ${needed}). Transient — retry after treasury top-up.`
+      );
+    }
+  } else {
+    await ensureGas(signerAddress, await estimateBnbTransferCost(), `payout-${claimId}`);
+  }
 
   // ── Mark PROCESSING (guarded — only one worker wins per claim) ──
   const marked = await prisma.giveawayClaim.updateMany({
@@ -129,7 +166,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
   try {
     const { hash } = await blockchain.sendTransaction(
-      creatorWallet.encryptedPrivateKey,
+      signerEncryptedKey,
       address,
       amountBigInt,
       assetKey,
@@ -149,7 +186,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
     await finalizePaid(claim, userId, address, amount, idempotencyKey, hash);
     await maybeReclaimGas(claim.giveawayId);
 
-    logger.info(`Payout completed: ${hash} for claim ${claimId}`);
+    logger.info(`Payout completed: ${hash} for claim ${claimId} (origin: ${payoutOrigin})`);
     return { status: 'completed', hash };
   } catch (err) {
     const msg = (err as Error).message;
@@ -186,12 +223,11 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
 /**
  * Reclaim seeded gas once every claim is in a terminal state (PAID).
- * Note: failed-then-left-QUEUED claims keep the giveaway out of the
- * reclaim condition until the creator cancels (cancelGiveaway →
- * reclaimGas handles it there). That's intentional — the seed stays
- * available in case the payout is ever requeued after a top-up.
+ * UPGRADE: no-op in platform payout mode — there are no per-giveaway gas
+ * seeds to reclaim (the payout wallet is a standing platform wallet).
  */
 async function maybeReclaimGas(giveawayId: string): Promise<void> {
+  if (config.PAYOUT_ORIGIN === 'platform') return;
   try {
     const [totalClaims, paidClaims] = await Promise.all([
       prisma.giveawayClaim.count({ where: { giveawayId } }),
@@ -264,9 +300,9 @@ worker.on('failed', (job, err) => {
   if (err instanceof UnrecoverableError) {
     logger.error(`Payout job ${job?.id} permanently stopped (no more retries): ${err.message}`);
   } else {
-    logger.error(`Payout job ${job?.id} failed (will retry):`, err);
+    logger.error(`Payout job ${job?.id} failed:`, err);
   }
 });
 
-logger.info('Payout worker started');
-         
+logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN})`);
+                 
