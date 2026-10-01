@@ -499,6 +499,195 @@ export function registerCallbacks(bot: any): void {
       ? giveaway.expiresAt.toLocaleString()
       : 'No expiry';
 
-    const text =
+        const text =
       `${e('gift')} <b>GIVEAWAY DETAILS</b>\n━━━━━━━━━━━━━━━━━\n\n` +
-      `<b>Status:</b> ${statusIcons[giveaway.status] || '⚪'}
+      `<b>Status:</b> ${statusIcons[giveaway.status] || '⚪'} ${giveaway.status}\n` +
+      `<b>Asset:</b> ${giveaway.asset}\n` +
+      `<b>Total Pool:</b> ${giveaway.totalAmount} ${giveaway.asset}\n` +
+      `<b>Per User:</b> ${giveaway.amountPerUser} ${giveaway.asset}\n` +
+      `<b>Progress:</b> ${giveaway.claimedCount}/${giveaway.maxClaimers} claimed\n` +
+      `<b>Expiry:</b> ${expiryText}\n` +
+      `<b>Share Link:</b> <code>https://t.me/${BOT_USERNAME}?start=giveaway_${giveaway.secureCode}</code>\n` +
+      (giveaway.claims.length > 0
+        ? `\n<b>Claims:</b>\n${giveaway.claims
+            .slice(0, 10)
+            .map((c) => `${c.status === 'PAID' ? '✅' : c.status === 'FAILED' ? '❌' : '⏳'} @${c.user.username || 'Unknown'}`)
+            .join('\n')}`
+        : '');
+
+    const rows: any[] = [
+      [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${giveaway.secureCode}`)],
+    ];
+
+    if (giveaway.status === 'ACTIVE') {
+      rows.push([Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${giveaway.id}`)]);
+    }
+
+    rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway:mine')]);
+
+    await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
+  }));
+
+  // ─────────────────────────── CANCEL GIVEAWAY ───────────────────────────
+
+  bot.action(/giveaway:cancel:(.+)/, guard(async (ctx: Context) => {
+    await ctx.answerCbQuery();
+    const giveawayId = (ctx as any).match[1];
+
+    const user = await prisma.user.findUnique({ where: { telegramId: ctx.from!.id.toString() } });
+    if (!user) return;
+
+    const giveaway = await prisma.giveaway.findUnique({ where: { id: giveawayId } });
+    if (!giveaway || giveaway.creatorId !== user.id) {
+      await editMainMessage(ctx, `${e('warning')} Giveaway not found.`, backKeyboard('giveaway:mine'));
+      return;
+    }
+
+    if (giveaway.status !== 'ACTIVE') {
+      await editMainMessage(ctx, `${e('warning')} This giveaway can no longer be cancelled.`, backKeyboard('giveaway:mine'));
+      return;
+    }
+
+    // Show inline confirmation
+    const text =
+      `${e('warning')} <b>CANCEL GIVEAWAY?</b>\n━━━━━━━━━━━━━━━━━\n\n` +
+      `Pool: ${giveaway.totalAmount} ${giveaway.asset}\n` +
+      `Claimed: ${giveaway.claimedCount}/${giveaway.maxClaimers}\n\n` +
+      `Unclaimed funds will be returned to your balance.`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(`${eb('confirm')} Yes, Cancel`, `giveaway:cancel:confirm:${giveawayId}`)],
+      [Markup.button.callback(`${eb('back')} Keep Giveaway`, 'giveaway:mine')],
+    ]);
+
+    await editMainMessage(ctx, text, keyboard);
+  }));
+
+  bot.action(/giveaway:cancel:confirm:(.+)/, guard(async (ctx: Context) => {
+    await ctx.answerCbQuery();
+    const giveawayId = (ctx as any).match[1];
+
+    const user = await prisma.user.findUnique({ where: { telegramId: ctx.from!.id.toString() } });
+    if (!user) return;
+
+    try {
+      const result = await giveawayService.cancelGiveaway(giveawayId, user.id);
+      const text =
+        `${e('check')} <b>GIVEAWAY CANCELLED</b>\n━━━━━━━━━━━━━━━━━\n\n` +
+        `Refunded: ${result.refundAmount} ${result.asset}\n` +
+        `Tx: <code>${result.transactionHash || 'Internal'}</code>`;
+      await editMainMessage(ctx, text, backKeyboard('giveaway:mine'));
+    } catch (err) {
+      logger.error('Cancel giveaway error:', err);
+      const reason = (err as Error).message;
+      const friendly = reason.includes('already been cancelled')
+        ? 'This giveaway has already been cancelled.'
+        : reason.includes('no longer active')
+          ? 'This giveaway is no longer active and cannot be cancelled.'
+          : 'Could not cancel the giveaway. Please try again.';
+      await editMainMessage(ctx, `${e('warning')} ${friendly}`, backKeyboard('giveaway:mine'));
+    }
+  }));
+
+  bot.action(/giveaway:confirm:(single|multi)\|([A-Z]+)\|([\d.]+)\|(\d+)\|(\d+)/, guard(async (ctx: Context) => {
+    await assertUserOperational(ctx.from!.id.toString());
+    await ctx.answerCbQuery('Creating giveaway...');
+
+    const [, mode, asset, amountStr, claimersStr, expiryHoursStr] = (ctx as any).match;
+    const amount = parseFloat(amountStr);
+    const maxClaimers = parseInt(claimersStr);
+    const expiryHours = parseInt(expiryHoursStr);
+
+    const user = await prisma.user.findUnique({ where: { telegramId: ctx.from!.id.toString() } });
+    if (!user) return;
+
+    try {
+      const result = await giveawayService.createGiveaway({
+        creatorId: user.id,
+        asset: asset as AssetSymbol,
+        totalAmount: amount,
+        maxClaimers,
+        expiresAt: expiryHours > 0 ? new Date(Date.now() + expiryHours * 3600000) : undefined,
+      });
+
+      const text =
+        `${e('party')} <b>GIVEAWAY CREATED!</b>\n━━━━━━━━━━━━━━━━━\n\n` +
+        `${e('gift')} Total: ${amount} ${asset}\n` +
+        `${e('people')} Claimers: ${maxClaimers}\n` +
+        `${e('star')} Each gets: ${result.amountPerUser} ${asset}\n\n` +
+        `${e('link')} <b>Share Link:</b>\n` +
+        `<code>https://t.me/${BOT_USERNAME}?start=giveaway_${result.secureCode}</code>\n\n` +
+        `Share this link to let people claim!`;
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${result.secureCode}`)],
+        [Markup.button.callback(`${eb('list')} My Giveaways`, 'giveaway:mine')],
+        [Markup.button.callback(`${eb('back')} Back`, 'giveaway')],
+      ]);
+
+      await editMainMessage(ctx, text, keyboard);
+    } catch (err) {
+      logger.error('Giveaway creation error:', err);
+      const reason = (err as Error).message;
+
+      let friendlyMessage = `${e('warning')} <b>COULD NOT CREATE GIVEAWAY</b>\n\n`;
+      if (reason.includes('Insufficient')) {
+        friendlyMessage += `You don't have enough ${asset} to cover the giveaway amount plus fees.\n\nDeposit more ${asset} and try again.`;
+      } else if (reason.includes('gas budget')) {
+        friendlyMessage += `Network gas is too expensive right now. Please try again later.`;
+      } else if (reason.includes('maintenance')) {
+        friendlyMessage += `VEYLO is currently under maintenance. Please try again later.`;
+      } else {
+        friendlyMessage += `Something went wrong. Please try again.`;
+      }
+
+      await editMainMessage(ctx, friendlyMessage, backKeyboard('giveaway'));
+    }
+  }));
+
+  // ─────────────────────────── REWARDS / REDEEM ───────────────────────────
+
+  bot.action('rewards', guard(async (ctx: Context) => {
+    await assertUserOperational(ctx.from!.id.toString());
+    await ctx.answerCbQuery();
+
+    await editMainMessage(
+      ctx,
+      `${e('gift')} <b>REWARDS</b>\n━━━━━━━━━━━━━━━━━\n\n` +
+      `Have a redeem code?\nEnter it below to claim your reward!`,
+      backKeyboard('main')
+    );
+
+    await setUserSession(ctx.from!.id.toString(), { state: 'redeem_code' });
+  }));
+
+  // ─────────────────────────── SETTINGS ───────────────────────────
+
+  bot.action('settings', guard(async (ctx: Context) => {
+    await assertUserOperational(ctx.from!.id.toString());
+    await ctx.answerCbQuery();
+
+    const text = `${e('settings')} <b>SETTINGS</b>\n━━━━━━━━━━━━━━━━━\n\nComing soon!`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(`${eb('back')} Back`, 'main')],
+    ]);
+
+    await editMainMessage(ctx, text, keyboard);
+  }));
+
+  // ─────────────────────────── NOOP (pagination indicator) ───────────────────────────
+
+  bot.action('noop', async (ctx: Context) => {
+    await ctx.answerCbQuery();
+  });
+
+  // ─────────────────────────── COPY GIVEAWAY LINK ───────────────────────────
+
+  bot.action(/giveaway:copy:(.+)/, guard(async (ctx: Context) => {
+    const code = (ctx as any).match[1];
+    const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
+    await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
+  }));
+  }
+  
