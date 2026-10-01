@@ -259,6 +259,141 @@ export function registerTextHandlers(bot: any): void {
           break;
         }
 
+        // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
+        case 'deposit_amount': {
+          const asset = ((session as any).asset || 'USDT') as string;
+          const amountStr = text.trim().split(' ')[0];
+
+          if (!isValidAmount(amountStr)) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>INVALID AMOUNT</b>\n${DIVIDER}\n\n` +
+              `Enter a valid number for <b>${asset}</b>.\n\n${e('edit')} Example: <code>10</code>`,
+              backKeyboard('account:deposits')
+            );
+            return;
+          }
+
+          const amount = parseFloat(amountStr);
+          if (amount <= 0) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>AMOUNT TOO SMALL</b>\n\nAmount must be greater than 0.`,
+              backKeyboard('account:deposits')
+            );
+            return;
+          }
+
+          try {
+            const { depositSessionService } = await import('../../services/deposit-session');
+            const user = await prisma.user.findUnique({ where: { telegramId } });
+            if (!user) return;
+
+            const { session: ds, address } = await depositSessionService.createSession(user.id, asset as any, amount);
+            await clearUserSession(telegramId);
+
+            await editMainMessage(
+              ctx,
+              `${e('deposit')} <b>DEPOSIT ${asset}</b>\n${DIVIDER}\n\n` +
+              `<b>Network:</b> BNB Smart Chain (BEP20)\n\n` +
+              `Send exactly <b>${Number(ds.expectedAmount)} ${asset}</b> to:\n\n` +
+              `<code>${address}</code>\n\n` +
+              `• Includes the platform deposit fee — the full <b>${amount} ${asset}</b> is credited to your balance\n` +
+              `• Send the <b>exact</b> amount so your payment is matched instantly\n` +
+              `• This address is yours for <b>30 minutes</b>`,
+              Markup.inlineKeyboard([
+                [Markup.button.callback(`${eb('check')} I Have Deposited`, `deposit:paid:${ds.id}`)],
+                [Markup.button.callback(`${eb('cancel')} Cancel Deposit`, `deposit:cancel:${ds.id}`)],
+                [Markup.button.callback(`${eb('back')} Back`, 'account:deposits')],
+              ])
+            );
+          } catch (err) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>UNABLE TO START DEPOSIT</b>\n\n${(err as Error).message}`,
+              backKeyboard('account:deposits')
+            );
+          }
+          break;
+        }
+
+        // === ADMIN: EDIT FEE (session feeKey set by admin:fee:set:<key>) ===
+        case 'admin_fee_edit': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
+          }
+          const feeKey = (session as any).feeKey as string;
+          const valueStr = text.trim();
+          await clearUserSession(telegramId);
+
+          const value = Number(valueStr);
+          if (!isFinite(value) || value < 0) {
+            await editMainMessage(ctx, `${e('warning')} Invalid value. Fees must be non-negative numbers.`, backKeyboard('admin:finance'));
+            return;
+          }
+
+          try {
+            const { feeConfig } = await import('../../services/fee-config');
+            await feeConfig.setFees(telegramId, { [feeKey]: value });
+            await editMainMessage(ctx, `${e('check')} Fee updated.`, backKeyboard('admin:finance'));
+          } catch (err) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>INVALID FEE VALUE</b>\n\n${(err as Error).message.slice(0, 200)}`,
+              backKeyboard('admin:finance')
+            );
+          }
+          break;
+        }
+
+        // === ADMIN: ADD COMPANY DEPOSIT WALLET ("<address> <privateKey>") ===
+        case 'admin_dwallet_add': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
+          }
+          await clearUserSession(telegramId);
+
+          const parts = text.trim().split(/\s+/);
+          const [address, privateKey] = parts;
+          if (!address || !privateKey || !isValidEVMAddress(address)) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>INVALID FORMAT</b>\n\nExpected:\n<code>0xAddress 0xPrivateKey</code>`,
+              backKeyboard('admin:dwallets')
+            );
+            return;
+          }
+
+          try {
+            const { encrypt } = await import('../../utils/encryption');
+            const normalized = normalizeAddress(address);
+
+            await prisma.companyDepositWallet.upsert({
+              where: { address: normalized },
+              create: { address: normalized, encryptedPrivateKey: encrypt(privateKey) },
+              update: { encryptedPrivateKey: encrypt(privateKey), status: 'ACTIVE' },
+            });
+            await prisma.auditLog.create({
+              data: {
+                adminId: telegramId,
+                action: 'DEPOSIT_WALLET_ADD',
+                entityType: 'company_deposit_wallet',
+                newValue: { address: normalized },
+              },
+            });
+            await editMainMessage(ctx, `${e('check')} Company deposit address added.`, backKeyboard('admin:dwallets'));
+          } catch (err) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} Failed to add address: ${(err as Error).message.slice(0, 200)}`,
+              backKeyboard('admin:dwallets')
+            );
+          }
+          break;
+        }
+
         // === PAYOUT ADDRESS ===
         case 'awaiting_payout_address': {
           const address = text.trim();
@@ -360,178 +495,4 @@ export function registerTextHandlers(bot: any): void {
             ctx,
             `${e('lock')} <b>USER WALLET</b>\n${DIVIDER}\n\n` +
             `${e('person')} User: <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
-            `${e('wallet')} Address: <code>${target.wallet.address}</code>\n\n` +
-            `<i>Select what to recover. Access is audit-logged.</i>`,
-            Markup.inlineKeyboard(rows)
-          );
-          break;
-        }
-
-        default:
-          await clearUserSession(telegramId);
-      }
-    } catch (err) {
-      if ((err as { code?: string }).code === 'MAINTENANCE_ACTIVE') {
-        // Toggled between the middleware check and the guarded step — nothing was mutated.
-        await clearUserSession(telegramId);
-        await editMainMessage(ctx, formatMaintenanceMessage(), backKeyboard('main'));
-        return;
-      }
-      logger.error('Text handler error:', err);
-      await editMainMessage(
-        ctx,
-        `${e('warning')} An error occurred. Please try again.`,
-        backKeyboard('main')
-      );
-      await clearUserSession(telegramId);
-    }
-  });
-
-  // === EXPIRY SELECTION ===
-  bot.action(/giveaway:expiry:(\d+)/, async (ctx: Context) => {
-    const hours = parseInt((ctx as any).match[1]);
-    const from = ctx.from!;
-    const session = await getUserSession(from.id.toString());
-
-    if (!session || session.state !== 'giveaway_multi_expiry') {
-      await ctx.answerCbQuery('Session expired. Start over.');
-      return;
-    }
-
-    const { amount, asset, maxClaimers, amountPerUser } = session as any;
-    const expiryHours = hours === 0 ? null : hours;
-
-    await setUserSession(from.id.toString(), {
-      state: 'giveaway_multi_confirm',
-      amount,
-      asset,
-      maxClaimers,
-      expiryHours,
-    });
-
-    const cost = await estimateCreationCost(amount, maxClaimers);
-    const usdValue = await pricing.convertToUSD(asset, amount);
-    const ngnValue = await pricing.convertToNGN(asset, amount);
-    const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
-
-    await editMainMessage(
-      ctx,
-      `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n${DIVIDER}\n\n` +
-      `${e('coin')} Asset: <b>${asset}</b>\n` +
-      `${e('gift')} Total Amount: <b>${amount} ${asset}</b>\n` +
-      `${e('people')} Claimers: <b>${maxClaimers}</b>\n` +
-      `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
-      (cost.fee > 0
-        ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
-          `${e('fire')} Network Gas (${cost.gasUnits} slots: ${maxClaimers} claims + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
-          `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
-        : '') +
-      `${e('chart')} Per User: <b>≈ ${pricing.formatUSD(usdPerUser)}</b>\n` +
-      `${e('chart')} Total Value: <b>≈ ${pricing.formatUSD(usdValue)}</b>\n` +
-      `${e('naira')} Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n` +
-      `${e('clock')} Expiry: <b>${hours === 0 ? 'No Expiry' : `${hours} Hours`}</b>\n\n` +
-      `${e('check')} <b>Ready to create?</b>`,
-      confirmCancelKeyboard(
-        `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
-        'giveaway'
-      )
-    );
-    await ctx.answerCbQuery();
-  });
-
-  // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
-  bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
-    const claimId = (ctx as any).match[1];
-    const from = ctx.from!;
-
-    await ctx.answerCbQuery('Processing your reward...');
-
-    const session = await getUserSession(from.id.toString());
-    const address =
-      session?.state === 'awaiting_payout_confirm'
-        ? ((session as any).address as string)
-        : undefined;
-
-    if (!address) {
-      await editMainMessage(
-        ctx,
-        `${e('warning')} <b>SESSION EXPIRED</b>\n\nPlease send your wallet address again.`,
-        backKeyboard('main')
-      );
-      return;
-    }
-
-    const claim = await prisma.giveawayClaim.findUnique({
-      where: { id: claimId },
-      include: { giveaway: true },
-    });
-
-    if (!claim || claim.status !== 'RESERVED') {
-      await editMainMessage(ctx, `${e('warning')} <b>INVALID CLAIM</b>\n\nThis claim is no longer valid.`, backKeyboard('main'));
-      return;
-    }
-
-    await giveawayService.submitAddress(claimId, address);
-
-    const idempotencyKey = hashIdempotencyKey('payout', claimId, Date.now().toString());
-    await queuePayout({
-      claimId,
-      giveawayId: claim.giveawayId,
-      userId: claim.userId,
-      address,
-      amount: Number(claim.giveaway.amountPerUser),
-      asset: claim.giveaway.asset,
-      idempotencyKey,
-    });
-
-    await clearUserSession(from.id.toString());
-
-    await editMainMessage(
-      ctx,
-      `${e('check')} <b>REWARD QUEUED</b>\n${DIVIDER}\n\n` +
-      `${e('gift')} Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward has been queued for payout.\n\n` +
-      `${e('clock')} You will receive a notification once it's sent.`,
-      backKeyboard('main')
-    );
-  });
-
-  bot.action(/payout:change:(.+)/, async (ctx: Context) => {
-    const claimId = (ctx as any).match[1];
-    const from = ctx.from!;
-
-    const claim = await prisma.giveawayClaim.findUnique({
-      where: { id: claimId },
-      include: { giveaway: true },
-    });
-    if (!claim) return;
-
-    await setUserSession(from.id.toString(), {
-      state: 'awaiting_payout_address',
-      claimId,
-      asset: claim.giveaway.asset,
-    });
-
-    await editMainMessage(
-      ctx,
-      `${e('deposit')} <b>SEND YOUR ${claim.giveaway.asset} BEP20 WALLET ADDRESS</b>\n\n` +
-      `Type or paste the address below.\n\n` +
-      `⚠️ Must support BNB Smart Chain (BEP20)`,
-      backKeyboard('main')
-    );
-    await ctx.answerCbQuery();
-  });
-
-  bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
-    const from = ctx.from!;
-    await clearUserSession(from.id.toString());
-    await editMainMessage(
-      ctx,
-      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
-      backKeyboard('main')
-    );
-    await ctx.answerCbQuery();
-  });
-}
-
-
-    
+         
