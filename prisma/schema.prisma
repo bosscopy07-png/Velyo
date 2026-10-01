@@ -28,6 +28,12 @@ model User {
   claims          GiveawayClaim[]
   codeRedemptions CodeRedemption[]
   auditLogs       AuditLog[]
+  rewards         Reward[]
+  attributionsAsClaimant GiveawayAttribution[] @relation("AttributionClaimant")
+  attributionsAsCreator  GiveawayAttribution[] @relation("AttributionCreator")
+  claimBlocksCreated     ClaimBlock[]          @relation("BlocksCreated")
+  claimBlocksReceived    ClaimBlock[]          @relation("BlocksReceived")
+  depositSessions        DepositSession[]
 
   @@index([telegramId])
   @@index([status])
@@ -113,7 +119,9 @@ model Giveaway {
   cancelledAt        DateTime?
   cancellationReason String?
 
-  claims GiveawayClaim[]
+  claims        GiveawayClaim[]
+  attributions  GiveawayAttribution[]
+  claimBlocks   ClaimBlock[]
 
   @@index([creatorId])
   @@index([status])
@@ -136,6 +144,9 @@ model GiveawayClaim {
   payoutTransactionHash String?
   failedReason          String?
   claimOrder            Int
+
+  attribution GiveawayAttribution?
+  flags       ClaimFlag[]
 
   @@unique([giveawayId, userId])
   @@index([giveawayId])
@@ -185,7 +196,7 @@ model PlatformFee {
   asset         String
   amount        Decimal     @db.Decimal(36, 18)
   feeWallet     String
-  sweptAt       DateTime?   // 鈫� NEW: set when the admin sweep collects this fee
+  sweptAt       DateTime?
   createdAt     DateTime    @default(now())
 
   @@index([transactionId])
@@ -239,6 +250,121 @@ model SystemConfig {
   @@map("system_configs")
 }
 
+// ─────────────────────────────── UPGRADE: REWARDS & ATTRIBUTION ─────────────
+
+model Reward {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id])
+  type           RewardType
+  sourceType     String       // 'giveaway' (extensible: 'deposit', ...)
+  sourceId       String       // giveaway id (or attribution id for referral)
+  asset          String
+  amount         Decimal      @db.Decimal(36, 18)
+  status         RewardStatus @default(CREDITED)
+  idempotencyKey String       @unique
+  createdAt      DateTime     @default(now())
+
+  @@index([userId])
+  @@index([sourceType, sourceId])
+  @@map("rewards")
+}
+
+model GiveawayAttribution {
+  id         String              @id @default(cuid())
+  giveawayId String
+  giveaway   Giveaway            @relation(fields: [giveawayId], references: [id])
+  claimantId String
+  claimant   User                @relation("AttributionClaimant", fields: [claimantId], references: [id])
+  creatorId  String
+  creator    User                @relation("AttributionCreator", fields: [creatorId], references: [id])
+  claimId    String?             @unique
+  claim      GiveawayClaim?      @relation(fields: [claimId], references: [id])
+  source     AttributionSource
+  status     AttributionStatus   @default(ACTIVE)
+  createdAt  DateTime            @default(now())
+
+  @@unique([giveawayId, claimantId])
+  @@index([claimantId])
+  @@index([creatorId])
+  @@map("giveaway_attributions")
+}
+
+model ClaimBlock {
+  id            String    @id @default(cuid())
+  creatorId     String
+  creator       User      @relation("BlocksCreated", fields: [creatorId], references: [id])
+  blockedUserId String
+  blockedUser   User      @relation("BlocksReceived", fields: [blockedUserId], references: [id])
+  giveawayId    String?   // null = creator-scoped (all current & future giveaways)
+  giveaway      Giveaway? @relation(fields: [giveawayId], references: [id])
+  reason        String?
+  createdAt     DateTime  @default(now())
+
+  @@index([creatorId, blockedUserId])
+  @@map("claim_blocks")
+}
+
+model ClaimFlag {
+  id         String        @id @default(cuid())
+  claimId    String
+  claim      GiveawayClaim @relation(fields: [claimId], references: [id])
+  giveawayId String
+  signal     String        // 'SHARED_WALLET' | 'CROSS_ACCOUNT_WALLET' | 'CLAIM_VELOCITY'
+  severity   FlagSeverity  @default(POSSIBLE_DUPLICATE)
+  detail     Json?
+  status     FlagStatus    @default(OPEN)
+  createdAt  DateTime      @default(now())
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  @@index([giveawayId, status])
+  @@index([claimId])
+  @@map("claim_flags")
+}
+
+// ─────────────────────────────── UPGRADE: DEPOSIT SESSIONS ──────────────────
+
+model CompanyDepositWallet {
+  id                  String            @id @default(cuid())
+  address             String            @unique
+  encryptedPrivateKey String
+  status              CompanyWalletStatus @default(ACTIVE)
+  lastAssignedAt      DateTime?
+  createdAt           DateTime          @default(now())
+
+  sessions DepositSession[]
+
+  @@map("company_deposit_wallets")
+}
+
+model DepositSession {
+  id               String               @id @default(cuid())
+  userId           String
+  user             User                 @relation(fields: [userId], references: [id])
+  asset            String
+  requestedAmount  Decimal              @db.Decimal(36, 18)
+  platformFee      Decimal              @default(0) @db.Decimal(36, 18)
+  expectedAmount   Decimal              @db.Decimal(36, 18)
+  uniqueSuffix     Decimal              @default(0) @db.Decimal(36, 18)
+  assignedWalletId String
+  assignedWallet   CompanyDepositWallet @relation(fields: [assignedWalletId], references: [id])
+  paymentRef       String               @unique
+  txHash           String?              @unique
+  detectedTxHash   String?
+  detectedAmount   Decimal?             @db.Decimal(36, 18)
+  status           DepositSessionStatus @default(AWAITING)
+  creditedAmount   Decimal?             @db.Decimal(36, 18)
+  expiresAt        DateTime
+  createdAt        DateTime             @default(now())
+  creditedAt       DateTime?
+  forwardedAt      DateTime?
+
+  @@index([userId])
+  @@index([status, expiresAt])
+  @@map("deposit_sessions")
+}
+
 enum UserStatus {
   ACTIVE
   SUSPENDED
@@ -262,6 +388,7 @@ enum TransactionType {
   REFUND
   TRANSFER
   PAYOUT
+  REWARD
 }
 
 enum TransactionStatus {
@@ -311,15 +438,59 @@ enum MonitorStatus {
   FAILED
 }
 
-// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ BROADCASTS 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+enum RewardType {
+  GIVEAWAY_CASHBACK
+  REFERRAL_REWARD
+}
+
+enum RewardStatus {
+  PENDING
+  CREDITED
+  APPLIED
+  FAILED
+}
+
+enum AttributionSource {
+  GIVEAWAY_LINK
+  MANUAL_CODE
+}
+
+enum AttributionStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum FlagSeverity {
+  POSSIBLE_DUPLICATE
+  CONFIRMED_ABUSE
+}
+
+enum FlagStatus {
+  OPEN
+  DISMISSED
+  CONFIRMED
+}
+
+enum CompanyWalletStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum DepositSessionStatus {
+  AWAITING
+  DETECTED
+  CREDITED
+  EXPIRED
+  FAILED
+}
 
 model Broadcast {
   id            String          @id @default(cuid())
-  createdBy     String          // admin telegramId
+  createdBy     String
   text          String          @db.Text
-  entities      Json?           // Telegram formatting entities (bold, links, ...)
+  entities      Json?
   status        BroadcastStatus @default(SENDING)
-  expireMinutes Int             // hard cap: delete even if never opened
+  expireMinutes Int
   targetCount   Int             @default(0)
   sentCount     Int             @default(0)
   failedCount   Int             @default(0)
@@ -340,8 +511,8 @@ model BroadcastDelivery {
   chatId      String
   messageId   Int
   sentAt      DateTime  @default(now())
-  openedAt    DateTime? // first time the user interacted with the bot after receiving it
-  deleteAt    DateTime  // when the message is removed (hard cap, pulled earlier when opened)
+  openedAt    DateTime?
+  deleteAt    DateTime
   deletedAt   DateTime?
   attempts    Int       @default(0)
 
