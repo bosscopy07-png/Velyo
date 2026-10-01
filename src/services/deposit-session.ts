@@ -1,12 +1,17 @@
 import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
+import cron from 'node-cron';
 import { prisma } from '../database';
+import { redis } from './redis';
 import { blockchain } from './blockchain';
 import { feeConfig } from './fee-config';
 import { decrypt, hashIdempotencyKey } from '../utils/encryption';
 import { logger } from '../utils/logger';
 import { config, ASSETS, type AssetSymbol } from '../config';
-import cron from 'node-cron';
+import { pickUniqueSuffix, computeExpectedAmount } from './fee-math';
+
+// Re-exported so existing/future importers keep a single import site.
+export { pickUniqueSuffix, computeExpectedAmount };
 
 /**
  * Deposit-session architecture (spec §11–21).
@@ -21,18 +26,18 @@ import cron from 'node-cron';
  * Identification (spec §14): PRIMARY = session + assigned address + txHash
  * uniqueness + amount match. The unique suffix is a SECONDARY aid only.
  *
- * RPC profile (spec §17/§19): the only background polling is a 60s sweep of
- * DETECTED sessions awaiting confirmation depth (bounded by session count,
- * not user count), plus expiry. No permanent per-user loop is created.
+ * RPC profile (spec §17/§19): the only background polling is a light sweep
+ * (2×/min) over DETECTED sessions awaiting confirmation depth and session
+ * expiry — bounded by ACTIVE SESSION COUNT, never by total user count.
+ * No permanent per-user loop is created by this module. (The legacy
+ * deposit-monitor.ts per-user scanning remains in place until deliberately
+ * decommissioned — historical DepositMonitor rows stay for audit.)
  */
 
 const SESSION_TTL_MS = config.DEPOSIT_SESSION_TTL_MINUTES * 60_000;
 const REQUIRED_CONFIRMATIONS = 15;
 /** Amount match tolerance (asset units) — suffix is advisory, not exact. */
 const AMOUNT_TOLERANCE = 0.001;
-/** Unique suffix range: 0.000001 .. 0.000999 asset units. */
-const SUFFIX_MIN = 1e-6;
-const SUFFIX_MAX = 999e-6;
 
 export type VerifyResult =
   | { status: 'credited'; amount: number }
@@ -42,26 +47,11 @@ export type VerifyResult =
   | { status: 'expired' }
   | { status: 'error'; reason: string };
 
-/** Pure helper — pick a suffix not used by other active sessions. Exported for tests. */
-export function pickUniqueSuffix(taken: number[], rand: () => number = Math.random): number {
-  const takenSet = new Set(taken.map((t) => Number(t.toFixed(6))));
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const candidate = Number((SUFFIX_MIN + Math.floor(rand() * 999) * SUFFIX_MIN).toFixed(6));
-    if (candidate >= SUFFIX_MIN && candidate <= SUFFIX_MAX && !takenSet.has(candidate)) return candidate;
-  }
-  // Fallback: shift outside the common range deterministically.
-  return Number((SUFFIX_MAX + taken.length * SUFFIX_MIN).toFixed(6));
-}
-
-/** Pure helper — expected amount math in one place. Exported for tests. */
-export function computeExpectedAmount(requested: number, fee: number, suffix: number): number {
-  return Number((requested + fee + suffix).toFixed(8));
-}
-
 class DepositSessionService {
   /**
    * Creates a deposit session and assigns a company pool address
-   * (least-recently-assigned ACTIVE wallet — deterministic, recorded).
+   * (least-recently-assigned ACTIVE wallet — deterministic, recorded against
+   * the session for audit; spec §13).
    */
   async createSession(userId: string, asset: AssetSymbol, requestedAmount: number) {
     if (!config.ENABLE_DEPOSITS) throw new Error('Deposits are temporarily disabled');
@@ -69,7 +59,7 @@ class DepositSessionService {
 
     const fees = await feeConfig.getFees();
 
-    // Assign pool address: round-robin by lastAssignedAt (nulls first).
+    // Assign pool address: round-robin by lastAssignedAt (never-assigned first).
     const wallet = await prisma.companyDepositWallet.findFirst({
       where: { status: 'ACTIVE' },
       orderBy: [{ lastAssignedAt: { sort: 'asc', nulls: 'first' } }],
@@ -91,6 +81,8 @@ class DepositSessionService {
       }
     }
 
+    // Unique amount suffix — collision-checked against ALL live sessions so
+    // two simultaneous deposits can never share an identifier (spec §14).
     const takenSuffixes = (
       await prisma.depositSession.findMany({
         where: { status: { in: ['AWAITING', 'DETECTED'] } },
@@ -136,7 +128,7 @@ class DepositSessionService {
   /**
    * "I HAVE DEPOSITED" — immediate active verification (spec §18).
    * Idempotent and race-safe: the guarded status transition guarantees a
-   * single crediting path even if two taps/requests arrive together.
+   * single crediting path even if two taps arrive together (spec §20).
    */
   async verifySession(sessionId: string, requesterUserId: string): Promise<VerifyResult> {
     const session = await prisma.depositSession.findUnique({
@@ -153,7 +145,6 @@ class DepositSessionService {
     }
 
     try {
-      // ── Locate the inbound transaction on-chain ──
       const detected = await this.findInboundTransfer(session);
       if (!detected) return { status: 'not_found' };
 
@@ -166,7 +157,7 @@ class DepositSessionService {
       const confirmations = detected.blockNumber ? currentBlock - detected.blockNumber + 1 : 0;
 
       if (confirmations < REQUIRED_CONFIRMATIONS) {
-        // Seen but immature — record DETECTED once and let the sweep mature it.
+        // Seen but immature — record DETECTED once; the sweep matures it.
         await prisma.depositSession.updateMany({
           where: { id: session.id, status: 'AWAITING' },
           data: { status: 'DETECTED', detectedTxHash: detected.txHash, detectedAmount: detected.amount },
@@ -176,7 +167,7 @@ class DepositSessionService {
 
       return await this.creditSession(session, detected.txHash, detected.amount);
     } catch (err) {
-      // RPC failure ≠ deposit failure (spec §35) — report as inconclusive.
+      // RPC failure ≠ deposit failure (spec §35) — report inconclusive, mutate nothing.
       logger.error(`verifySession(${sessionId}) error: ${(err as Error).message}`);
       return { status: 'error', reason: 'Verification unavailable right now — please try again in a minute' };
     }
@@ -185,14 +176,16 @@ class DepositSessionService {
   /**
    * Find an inbound transfer to the session's assigned address within the
    * session window. USDT: real Transfer events (real txHash). BNB: balance
-   * delta vs a snapshot taken at check time bounded to the session window.
+   * delta between two observations (company deposit wallets only receive
+   * user deposits — forwards go OUT), so a positive delta in the window is
+   * a deposit; the synthetic ref embeds the session id and is unique per
+   * session (txHash @unique).
    */
   private async findInboundTransfer(session: {
     id: string;
     asset: string;
     expectedAmount: number;
     assignedWallet: { address: string };
-    createdAt: Date;
   }): Promise<{ txHash: string; amount: number; blockNumber?: number } | null> {
     const address = session.assignedWallet.address.toLowerCase();
     const provider = await blockchain.getProvider();
@@ -208,8 +201,8 @@ class DepositSessionService {
         currentBlock
       );
       const events = eventsByAddress.get(address) ?? [];
-      // Closest-amount match above the requested minimum; never match an
-      // amount credited to another session (txHash unique) or below request.
+      // Closest-amount match above the requested minimum; below-minimum
+      // transfers are ignored (they can't be this session's payment).
       let best: { txHash: string; amount: number; blockNumber?: number } | null = null;
       let bestDiff = Infinity;
       for (const ev of events) {
@@ -224,8 +217,9 @@ class DepositSessionService {
       return best;
     }
 
-    // BNB: balance delta. Company deposit wallets only receive user deposits
-    // (forwards go OUT), so a positive delta in the window is a deposit.
+    // BNB: balance delta. First tap records the baseline; a later tap (or
+    // the sweep's maturation path) compares. Honest trade-off: BNB has no
+    // transfer-event log, and this keeps RPC usage to two balance reads.
     const key = `ds:bal:${session.id}`;
     const prevRaw = await redis.get(key);
     const current = Number((await blockchain.getBalance(session.assignedWallet.address, 'BNB')) / 1e18n);
@@ -245,7 +239,10 @@ class DepositSessionService {
 
   /**
    * The single crediting path. Guarded AWAITING/DETECTED → CREDITED
-   * transition means exactly one winner per session, ever (spec §20).
+   * transition means exactly one winner per session, ever (spec §20). The
+   * txHash is stored on the session (unique) and the ledger transaction
+   * carries a derived unique idempotency key — a second worker/tap sees
+   * "already credited" and does nothing.
    */
   private async creditSession(
     session: { id: string; userId: string; asset: string; requestedAmount: number; platformFee: number },
@@ -260,6 +257,8 @@ class DepositSessionService {
 
     try {
       await prisma.$transaction(async (tx) => {
+        // Only the INTENDED deposit amount becomes user balance (spec §15);
+        // the fee and unique-suffix components stay platform-side.
         await tx.balance.upsert({
           where: { userId_asset: { userId: session.userId, asset: session.asset } },
           create: { userId: session.userId, asset: session.asset, availableBalance: session.requestedAmount },
@@ -277,7 +276,7 @@ class DepositSessionService {
             status: 'CONFIRMED',
             transactionHash: txHash,
             idempotencyKey: hashIdempotencyKey('deposit-session', session.id),
-            metadata: { depositSessionId: session.id, onChainAmount, paymentRef: session.id },
+            metadata: { depositSessionId: session.id, onChainAmount },
           },
         });
 
@@ -295,8 +294,8 @@ class DepositSessionService {
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        // Transaction row already exists (concurrent credit) — session row
-        // is already CREDITED; nothing further to do.
+        // Ledger row already exists (concurrent credit) — the session row is
+        // already CREDITED; nothing further to do. No double credit.
         return { status: 'already_credited' };
       }
       throw err;
@@ -325,7 +324,7 @@ class DepositSessionService {
   /**
    * Forwards the received funds (minus a gas reserve for future forwards)
    * from the company deposit address to the platform treasury. Never sends
-   * the full balance (spec §21).
+   * the full balance — the reserve stays behind as gas (spec §21).
    */
   async forwardToTreasury(sessionId: string): Promise<void> {
     const session = await prisma.depositSession.findUnique({
@@ -339,7 +338,7 @@ class DepositSessionService {
     const rawBalance = await blockchain.getBalance(session.assignedWallet.address, asset);
     const decimals = assetConfig.decimals;
 
-    // Reserve: one BNB transfer worth of native BNB stays behind for gas.
+    // Reserve: two native-BNB-transfer worths stay behind for future forwards.
     const { estimateBnbTransferCost } = await import('./gas');
     const gasReserve = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18)) * 2n;
     const forwardable = asset === 'BNB' ? rawBalance - gasReserve : rawBalance;
@@ -372,9 +371,9 @@ class DepositSessionService {
   }
 
   /**
-   * Background sweeps (spec §17/§19) — the ONLY recurring RPC work:
-   *  - expire stale sessions (DB-only)
-   *  - mature DETECTED sessions (real txHash path) — bounded by session count
+   * Background sweeps (spec §17/§19) — the ONLY recurring RPC work this
+   * module performs: session expiry (DB-only) + maturation of DETECTED
+   * sessions (real txHash path, bounded by live-session count).
    * Starts from bot/index.ts.
    */
   start(): void {
@@ -434,7 +433,5 @@ class DepositSessionService {
   }
 }
 
-// redis is imported lazily-ish at module scope to avoid cycles with services/redis
-import { redis } from './redis';
-
 export const depositSessionService = new DepositSessionService();
+    
