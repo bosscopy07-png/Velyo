@@ -5,12 +5,16 @@ import { securityMiddleware } from './middleware/security';
 import { handleStart } from './commands/start';
 import { handleClaim } from './commands/claim';
 import { registerCallbacks } from './callbacks';
+import { registerUpgradeCallbacks } from './callbacks/upgrade';
 import { registerTextHandlers } from './handlers/text';
 import { registerAdminCommands } from '../admin/commands';
+import { registerAdminUpgrade } from '../admin/upgrade';
 import { registerBroadcastAdmin } from '../admin/broadcast';
 import { registerUserAdmin } from '../admin/users';
 import { broadcastService } from '../services/broadcast';
 import { depositMonitor } from '../services/deposit-monitor';
+import { depositSessionService } from '../services/deposit-session';
+import { treasuryMonitor } from '../services/treasury';
 import { claimExpiry } from '../services/claim-expiry';
 import { balanceSync } from '../services/balance-sync';
 import '../workers/payout';
@@ -32,8 +36,10 @@ bot.command('claim', handleClaim);
 
 // Callbacks & Text
 registerCallbacks(bot);
+registerUpgradeCallbacks(bot);
 registerTextHandlers(bot);
 registerAdminCommands(bot);
+registerAdminUpgrade(bot);
 registerBroadcastAdmin(bot);
 registerUserAdmin(bot);
 broadcastService.start(bot.telegram);
@@ -74,8 +80,16 @@ startBot();
 
 // In-process background jobs
 depositMonitor.start();
+depositSessionService.start();
 claimExpiry.start();
 balanceSync.start();
+treasuryMonitor.start((message) => {
+  for (const adminId of config.ADMIN_TELEGRAM_IDS) {
+    bot.telegram.sendMessage(adminId, message, { parse_mode: 'HTML' }).catch((err) => {
+      logger.error(`Treasury alert to ${adminId} failed: ${(err as Error).message}`);
+    });
+  }
+});
 
 async function shutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal}, shutting down...`);
