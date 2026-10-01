@@ -442,7 +442,8 @@ class GiveawayService {
     }
   }
 
-  async cancelGiveaway(giveawayId: string, userId: string): Promise<{ refundAmount: number; transactionHash: string | null; asset: string }> {
+// ════════════════════════ PART 2 CONTINUES BELOW ════════════════════════
+      async cancelGiveaway(giveawayId: string, userId: string): Promise<{ refundAmount: number; transactionHash: string | null; asset: string }> {
     // Atomic: only transition ACTIVE → CANCELLED if still ACTIVE.
     // If count = 0, someone else cancelled first — read their result, don't double-refund.
     const transition = await prisma.giveaway.updateMany({
@@ -461,7 +462,7 @@ class GiveawayService {
           asset: existing.asset,
         };
       }
-            throw new Error('Giveaway not found or no longer active');
+      throw new Error('Giveaway not found or no longer active');
     }
 
     // ── CANONICAL ESCROW RELEASE (see computeOutstandingEscrow) ──
@@ -524,7 +525,7 @@ class GiveawayService {
 
     const wallet = await walletService.createWallet(creatorId);
     const needed = Number((await estimateBnbTransferCost()) * units);
-    const baseline = Number((await blockchain.getBalance(wallet.address, 'BNB')) / 1e18n);
+    const baseline = Number(await blockchain.getBalance(wallet.address, 'BNB')) / 1e18;
 
     const deficit = needed - baseline;
     if (deficit <= 0) {
@@ -578,7 +579,7 @@ class GiveawayService {
     const wallet = await prisma.wallet.findUnique({ where: { userId: giveaway.creatorId } });
     if (!wallet) return;
 
-    const bnbBalance = Number((await blockchain.getBalance(wallet.address, 'BNB')) / 1e18n);
+    const bnbBalance = Number(await blockchain.getBalance(wallet.address, 'BNB')) / 1e18;
 
     // Leave a small safety margin (0.0003 BNB) for dust/future ops
     const margin = 0.0003;
@@ -726,5 +727,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-          }
-          
+        
