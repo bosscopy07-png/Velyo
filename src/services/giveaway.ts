@@ -461,6 +461,270 @@ class GiveawayService {
           asset: existing.asset,
         };
       }
-      throw new Error('Giveaway not found or no longer active');
-                                            }
+            throw new Error('Giveaway not found or no longer active');
+    }
+
+    // ── CANONICAL ESCROW RELEASE (see computeOutstandingEscrow) ──
+    const { giveaway, outstanding } = await computeOutstandingEscrow(giveawayId);
+
+    if (outstanding > 0) {
+      const { hashIdempotencyKey } = await import('../utils/encryption');
+
+      await prisma.$transaction(async (tx) => {
+        await tx.balance.update({
+          where: { userId_asset: { userId: giveaway.creatorId, asset: giveaway.asset } },
+          data: {
+            availableBalance: { increment: outstanding },
+            lockedBalance: { decrement: outstanding },
+          },
+        });
+
+        await tx.transaction.create({
+          data: {
+            userId: giveaway.creatorId,
+            type: 'REFUND',
+            asset: giveaway.asset,
+            amount: outstanding,
+            fee: 0,
+            netAmount: outstanding,
+            status: 'CONFIRMED',
+            idempotencyKey: hashIdempotencyKey('refund', giveawayId),
+            metadata: { giveawayId },
+          },
+        });
+      });
+    }
+
+    // Reclaim seeded gas from the (now defunct) payout wallet — operator funds back.
+    // Never throws into the cancel flow: worst case we log and an admin can reclaim later.
+    await this.reclaimGas(giveawayId).catch((err) =>
+      logger.error(`Gas reclaim after cancel failed for ${giveawayId}: ${(err as Error).message}`)
+    );
+
+    logger.info(`Giveaway ${giveawayId} cancelled by ${userId}, refunded ${outstanding}`);
+    return { refundAmount: outstanding, transactionHash: null, asset: giveaway.asset };
+  }
+
+  /**
+   * Seed the giveaway's payout wallet with gas for its claims + buffer.
+   *
+   * The "why": keeping the gas on the CREATOR's wallet (and forwarding the
+   * creation fee from it) means the creator never needs BNB — only USDT.
+   * The operator wallet funds the gas budget up front; `reclaimGas` sweeps
+   * the change back to the operator once every claim is PAID. Seeding runs
+   * BEFORE the giveaway exists in the DB, so a failure here means the
+   * giveaway is never created and no funds are locked.
+   *
+   * @returns The seed transaction hash (must mine before any spend).
+   */
+  private async seedPayoutGas(creatorId: string, giveawayId: string, units: number): Promise<string> {
+    if (!config.OPERATOR_WALLET_KEY) {
+      throw new Error('OPERATOR_WALLET_KEY not configured — cannot seed gas');
+    }
+
+    const wallet = await walletService.createWallet(creatorId);
+    const needed = Number((await estimateBnbTransferCost()) * units);
+    const baseline = Number((await blockchain.getBalance(wallet.address, 'BNB')) / 1e18n);
+
+    const deficit = needed - baseline;
+    if (deficit <= 0) {
+      logger.info(`Payout gas already sufficient for ${wallet.address} (${baseline} BNB ≥ ${needed})`);
+      return '';
+    }
+
+    // 1.5× headroom on the deficit — fee spikes between seed and spend
+    // must not strand the wallet (that's the INSUFFICIENT_FUNDS unwind path).
+    const padded = Number((deficit * 1.5).toFixed(6));
+    logger.info(`Seeding ${padded} BNB gas to ${wallet.address} (deficit ${deficit}, ${units} units)`);
+
+    const seedIdem = hashIdempotencyKey('seed', giveawayId);
+    const { hash } = await blockchain.sendTransaction(
+      config.OPERATOR_WALLET_KEY,
+      wallet.address,
+      BigInt(Math.floor(padded * 1e18)),
+      'BNB',
+      seedIdem
+    );
+
+    // Tracked for adjustOperatorBalance (called post-confirmation in queuePayout path)
+    await redis.set(`gas:seeded:${giveawayId}`, padded.toString());
+
+    return hash;
+  }
+
+  /**
+   * Reclaim leftover seeded gas from the creator's wallet back to the
+   * operator wallet — but ONLY from what this giveaway seeded (never touch
+   * other giveaways' budgets or the user's own BNB).
+   *
+   * Protection: reads `gas:seeded:${giveawayId}` (set at seed time). Zero or
+   * missing → nothing to reclaim (caller bug) or already reclaimed → skip.
+   */
+  async reclaimGas(giveawayId: string): Promise<void> {
+    if (!config.OPERATOR_WALLET_KEY) return;
+
+    const seededStr = await redis.get(`gas:seeded:${giveawayId}`);
+    if (!seededStr) return;
+
+    const seeded = parseFloat(seededStr);
+    if (!(seeded > 0)) {
+      await redis.del(`gas:seeded:${giveawayId}`);
+      return;
+    }
+
+    const giveaway = await prisma.giveaway.findUnique({ where: { id: giveawayId }, include: { creator: true } });
+    if (!giveaway) return;
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: giveaway.creatorId } });
+    if (!wallet) return;
+
+    const bnbBalance = Number((await blockchain.getBalance(wallet.address, 'BNB')) / 1e18n);
+
+    // Leave a small safety margin (0.0003 BNB) for dust/future ops
+    const margin = 0.0003;
+    const reclaimable = Math.min(seeded, Math.max(0, bnbBalance - margin));
+
+    if (reclaimable < 0.00001) {
+      await redis.del(`gas:seeded:${giveawayId}`);
+      return;
+    }
+
+    try {
+      const { hash } = await blockchain.sendTransaction(
+        wallet.encryptedPrivateKey,
+        config.PLATFORM_FEE_WALLET,
+        BigInt(Math.floor(reclaimable * 1e18)),
+        'BNB',
+        hashIdempotencyKey('reclaim', giveawayId)
+      );
+
+      // Confirm before adjusting the ledger so a dropped tx can't double-count
+      await blockchain.waitMined(hash, 90000);
+      await walletService.adjustOperatorBalance('BNB', -reclaimable);
+
+      await redis.del(`gas:seeded:${giveawayId}`);
+      logger.info(`Reclaimed ${reclaimable} BNB from ${wallet.address} (giveaway ${giveawayId})`);
+    } catch (err) {
+      logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message} — key retained for retry`);
+      // Key kept — the next reclaim attempt will retry with the same idempotency key
+    }
+  }
+
+  /**
+   * Forward the creation fee (platform + gas) to the platform wallet.
+   * @param seedHash Seed tx hash — MUST mine first (cross-wallet ordering)
+   */
+  private async forwardCreationFee(
+    giveawayId: string,
+    creatorId: string,
+    asset: string,
+    amount: number,
+    seedHash: string
+  ): Promise<void> {
+    try {
+      if (seedHash) {
+        await blockchain.waitMined(seedHash, 120000);
+      }
+
+      const wallet = await prisma.wallet.findUnique({ where: { userId: creatorId } });
+      if (!wallet) return;
+
+      const raw = await blockchain.getBalance(wallet.address, asset as AssetSymbol);
+      const onChain = Number(raw) / 1e18;
+
+      if (onChain < amount) {
+        logger.warn(`Wallet ${wallet.address} short ${amount} ${asset} (has ${onChain}) — skipping fee forward`);
+        return;
+      }
+
+      const { hash } = await blockchain.sendTransaction(
+        wallet.encryptedPrivateKey,
+        config.PLATFORM_FEE_WALLET,
+        BigInt(Math.floor(amount * 1e18)),
+        asset as AssetSymbol,
+        hashIdempotencyKey('creation-fee-fwd', giveawayId)
+      );
+
+      // Wait for the forward to mine, then mark fee rows swept and settle the
+      // operator ledger (seeded gas + forwarded fee arrive together).
+      await blockchain.waitMined(hash, 120000);
+      await prisma.platformFee.updateMany({
+        where: { sweptAt: null, asset, transaction: { userId: creatorId, metadata: { path: ['giveawayId'], equals: giveawayId } } },
+        data: { sweptAt: new Date() },
+      });
+
+      const seeded = parseFloat((await redis.get(`gas:seeded:${giveawayId}`)) || '0');
+      if (seeded > 0) {
+        await walletService.adjustOperatorBalance('BNB', -seeded);
+        await redis.del(`gas:seeded:${giveawayId}`);
+      }
+
+      logger.info(`Forwarded creation fee ${amount} ${asset} for giveaway ${giveawayId} (tx ${hash})`);
+    } catch (err) {
+      logger.error(`Failed to forward creation fee for ${giveawayId}: ${(err as Error).message}`);
+    }
+  }
+
+  async getGiveawayStats(giveawayId: string): Promise<{
+    giveawayId: string;
+    creatorId: string;
+    totalAmount: string;
+    amountPerUser: string;
+    asset: string;
+    claimedCount: number;
+    maxClaimers: number;
+    claims: Array<{
+      id: string;
+      claimOrder: number;
+      status: string;
+      claimedAt: Date;
+      user: { username: string | null; firstName: string | null };
+    }>;
+    paidClaims: Array<{ id: string }>;
+    pendingClaims: Array<{ id: string }>;
+    failedClaims: Array<{ id: string }>;
+  } | null> {
+    const giveaway = await prisma.giveaway.findUnique({
+      where: { id: giveawayId },
+      include: {
+        claims: {
+          orderBy: { claimOrder: 'asc' },
+          include: { user: { select: { username: true, firstName: true } } },
+        },
+      },
+    });
+
+    if (!giveaway) return null;
+
+    return {
+      giveawayId: giveaway.id,
+      creatorId: giveaway.creatorId,
+      totalAmount: giveaway.totalAmount.toString(),
+      amountPerUser: giveaway.amountPerUser.toString(),
+      asset: giveaway.asset,
+      claimedCount: giveaway.claimedCount,
+      maxClaimers: giveaway.maxClaimers,
+      claims: giveaway.claims.map((c) => ({
+        id: c.id,
+        claimOrder: c.claimOrder,
+        status: c.status,
+        claimedAt: c.claimedAt,
+        user: c.user,
+      })),
+      paidClaims: giveaway.claims.filter((c) => c.status === 'PAID'),
+      pendingClaims: giveaway.claims.filter((c) => c.status === 'QUEUED' || c.status === 'PROCESSING' || c.status === 'ADDRESS_CONFIRMED'),
+      failedClaims: giveaway.claims.filter((c) => c.status === 'FAILED'),
+    };
+  }
+
+  async trackAttempt(giveawayId: string): Promise<void> {
+    await prisma.giveaway.update({
+      where: { id: giveawayId },
+      data: { attemptCount: { increment: 1 } },
+    });
+  }
+}
+
+export const giveawayService = new GiveawayService();
+          }
           
