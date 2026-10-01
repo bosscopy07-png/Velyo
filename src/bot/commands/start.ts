@@ -179,6 +179,21 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       return;
     }
 
+    // ── Referral attribution (spec §3): the giveaway link IS the referral. ──
+    // Recorded only after a successful first claim; idempotent via
+    // unique(giveawayId, claimantId) — retried /start payloads never
+    // duplicate it. Failures are non-fatal to the claim itself.
+    try {
+      const { attributionService } = await import('../../services/attribution');
+      await attributionService.recordAttribution({
+        giveawayId: giveaway.id,
+        claimantId: userId,
+        source: 'GIVEAWAY_LINK',
+      });
+    } catch (err) {
+      logger.error(`Attribution recording failed (non-fatal) for giveaway ${giveaway.id}: ${(err as Error).message}`);
+    }
+
     const claim = await prisma.giveawayClaim.findUnique({
       where: { giveawayId_userId: { giveawayId: giveaway.id, userId } },
     });
@@ -216,5 +231,5 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
   );
-      }
+        }
       
