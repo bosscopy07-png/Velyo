@@ -173,7 +173,8 @@ class DepositSessionService {
     }
   }
 
-  /**
+// ════════════════════════ PART 2 CONTINUES BELOW ════════════════════════
+      /**
    * Find an inbound transfer to the session's assigned address within the
    * session window. USDT: real Transfer events (real txHash). BNB: balance
    * delta between two observations (company deposit wallets only receive
@@ -222,7 +223,7 @@ class DepositSessionService {
     // transfer-event log, and this keeps RPC usage to two balance reads.
     const key = `ds:bal:${session.id}`;
     const prevRaw = await redis.get(key);
-    const current = Number((await blockchain.getBalance(session.assignedWallet.address, 'BNB')) / 1e18n);
+    const current = Number(await blockchain.getBalance(session.assignedWallet.address, 'BNB')) / 1e18;
     await redis.set(key, current.toFixed(12), 'EX', 3600);
     if (!prevRaw) return null; // need a second observation point
 
@@ -434,4 +435,4 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-    
+                                   
