@@ -491,8 +491,180 @@ export function registerTextHandlers(bot: any): void {
           }
           rows.push([Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]);
 
-          await editMainMessage(
+                    await editMainMessage(
             ctx,
             `${e('lock')} <b>USER WALLET</b>\n${DIVIDER}\n\n` +
             `${e('person')} User: <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
-         
+            `${e('wallet')} Address: <code>${target.wallet.address}</code>\n\n` +
+            `<i>Select what to recover. Access is audit-logged.</i>`,
+            Markup.inlineKeyboard(rows)
+          );
+          break;
+        }
+
+        default:
+          await clearUserSession(telegramId);
+      }
+    } catch (err) {
+      if ((err as { code?: string }).code === 'MAINTENANCE_ACTIVE') {
+        // Toggled between the middleware check and the guarded step — nothing was mutated.
+        await clearUserSession(telegramId);
+        await editMainMessage(ctx, formatMaintenanceMessage(), backKeyboard('main'));
+        return;
+      }
+      logger.error('Text handler error:', err);
+      await editMainMessage(
+        ctx,
+        `${e('warning')} An error occurred. Please try again.`,
+        backKeyboard('main')
+      );
+      await clearUserSession(telegramId);
+    }
+  });
+
+  // === EXPIRY SELECTION ===
+  bot.action(/giveaway:expiry:(\d+)/, async (ctx: Context) => {
+    const hours = parseInt((ctx as any).match[1]);
+    const from = ctx.from!;
+    const session = await getUserSession(from.id.toString());
+
+    if (!session || session.state !== 'giveaway_multi_expiry') {
+      await ctx.answerCbQuery('Session expired. Start over.');
+      return;
+    }
+
+    const { amount, asset, maxClaimers, amountPerUser } = session as any;
+    const expiryHours = hours === 0 ? null : hours;
+
+    await setUserSession(from.id.toString(), {
+      state: 'giveaway_multi_confirm',
+      amount,
+      asset,
+      maxClaimers,
+      expiryHours,
+    });
+
+    const cost = await estimateCreationCost(amount, maxClaimers);
+    const usdValue = await pricing.convertToUSD(asset, amount);
+    const ngnValue = await pricing.convertToNGN(asset, amount);
+    const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
+
+    await editMainMessage(
+      ctx,
+      `${e('gift')} <b>GIVEAWAY SUMMARY</b>\n${DIVIDER}\n\n` +
+      `${e('coin')} Asset: <b>${asset}</b>\n` +
+      `${e('gift')} Total Amount: <b>${amount} ${asset}</b>\n` +
+      `${e('people')} Claimers: <b>${maxClaimers}</b>\n` +
+      `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
+      (cost.fee > 0
+        ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+          `${e('fire')} Network Gas (${cost.gasUnits} slots: ${maxClaimers} claims + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
+          `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
+        : '') +
+      `${e('chart')} Per User: <b>≈ ${pricing.formatUSD(usdPerUser)}</b>\n` +
+      `${e('chart')} Total Value: <b>≈ ${pricing.formatUSD(usdValue)}</b>\n` +
+      `${e('naira')} Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n` +
+      `${e('clock')} Expiry: <b>${hours === 0 ? 'No Expiry' : `${hours} Hours`}</b>\n\n` +
+      `${e('check')} <b>Ready to create?</b>`,
+      confirmCancelKeyboard(
+        `giveaway:confirm:multi|${asset}|${amount}|${maxClaimers}|${expiryHours || 0}`,
+        'giveaway'
+      )
+    );
+    await ctx.answerCbQuery();
+  });
+
+  // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
+  bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
+    const claimId = (ctx as any).match[1];
+    const from = ctx.from!;
+
+    await ctx.answerCbQuery('Processing your reward...');
+
+    const session = await getUserSession(from.id.toString());
+    const address =
+      session?.state === 'awaiting_payout_confirm'
+        ? ((session as any).address as string)
+        : undefined;
+
+    if (!address) {
+      await editMainMessage(
+        ctx,
+        `${e('warning')} <b>SESSION EXPIRED</b>\n\nPlease send your wallet address again.`,
+        backKeyboard('main')
+      );
+      return;
+    }
+
+    const claim = await prisma.giveawayClaim.findUnique({
+      where: { id: claimId },
+      include: { giveaway: true },
+    });
+
+    if (!claim || claim.status !== 'RESERVED') {
+      await editMainMessage(ctx, `${e('warning')} <b>INVALID CLAIM</b>\n\nThis claim is no longer valid.`, backKeyboard('main'));
+      return;
+    }
+
+    await giveawayService.submitAddress(claimId, address);
+
+    const idempotencyKey = hashIdempotencyKey('payout', claimId, Date.now().toString());
+    await queuePayout({
+      claimId,
+      giveawayId: claim.giveawayId,
+      userId: claim.userId,
+      address,
+      amount: Number(claim.giveaway.amountPerUser),
+      asset: claim.giveaway.asset,
+      idempotencyKey,
+    });
+
+    await clearUserSession(from.id.toString());
+
+    await editMainMessage(
+      ctx,
+      `${e('check')} <b>REWARD QUEUED</b>\n${DIVIDER}\n\n` +
+      `${e('gift')} Your <b>${claim.giveaway.amountPerUser} ${claim.giveaway.asset}</b> reward has been queued for payout.\n\n` +
+      `${e('clock')} You will receive a notification once it's sent.`,
+      backKeyboard('main')
+    );
+  });
+
+  bot.action(/payout:change:(.+)/, async (ctx: Context) => {
+    const claimId = (ctx as any).match[1];
+    const from = ctx.from!;
+
+    const claim = await prisma.giveawayClaim.findUnique({
+      where: { id: claimId },
+      include: { giveaway: true },
+    });
+    if (!claim) return;
+
+    await setUserSession(from.id.toString(), {
+      state: 'awaiting_payout_address',
+      claimId,
+      asset: claim.giveaway.asset,
+    });
+
+    await editMainMessage(
+      ctx,
+      `${e('deposit')} <b>SEND YOUR ${claim.giveaway.asset} BEP20 WALLET ADDRESS</b>\n\n` +
+      `Type or paste the address below.\n\n` +
+      `⚠️ Must support BNB Smart Chain (BEP20)`,
+      backKeyboard('main')
+    );
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/payout:cancel:(.+)/, async (ctx: Context) => {
+    const from = ctx.from!;
+    await clearUserSession(from.id.toString());
+    await editMainMessage(
+      ctx,
+      `${e('cancel')} <b>PAYOUT CANCELLED</b>\n\nYour spot remains secured. Send /start to return to the menu.`,
+      backKeyboard('main')
+    );
+    await ctx.answerCbQuery();
+  });
+}
+
