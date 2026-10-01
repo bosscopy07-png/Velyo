@@ -31,6 +31,10 @@ const SWEEP_STAGGER_MS = 3000;
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
 
+// UPGRADE (spec §32): Finance / Treasury / Security sections added.
+// Finance = runtime fee configuration (admin:finance in admin/upgrade.ts).
+// Treasury = roles, balances, deposit pool (admin:treasury).
+// Security = duplicate-claim flag review (admin:security).
 const adminPanelKeyboard = Markup.inlineKeyboard([
   [
     Markup.button.callback(`${eb('people')} Users`, 'admin:users'),
@@ -49,8 +53,15 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
     Markup.button.callback(`${eb('document')} Codes`, 'admin:codes'),
   ],
   [
-    Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
+    Markup.button.callback(`${eb('chart')} Finance`, 'admin:finance'),
+    Markup.button.callback(`${eb('money')} Treasury`, 'admin:treasury'),
+  ],
+  [
+    Markup.button.callback(`${eb('shield')} Security`, 'admin:security'),
     Markup.button.callback(`${eb('warning')} Emergency`, 'admin:emergency'),
+  ],
+  [
+    Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
   ],
   [Markup.button.callback(`${eb('back')} Back`, 'main')],
 ]);
@@ -483,7 +494,9 @@ export function registerAdminCommands(bot: any): void {
     );
   });
 }
+
 // ─────────────────────────── PAGINATED RENDERERS ───────────────────────────
+
 async function renderUsersPage(ctx: Context, page: number): Promise<void> {
   const totalUsers = await prisma.user.count();
   const totalPages = Math.max(1, Math.ceil(totalUsers / USERS_PER_PAGE));
@@ -516,351 +529,4 @@ async function renderUsersPage(ctx: Context, page: number): Promise<void> {
 
   // One tappable button per user → full profile (2 per row keeps it compact)
   const userButtons = users.map((u) =>
-    Markup.button.callback(
-      `${u.username ? '@' + u.username : u.firstName || u.telegramId}`.slice(0, 24),
-      `admin:user:${u.id}`
-    )
-  );
-  const userRows: any[] = [];
-  for (let i = 0; i < userButtons.length; i += 2) userRows.push(userButtons.slice(i, i + 2));
-
-  await editMainMessage(
-    ctx,
-    text,
-    Markup.inlineKeyboard([
-      ...userRows,
-      pager('admin:users', page, totalPages, `${totalUsers} users`),
-      [
-        Markup.button.callback(`${eb('search')} Find User`, 'admin:search'),
-        Markup.button.callback(`${eb('back')} Admin Panel`, 'admin'),
-      ],
-    ])
-  );
-}
-
-async function renderFeesPage(ctx: Context, page: number): Promise<void> {
-  const totalFeesCount = await prisma.platformFee.count();
-  const totalPages = Math.max(1, Math.ceil(totalFeesCount / FEES_PER_PAGE));
-
-  const fees = await prisma.platformFee.findMany({
-    skip: page * FEES_PER_PAGE,
-    take: FEES_PER_PAGE,
-    orderBy: { createdAt: 'desc' },
-  });
-
-  let text = `${e('chart')} <b>PLATFORM FEES</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
-  if (fees.length === 0) {
-    text += 'No fees on this page.';
-  }
-  for (const f of fees) {
-    const status = f.sweptAt
-      ? `${e('check')} swept ${f.sweptAt.toLocaleDateString()}`
-      : `${e('clock')} pending`;
-    text += `${e('money')} ${f.amount} ${f.asset} · ${f.createdAt.toLocaleDateString()} · ${status}\n`;
-  }
-
-  const [grandTotal, pendingAgg, sweptAgg] = await Promise.all([
-    prisma.platformFee.aggregate({ _sum: { amount: true } }),
-    prisma.platformFee.aggregate({ where: { sweptAt: null }, _sum: { amount: true } }),
-    prisma.platformFee.aggregate({ where: { sweptAt: { not: null } }, _sum: { amount: true } }),
-  ]);
-  const grand = Number(grandTotal._sum.amount || 0);
-  const pending = Number(pendingAgg._sum.amount || 0);
-  const swept = Number(sweptAgg._sum.amount || 0);
-
-  text += `\n${e('chart')} <b>Totals</b>\n`;
-  text += `${e('money')} All-time: $${grand.toFixed(2)}\n`;
-  text += `${e('clock')} Pending: $${pending.toFixed(2)}${pending > 0 ? ' — use Fee Sweep ↩️' : ''}\n`;
-  text += `${e('check')} Swept: $${swept.toFixed(2)}`;
-
-  await editMainMessage(
-    ctx,
-    text,
-    Markup.inlineKeyboard([
-      pager('admin:fees', page, totalPages, `${totalFeesCount} fees`),
-      [Markup.button.callback(`${eb('money')} Fee Sweep`, 'admin:sweep')],
-      [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
-    ])
-  );
-}
-
-async function renderGiveawaysPage(ctx: Context, page: number): Promise<void> {
-  const total = await prisma.giveaway.count();
-  const totalPages = Math.max(1, Math.ceil(total / GIVEAWAYS_PER_PAGE));
-
-  const giveaways = await prisma.giveaway.findMany({
-    skip: page * GIVEAWAYS_PER_PAGE,
-    take: GIVEAWAYS_PER_PAGE,
-    orderBy: { createdAt: 'desc' },
-    include: { creator: true, claims: true },
-  });
-
-  let text = `${e('gift')} <b>GIVEAWAYS</b> — page ${page + 1}/${totalPages}\n${DIVIDER}\n\n`;
-  if (giveaways.length === 0) text += 'No giveaways on this page.';
-  for (const g of giveaways) {
-    const icon =
-      g.status === 'ACTIVE' ? e('lightning') :
-      g.status === 'COMPLETED' ? e('check') :
-      g.status === 'EXPIRED' ? e('clock') : e('warning');
-    text += `${icon} <b>${g.status}</b> · ${g.totalAmount} ${g.asset} · ${g.claimedCount}/${g.maxClaimers} · @${g.creator.username || 'N/A'}\n`;
-  }
-  text += `\n${e('chart')} <b>Total giveaways:</b> ${total}`;
-
-  await editMainMessage(
-    ctx,
-    text,
-    Markup.inlineKeyboard([
-      pager('admin:giveaways', page, totalPages, `${total} total`),
-      [Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')],
-    ])
-  );
-}
-
-// ─────────────────────────── FEE SWEEP HELPERS ───────────────────────────
-
-async function getUnsweptFees(): Promise<Array<{ userId: string; total: number }>> {
-  const rows = await prisma.platformFee.findMany({
-    where: { sweptAt: null, asset: 'USDT' },
-    include: { transaction: true },
-  });
-  const byUser = new Map<string, number>();
-  for (const r of rows) {
-    const uid = r.transaction.userId;
-    byUser.set(uid, (byUser.get(uid) ?? 0) + Number(r.amount));
-  }
-  return [...byUser.entries()].map(([userId, total]) => ({ userId, total }));
-}
-
-async function renderSweepDashboard(ctx: Context): Promise<void> {
-  const fees = await getUnsweptFees();
-  const eligible = fees.filter((f) => f.total >= SWEEP_THRESHOLD_USDT);
-  const below = fees.length - eligible.length;
-  const totalPullable = eligible.reduce((s, f) => s + f.total, 0);
-  const totalAll = fees.reduce((s, f) => s + f.total, 0);
-
-  let text = `${e('money')} <b>FEE SWEEP</b>\n${DIVIDER}\n\n`;
-  text += `${e('money')} Ready to pull (≥ $${SWEEP_THRESHOLD_USDT}): <b>$${totalPullable.toFixed(4)} USDT</b>\n`;
-  text += `${e('check')} ${eligible.length} user(s) above threshold\n`;
-  text += `${e('clock')} ${below} user(s) below threshold ($${(totalAll - totalPullable).toFixed(4)} total)\n\n`;
-
-  if (eligible.length > 0) {
-    text += `<b>Ready to pull:</b>\n`;
-
-    const users = await prisma.user.findMany({
-      where: { id: { in: eligible.map((f) => f.userId) } },
-      select: { id: true, username: true, telegramId: true },
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    for (const f of eligible.slice(0, 15)) {
-      const u = userMap.get(f.userId);
-      text += `• @${u?.username || u?.telegramId || 'unknown'} — ${f.total.toFixed(4)} USDT\n`;
-    }
-    if (eligible.length > 15) text += `…and ${eligible.length - 15} more\n`;
-  }
-
-  const rows: any[] = [];
-  if (eligible.length > 0) {
-    rows.push([Markup.button.callback(`💰 Pull Out All (${eligible.length})`, 'admin:sweep:run')]);
-  }
-  if (fees.length > 0) {
-    rows.push([Markup.button.callback(`🔥 Max Sweep — everyone (${fees.length})`, 'admin:sweep:max')]);
-  }
-  rows.push([Markup.button.callback(`${eb('back')} Back`, 'admin')]);
-
-  await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-}
-
-/**
- * Sweeps one user's accumulated fee USDT — capped at what the wallet
- * ACTUALLY holds on-chain. Phantom-era fee rows can exceed the real
- * balance (old double-refunds, forgiven claim-backs); the shortfall is
- * forgiven, never chased. Returns the outcome for the run counters.
- */
-async function sweepOne(userId: string, amountUSDT: number): Promise<'swept' | 'short' | 'empty'> {
-  const wallet = await prisma.wallet.findUnique({ where: { userId } });
-  if (!wallet) throw new Error('no wallet');
-
-  // On-chain truth gate: never attempt more than the wallet holds.
-  const rawBalance = await blockchain.getBalance(wallet.address, 'USDT');
-  const onChain = Number(rawBalance) / 1e18;
-  const sweepable = Math.min(amountUSDT, Math.max(0, onChain - SWEEP_RESERVE_USDT));
-
-  if (sweepable < SWEEP_RESERVE_USDT) {
-    logger.warn(
-      `Sweep skip user ${userId}: on-chain ${onChain.toFixed(4)} USDT < fee ${amountUSDT.toFixed(4)} (phantom gap — forgiven, rows left pending)`
-    );
-    return 'empty';
-  }
-
-  const baseline = await blockchain.getBalance(wallet.address, 'BNB');
-  let seedHash: string | null = null;
-  if (baseline < SWEEP_GAS_SEED) {
-    if (!config.OPERATOR_WALLET_KEY) throw new Error('OPERATOR_WALLET_KEY not configured');
-    const seedAmount = SWEEP_GAS_SEED - baseline + SWEEP_SEED_BUFFER_WEI;
-    const sent = await blockchain.sendTransaction(
-      config.OPERATOR_WALLET_KEY,
-      wallet.address,
-      seedAmount,
-      'BNB',
-      `sweep-seed-${wallet.address.slice(-8)}-${Date.now()}`
-    );
-    seedHash = sent.hash;
-    await walletService.adjustOperatorBalance('BNB', -Number(seedAmount) / 1e18);
-  }
-
-  // Cross-wallet ordering: seed (admin) → forward (user), different queues.
-  if (seedHash) await blockchain.waitMined(seedHash, 60000);
-
-  const rawFee = BigInt(Math.floor(sweepable * 1e18));
-  const { hash } = await blockchain.sendTransaction(
-    wallet.encryptedPrivateKey,
-    config.PLATFORM_FEE_WALLET,
-    rawFee,
-    'USDT',
-    `sweep-fwd-${wallet.address.slice(-8)}-${Date.now()}`
-  );
-
-  await prisma.platformFee.updateMany({
-    where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
-    data: { sweptAt: new Date() },
-  });
-  await walletService.adjustOperatorBalance('USDT', sweepable);
-
-  if (sweepable < amountUSDT) {
-    logger.warn(`Sweep short user ${userId}: pulled ${sweepable.toFixed(4)} of ${amountUSDT.toFixed(4)} (on-chain limit; remainder forgiven)`);
-    return 'short';
-  }
-  return 'swept';
-}
-
-/**
- * @param minAmount 0 = Max Sweep (every user, dust included); otherwise
- * only users with at least this much accumulated.
- */
-async function runSweep(ctx: Context, minAmount: number): Promise<void> {
-  const eligible = (await getUnsweptFees()).filter((f) => f.total >= minAmount);
-  let full = 0;
-  let partial = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  if (eligible.length === 0) {
-    await editMainMessage(
-      ctx,
-      `${e('check')} <b>NOTHING TO SWEEP</b>\n\nNo user has unswept fees right now.`,
-      Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
-    );
-    return;
-  }
-
-  const label = minAmount === 0 ? 'MAX SWEEP' : 'FEE SWEEP';
-
-  for (const f of eligible) {
-    try {
-      const result = await sweepOne(f.userId, f.total);
-      if (result === 'swept') full++;
-      else if (result === 'short') partial++;
-      else skipped++;
-    } catch (err) {
-      failed++;
-      logger.error(`Sweep failed for user ${f.userId}: ${(err as Error).message}`);
-    }
-
-    try {
-      await editMainMessage(
-        ctx,
-        `${e('money')} <b>${label} RUNNING…</b>\n` +
-        `${DIVIDER}\n\n` +
-        `${e('people')} Processed: <b>${full + partial + skipped + failed}/${eligible.length}</b>\n` +
-        `${e('check')} Full: <b>${full}</b>\n` +
-        `${e('warning')} Partial: <b>${partial}</b>\n` +
-        `${e('clock')} Skipped (on-chain short): <b>${skipped}</b>\n` +
-        `${e('cancel')} Failed: <b>${failed}</b>`,
-        Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
-      );
-    } catch { /* message may be too old to edit — ignore */ }
-
-    await new Promise((r) => setTimeout(r, SWEEP_STAGGER_MS));
-  }
-
-  await editMainMessage(
-    ctx,
-    `${e('check')} <b>${label} COMPLETE</b>\n` +
-    `${DIVIDER}\n\n` +
-    `${e('check')} Fully swept: <b>${full}</b>\n` +
-    `${e('warning')} Partially swept (on-chain cap): <b>${partial}</b>\n` +
-    `${e('clock')} Skipped (insufficient on-chain): <b>${skipped}</b>\n` +
-    `${e('cancel')} Failed: <b>${failed}</b>`,
-    Markup.inlineKeyboard([[Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]])
-  );
-}
-
-// ─────────────────────────── DASHBOARD ───────────────────────────
-
-async function renderDashboard(ctx: Context): Promise<void> {
-  const stats = await getAdminStats();
-
-  await editMainMessage(
-    ctx,
-    `${e('crown')} <b>VEYLO ADMIN DASHBOARD</b>\n` +
-    `${DIVIDER}\n\n` +
-    `${e('people')} <b>Users</b>\n` +
-    `└ Total: <b>${stats.totalUsers}</b>\n` +
-    `└ New Today: <b>${stats.newUsersToday}</b>\n` +
-    `└ Active Today: <b>${stats.activeUsersToday}</b>\n\n` +
-    `${e('money')} <b>Finance</b>\n` +
-    `└ Total Deposits: <b>${stats.totalDeposits}</b>\n` +
-    `└ Fees Collected: <b>$${stats.totalFees}</b>\n` +
-    `└ USDT Held: <b>$${stats.totalUSDT}</b>\n` +
-    `└ BNB Held: <b>${stats.totalBNB}</b>\n\n` +
-    `${e('gift')} <b>Giveaways</b>\n` +
-    `└ Total: <b>${stats.totalGiveaways}</b>\n` +
-    `└ Active: <b>${stats.activeGiveaways}</b>\n` +
-    `└ Pending Payouts: <b>${stats.pendingPayouts}</b>`,
-    adminPanelKeyboard
-  );
-}
-
-async function getAdminStats() {
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-  const [
-    totalUsers,
-    newUsersToday,
-    activeUsersToday,
-    totalDeposits,
-    totalFees,
-    totalUSDT,
-    totalBNB,
-    totalGiveaways,
-    activeGiveaways,
-    pendingPayouts,
-  ] = await Promise.all([
-    prisma.user.count(),
-    prisma.user.count({ where: { joinDate: { gte: today } } }),
-    prisma.user.count({ where: { lastActive: { gte: today } } }),
-    prisma.transaction.count({ where: { type: 'DEPOSIT', status: 'CONFIRMED' } }),
-    prisma.platformFee.aggregate({ _sum: { amount: true } }),
-    prisma.balance.aggregate({ where: { asset: 'USDT' }, _sum: { availableBalance: true } }),
-    prisma.balance.aggregate({ where: { asset: 'BNB' }, _sum: { availableBalance: true } }),
-    prisma.giveaway.count(),
-    prisma.giveaway.count({ where: { status: 'ACTIVE' } }),
-    prisma.giveawayClaim.count({ where: { status: { in: ['QUEUED', 'PROCESSING'] } } }),
-  ]);
-
-  return {
-    totalUsers,
-    newUsersToday,
-    activeUsersToday,
-    totalDeposits,
-    totalFees: Number(totalFees._sum.amount || 0).toFixed(2),
-    totalUSDT: Number(totalUSDT._sum.availableBalance || 0).toFixed(2),
-    totalBNB: Number(totalBNB._sum.availableBalance || 0).toFixed(6),
-    totalGiveaways,
-    activeGiveaways,
-    pendingPayouts,
-  };
-       }
-      
+    Mark
