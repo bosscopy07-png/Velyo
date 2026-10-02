@@ -70,6 +70,7 @@ async function getThresholds(): Promise<TreasuryThresholds> {
 export interface TreasuryStatus {
   address: string;
   payoutOrigin: 'creator' | 'platform';
+  legacyMonitorEnabled: boolean;
   bnb: number;
   usdt: number;
   companyWalletsActive: number;
@@ -108,6 +109,7 @@ class TreasuryMonitor {
     return {
       address: config.PLATFORM_FEE_WALLET,
       payoutOrigin: getPayoutOrigin(),
+      legacyMonitorEnabled: config.ENABLE_LEGACY_DEPOSIT_MONITOR,
       bnb: Number(bnbRaw) / 1e18,
       usdt: Number(usdtRaw) / 1e18,
       companyWalletsActive,
@@ -173,3 +175,4 @@ class TreasuryMonitor {
 }
 
 export const treasuryMonitor = new TreasuryMonitor();
+          
