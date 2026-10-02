@@ -145,7 +145,12 @@ class DepositSessionService {
     }
 
     try {
-      const detected = await this.findInboundTransfer(session);
+      const detected = await this.findInboundTransfer({
+        id: session.id,
+        asset: session.asset,
+        expectedAmount: Number(session.expectedAmount),
+        assignedWallet: session.assignedWallet,
+      });
       if (!detected) return { status: 'not_found' };
 
       // Receipt check: only successful txs are ever credited (spec §18.8).
@@ -165,7 +170,17 @@ class DepositSessionService {
         return { status: 'pending_confirmations', txHash: detected.txHash };
       }
 
-      return await this.creditSession(session, detected.txHash, detected.amount);
+      return await this.creditSession(
+        {
+          id: session.id,
+          userId: session.userId,
+          asset: session.asset,
+          requestedAmount: Number(session.requestedAmount),
+          platformFee: Number(session.platformFee),
+        },
+        detected.txHash,
+        detected.amount
+      );
     } catch (err) {
       // RPC failure ≠ deposit failure (spec §35) — report inconclusive, mutate nothing.
       logger.error(`verifySession(${sessionId}) error: ${(err as Error).message}`);
@@ -173,8 +188,7 @@ class DepositSessionService {
     }
   }
 
-// ════════════════════════ PART 2 CONTINUES BELOW ════════════════════════
-      /**
+  /**
    * Find an inbound transfer to the session's assigned address within the
    * session window. USDT: real Transfer events (real txHash). BNB: balance
    * delta between two observations (company deposit wallets only receive
@@ -435,4 +449,4 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-                                   
+    
