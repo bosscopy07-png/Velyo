@@ -79,10 +79,23 @@ async function startBot(): Promise<void> {
 startBot();
 
 // In-process background jobs
-depositMonitor.start();
+// UPGRADE (spec §17/§19): legacy PER-USER deposit monitoring is OFF by
+// default. Only company-pool deposit sessions are monitored (2 light
+// sweeps/min, bounded by live session count — never by total user count).
+// Historical DepositMonitor rows remain untouched in the DB.
+// Set ENABLE_LEGACY_DEPOSIT_MONITOR=true ONLY for a transition period.
+if (config.ENABLE_LEGACY_DEPOSIT_MONITOR) {
+  depositMonitor.start();
+  logger.info('LEGACY per-user deposit monitoring ENABLED (transition mode — heavy RPC usage)');
+} else {
+  logger.info('Legacy per-user deposit monitoring DISABLED — company pool sessions only');
+}
 depositSessionService.start();
 claimExpiry.start();
 balanceSync.start();
+
+// Treasury health: debounced Telegram alerts to admins (low BNB/USDT,
+// payout queue backlog, empty deposit pool).
 treasuryMonitor.start((message) => {
   for (const adminId of config.ADMIN_TELEGRAM_IDS) {
     bot.telegram.sendMessage(adminId, message, { parse_mode: 'HTML' }).catch((err) => {
