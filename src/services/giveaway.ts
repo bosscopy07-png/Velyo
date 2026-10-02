@@ -240,7 +240,7 @@ class GiveawayService {
           netAmount: -data.totalAmount,
           status: 'CONFIRMED',
           idempotencyKey: hashIdempotencyKey('giveaway', g.id),
-          metadata: { giveawayId: g.id, feeBreakdown: { platformFee: cost.platformFee, gasFee: cost.gasFee, gasUnits: cost.gasUnits, appliedRewardCredit } },
+          metadata: { giveawayId: g.id, feeBreakdown: { platformFee: cost.platformFee, gasFee: cost.gasFee, gasUnits: cost.gasUnits, appliedCredit } },
         },
       });
 
@@ -320,8 +320,8 @@ class GiveawayService {
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
-        }
-        /**
+}
+      /**
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
@@ -490,7 +490,7 @@ class GiveawayService {
     }
   }
 
-async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+  async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
       await assertUserOperational(userId);
@@ -693,4 +693,4 @@ async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: bool
 }
 
 export const giveawayService = new GiveawayService();
-      
+                                                  
