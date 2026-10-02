@@ -226,40 +226,44 @@ export function registerCallbacks(bot: any): void {
     await renderWallet(ctx);
   }));
 
-  // === DEPOSIT ===
+  // === DEPOSIT (UPGRADE §11–13: company pool sessions) ===
+  // Personal wallets are NO LONGER deposit addresses and are NOT monitored
+  // for deposits. Deposits use a company pool address assigned per-session
+  // (30-minute window, unique amount, "I Have Deposited" verification).
+  // The personal wallet address stays — it still holds giveaway funds/gas.
   bot.action('wallet:deposit', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('deposit')} <b>SELECT ASSET TO DEPOSIT</b>\n\nChoose which asset you want to deposit.`,
-      assetKeyboard('deposit')
+      `${e('deposit')} <b>DEPOSIT</b>\n\n` +
+      `You'll receive a dedicated company deposit address, valid for <b>30 minutes</b>, ` +
+      `with a unique amount so your payment is matched instantly.\n\n` +
+      `Choose an asset to start:`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback(`🟡 New BNB Deposit`, 'deposit:session:BNB')],
+        [Markup.button.callback(`🟢 New USDT Deposit`, 'deposit:session:USDT')],
+        [Markup.button.callback(`${eb('back')} Back`, 'wallet')],
+      ])
     );
   }));
 
   bot.action(/deposit:(BNB|USDT)/, guard(async (ctx: Context) => {
-    await ctx.answerCbQuery();
+    // UPGRADE: old personal-wallet deposit addresses are RETIRED. They are
+    // no longer monitored, so deposits sent there would not be detected.
+    // Redirect every tap to the session flow. (History is preserved in the
+    // DB; the address still custodies funds — it is simply no longer a
+    // deposit endpoint.)
+    await ctx.answerCbQuery('Personal deposit addresses are retired — use a new deposit session.');
     const asset = (ctx as any).match[1] as string;
-    const from = ctx.from!;
-    let user = await prisma.user.findUnique({
-      where: { telegramId: from.id.toString() },
-      include: { wallet: true },
-    });
-
-    if (!user) return;
-
-    if (!user.wallet) {
-      await walletService.createWallet(user.id);
-      user = await prisma.user.findUnique({
-        where: { telegramId: from.id.toString() },
-        include: { wallet: true },
-      });
-      if (!user?.wallet) return;
-    }
-
+    const { setUserSession } = await import('../../services/redis');
+    await setUserSession(ctx.from!.id.toString(), { state: 'deposit_amount', asset });
     await editMainMessage(
       ctx,
-      formatDepositMessage(asset, user.wallet.address),
-      depositKeyboard(asset)
+      `${e('deposit')} <b>NEW ${asset} DEPOSIT</b>\n\n` +
+      `Personal deposit addresses are <b>no longer used</b>.\n\n` +
+      `Enter the amount you want to deposit (in ${asset}):\n\n` +
+      `${e('edit')} Example: <code>10</code>`,
+      backKeyboard('account:deposits')
     );
   }));
 
@@ -414,7 +418,7 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
     await renderHistory(ctx);
   }));
-                                                           // === ACCOUNT ===
+    // === ACCOUNT ===
   bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
@@ -542,5 +546,4 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-      }
-      
+}
