@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../database';
 import { redis } from './redis';
 import { config } from '../config';
@@ -94,10 +95,13 @@ class FeeConfigService {
     const parsed = patchSchema.parse(patch); // throws on invalid
     const next: FeeConfig = { ...current, ...parsed };
 
+    // Prisma Json fields need InputJsonValue — a JSON round-trip both
+    // validates serializability and satisfies the type.
+    const jsonValue = JSON.parse(JSON.stringify(next)) as Prisma.InputJsonObject;
     await prisma.systemConfig.upsert({
       where: { key: CONFIG_ROW_KEY },
-      create: { key: CONFIG_ROW_KEY, value: next as object, updatedBy: adminTelegramId },
-      update: { value: next as object, updatedBy: adminTelegramId },
+      create: { key: CONFIG_ROW_KEY, value: jsonValue, updatedBy: adminTelegramId },
+      update: { value: jsonValue, updatedBy: adminTelegramId },
     });
 
     // Audit the diff only (not the whole config) — old/new per touched key.
@@ -108,8 +112,10 @@ class FeeConfigService {
         action: 'FEE_CONFIG_CHANGE',
         entityType: 'system_config',
         entityId: CONFIG_ROW_KEY,
-        oldValue: Object.fromEntries(touched.map((k) => [k, (current as Record<string, unknown>)[k]])),
-        newValue: parsed,
+        oldValue: JSON.parse(
+          JSON.stringify(Object.fromEntries(touched.map((k) => [k, (current as unknown as Record<string, unknown>)[k]])))
+        ) as Prisma.InputJsonObject,
+        newValue: JSON.parse(JSON.stringify(parsed)) as Prisma.InputJsonObject,
       },
     });
 
