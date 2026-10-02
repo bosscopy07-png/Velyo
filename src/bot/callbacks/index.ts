@@ -4,7 +4,7 @@ import { config } from '../../config';
 import { isAdmin } from '../middleware/security';
 import { e, eb } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
-import { BOT_USERNAME, editMainMessage } from '../utils/editMainMessage';
+import { editMainMessage } from '../utils/editMainMessage';
 import {
   mainKeyboard,
   backKeyboard,
@@ -15,11 +15,16 @@ import {
 import {
   formatDepositMessage,
   formatGiveawayCreatedMessage,
+  formatWalletMessage,
+  formatMyGiveawaysMessage,
 } from '../messages';
 import { setUserSession } from '../../services/redis';
 import { giveawayService } from '../../services/giveaway';
 import { walletService } from '../../services/wallet';
 import { formatAddress } from '../../utils/validation';
+
+// Telegram t.me links break if the username contains "@"
+const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 
 export function registerCallbacks(bot: any): void {
   // ─────────────────────────── RENDERERS ───────────────────────────
@@ -45,19 +50,19 @@ export function registerCallbacks(bot: any): void {
     const usdtBalance = user.balances.find((b) => b.asset === 'USDT');
     const bnbBalance = user.balances.find((b) => b.asset === 'BNB');
 
-    const text = [
-      `${e('wallet')} <b>MY WALLET</b>`,
-      `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`,
-      '',
-      `<b>Address:</b> <code>${user.wallet.address}</code>`,
-      '',
-      `${e('coin')} <b>BNB Balance:</b> <code>${Number(bnbBalance?.availableBalance || 0).toFixed(4)} BNB</code>`,
-      `${e('money')} <b>USDT Balance:</b> <code>${Number(usdtBalance?.availableBalance || 0).toFixed(2)} USDT</code>`,
-      '',
-      `${e('globe')} <b>Network:</b> BNB Smart Chain (BEP20)`,
-      '',
-      `${e('warning')} Send only BEP20 tokens to this address.`,
-    ].join('\n');
+    // On-chain truth — the DB mirror can hold phantom credits.
+    const [onChainUsdt, onChainBnb] = await Promise.all([
+      blockchain.getBalance(user.wallet.address, 'USDT'),
+      blockchain.getBalance(user.wallet.address, 'BNB'),
+    ]);
+
+    const text = formatWalletMessage(
+      user.wallet.address,
+      Number(onChainUsdt) / 1e18,
+      Number(onChainBnb) / 1e18,
+      Number(usdtBalance?.availableBalance || 0),
+      Number(bnbBalance?.availableBalance || 0)
+    );
 
     await editMainMessage(
       ctx,
@@ -116,20 +121,7 @@ export function registerCallbacks(bot: any): void {
       include: { claims: true },
     });
 
-    let text = `${e('gift')} <b>MY GIVEAWAYS</b>\n${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n`;
-    if (giveaways.length === 0) {
-      text += 'No giveaways yet.\nTap Create below to start one!';
-    }
-
-    for (const g of giveaways) {
-      const status =
-        g.status === 'ACTIVE' ? `${e('check')} ACTIVE` :
-        g.status === 'FULL' ? `${e('warning')} FULL` :
-        g.status === 'COMPLETED' ? `${e('party')} COMPLETED` :
-        g.status === 'CANCELLED' ? `${e('cancel')} CANCELLED` :
-        `${e('clock')} ${g.status}`;
-      text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
-    }
+    let text = formatMyGiveawaysMessage(giveaways);
 
     // Cancel only while nothing has been paid out
     const rows: any[] = giveaways
@@ -157,8 +149,8 @@ export function registerCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-           }
-      const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
+        }
+                                  const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
     } catch (err) {
@@ -331,7 +323,8 @@ export function registerCallbacks(bot: any): void {
     if (!user) return;
     await renderMyGiveaways(ctx, user.id);
   }));
-                                      bot.action(/giveaway:cancel:(.+)/, guard(async (ctx: Context) => {
+
+  bot.action(/giveaway:cancel:(.+)/, guard(async (ctx: Context) => {
     const giveawayId = (ctx as any).match[1];
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
@@ -380,8 +373,7 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
     await renderHistory(ctx);
   }));
-
-  // === ACCOUNT ===
+      // === ACCOUNT ===
   bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
@@ -509,5 +501,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-             }
-       
+      }
+      
