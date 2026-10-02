@@ -13,7 +13,7 @@ import { redis, setUserSession } from '../services/redis';
 
 /**
  * Phase-2 admin surface: Finance (runtime fee config), Security (duplicate
- * claim flags), Treasury (roles, balances, deposit pool management).
+ * claim flags), Treasury (roles, balances, deposit pool, monitor status).
  * All actions: admin-only (isAdmin middleware already guards the Admin
  * entry), audited, validated.
  */
@@ -121,7 +121,6 @@ export function registerAdminUpgrade(bot: any): void {
     await ctx.answerCbQuery(action === 'dismiss' ? 'Flag dismissed.' : 'Flag confirmed.');
     // Note: confirming abuse does NOT auto-ban — an admin still acts via the
     // existing user-management tools (global bans stay admin-only, spec §8).
-    const { backKeyboard } = await import('../bot/keyboards/main');
     await editMainMessage(
       ctx,
       `${e('check')} Flag ${action === 'dismiss' ? 'dismissed' : 'confirmed'}.` +
@@ -141,6 +140,7 @@ export function registerAdminUpgrade(bot: any): void {
       '',
       `<b>Address:</b> <code>${status.address}</code>`,
       `<b>Payout origin:</b> ${status.payoutOrigin === 'platform' ? '🏦 Platform wallet' : '👤 Creator wallets (legacy)'}`,
+      `<b>Legacy user-wallet deposit monitoring:</b> ${status.legacyMonitorEnabled ? '🟡 ON (transition mode)' : '⚫ OFF (company sessions only)'}`,
       '',
       `🟡 BNB (gas): <b>${status.bnb.toFixed(6)}</b>`,
       `🟢 USDT: <b>${status.usdt.toFixed(2)}</b>`,
@@ -204,11 +204,10 @@ export function registerAdminUpgrade(bot: any): void {
       data: { adminId: ctx.from!.id.toString(), action: 'DEPOSIT_WALLET_DISABLE', entityType: 'company_deposit_wallet', entityId: id },
     });
     await ctx.answerCbQuery('Address disabled. Historical sessions remain intact.');
-    const { backKeyboard } = await import('../bot/keyboards/main');
     await editMainMessage(ctx, `${e('check')} Company deposit address disabled.\nHistorical records remain for audit.`, backKeyboard('admin:dwallets'));
   }));
 
-  // Treasury alert debounce cleanup helper — occasionally purge stale keys
-  // (defensive; TTL handles it anyway).
+  // Treasury alert debounce key hygiene reference — TTL handles expiry;
+  // this import keeps the module graph explicit.
   void redis;
-}
+                                                       }
