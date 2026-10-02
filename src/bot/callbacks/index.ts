@@ -1,82 +1,129 @@
-import { Context, Markup } from 'telegraf';
+import { Context } from 'telegraf';
+import { Markup } from 'telegraf';
 import { prisma } from '../../database';
+import { walletService } from '../../services/wallet';
+import { giveawayService } from '../../services/giveaway';
+import { blockchain } from '../../services/blockchain';
+import { redis, setUserSession } from '../../services/redis';
 import { config } from '../../config';
-import { isAdmin } from '../middleware/security';
 import { e, eb } from '../../utils/emoji';
 import { logger } from '../../utils/logger';
-import { editMainMessage } from '../utils/editMainMessage';
+import { formatWalletMessage, formatDepositMessage, formatGiveawayCreatedMessage } from '../messages';
 import {
   mainKeyboard,
-  backKeyboard,
-  assetKeyboard,
+  walletKeyboard,
   depositKeyboard,
   giveawayTypeKeyboard,
+  backKeyboard,
+  assetKeyboard,
 } from '../keyboards/main';
-import {
-  formatDepositMessage,
-  formatGiveawayCreatedMessage,
-  formatWalletMessage,
-  formatMyGiveawaysMessage,
-} from '../messages';
-import { setUserSession } from '../../services/redis';
-import { giveawayService } from '../../services/giveaway';
-import { walletService } from '../../services/wallet';
 import { formatAddress } from '../../utils/validation';
+import { editMainMessage } from '../utils/editMainMessage';
 
 // Telegram t.me links break if the username contains "@"
 const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 
 export function registerCallbacks(bot: any): void {
-  // ─────────────────────────── RENDERERS ───────────────────────────
+  const isAdmin = (ctx: Context): boolean =>
+    !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
+
+  /**
+   * Platform money sitting in the user's wallet that is NOT spendable:
+   *  - unswept USDT platform fees (owed to the platform until swept/forwarded)
+   *  - seeded BNB gas floats (recorded in Redis gas:credit:*, reclaimed later)
+   * These must be subtracted from what we display, or users see money they
+   * can't actually use (the giveaway creation gate subtracts them too).
+   */
+  async function getPlatformReserve(userId: string, address: string): Promise<{ USDT: number; BNB: number }> {
+    const reserve = { USDT: 0, BNB: 0 };
+
+    // Unswept fees owed on this user's deposits/giveaways
+    const feesAgg = await prisma.platformFee.aggregate({
+      where: { sweptAt: null, asset: 'USDT', transaction: { userId } },
+      _sum: { amount: true },
+    });
+    reserve.USDT = Number(feesAgg._sum.amount ?? 0);
+
+    // Active seeded gas floats for this address (across all its giveaways).
+    // Plain SCAN cursor loop — compatible with ioredis v4 AND v5.
+    try {
+      let cursor = '0';
+      do {
+        const [next, keys] = (await redis.scan(
+          cursor,
+          'MATCH', 'gas:credit:*',
+          'COUNT', 200,
+        )) as unknown as [string, string[]];
+
+        for (const key of keys) {
+          const raw = await redis.get(key);
+          if (!raw) continue;
+          const credit = JSON.parse(raw) as { address: string; seeded: string };
+          if (credit.address === address && BigInt(credit.seeded) > 0n) {
+            reserve.BNB += Number(BigInt(credit.seeded)) / 1e18;
+          }
+        }
+
+        cursor = next;
+      } while (cursor !== '0');
+    } catch (err) {
+      // Float lookup is best-effort — never block the wallet view on it
+      logger.warn(`Gas float lookup failed for ${address}: ${(err as Error).message}`);
+    }
+
+    return reserve;
+  }
 
   async function renderWallet(ctx: Context): Promise<void> {
     const from = ctx.from!;
     let user = await prisma.user.findUnique({
       where: { telegramId: from.id.toString() },
-      include: { wallet: true, balances: true },
+      include: { balances: true, wallet: true },
     });
+
     if (!user) return;
 
-    // Lazy wallet: created on demand
     if (!user.wallet) {
       await walletService.createWallet(user.id);
       user = await prisma.user.findUnique({
         where: { telegramId: from.id.toString() },
-        include: { wallet: true, balances: true },
+        include: { balances: true, wallet: true },
       });
-      if (!user?.wallet) return;
     }
 
-    const usdtBalance = user.balances.find((b) => b.asset === 'USDT');
-    const bnbBalance = user.balances.find((b) => b.asset === 'BNB');
+    if (!user?.wallet) return;
 
-    // On-chain truth — the DB mirror can hold phantom credits.
-    const [onChainUsdt, onChainBnb] = await Promise.all([
-      blockchain.getBalance(user.wallet.address, 'USDT'),
-      blockchain.getBalance(user.wallet.address, 'BNB'),
-    ]);
+    // LIVE on-chain balances minus everything that's reserved:
+    //   locked          → giveaway escrow (DB is authoritative)
+    //   unswept fees    → platform's USDT, still in the wallet
+    //   gas floats      → seeded BNB, reclaimed by admin later
+    // The DB is only a fallback if the chain read fails.
+    const reserve = await getPlatformReserve(user.id, user.wallet.address);
 
-    const text = formatWalletMessage(
-      user.wallet.address,
-      Number(onChainUsdt) / 1e18,
-      Number(onChainBnb) / 1e18,
-      Number(usdtBalance?.availableBalance || 0),
-      Number(bnbBalance?.availableBalance || 0)
+    const balances = await Promise.all(
+      (['BNB', 'USDT'] as const).map(async (asset) => {
+        const db = user!.balances.find((b) => b.asset === asset);
+        const locked = Number(db?.lockedBalance ?? 0);
+        const platformReserve = reserve[asset] ?? 0;
+
+        let onChain = Number(db?.availableBalance ?? 0);
+        try {
+          const raw = await blockchain.getBalance(user!.wallet!.address, asset);
+          onChain = Number(raw) / 1e18;
+        } catch (err) {
+          logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
+        }
+
+        return {
+          asset,
+          available: Math.max(0, onChain - locked - platformReserve),
+          locked,
+        };
+      })
     );
 
-    await editMainMessage(
-      ctx,
-      text,
-      Markup.inlineKeyboard([
-        [Markup.button.callback(`${eb('refresh')} Refresh`, 'wallet:refresh')],
-        [
-          Markup.button.callback(`${eb('copy')} Copy Address`, `wallet:copy:${user.wallet.address}`),
-          Markup.button.callback(`${eb('deposit')} Deposit`, 'wallet:deposit'),
-        ],
-        [Markup.button.callback(`${eb('document')} History`, 'wallet:history')],
-        [Markup.button.callback(`${eb('back')} Back`, 'main')],
-      ])
-    );
+    const caption = await formatWalletMessage(balances);
+    await editMainMessage(ctx, caption, walletKeyboard);
   }
 
   async function renderHistory(ctx: Context): Promise<void> {
@@ -84,33 +131,21 @@ export function registerCallbacks(bot: any): void {
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
     if (!user) return;
 
-    const transactions = await prisma.transaction.findMany({
+    const txs = await prisma.transaction.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: 'desc' },
-      take: 20,
+      take: 10,
     });
 
-    let text = `${e('chart')} <b>TRANSACTION HISTORY</b>\n${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}\n\n`;
+    let text = `${e('document')} <b>RECENT ACTIVITY</b>\n\n`;
+    if (txs.length === 0) text += 'No transactions yet.';
 
-    if (transactions.length === 0) {
-      text += 'No transactions yet.';
-    } else {
-      for (const tx of transactions) {
-        const date = tx.createdAt.toLocaleDateString();
-        const icons: Record<string, string> = {
-          DEPOSIT: e('deposit'),
-          WITHDRAWAL: e('money'),
-          GIVEAWAY_CREATED: e('gift'),
-          GIVEAWAY_REWARD: e('party'),
-          CODE_REDEMPTION: e('diamond'),
-          REFUND: e('refresh'),
-          PAYOUT: e('money'),
-        };
-        text += `${icons[tx.type] || e('document')} ${tx.type}: <code>${tx.amount} ${tx.asset}</code> — ${tx.status} (${date})\n`;
-      }
+    for (const tx of txs) {
+      const sign = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND'].includes(tx.type) ? '+' : '-';
+      text += `${sign}${tx.amount} ${tx.asset} — ${tx.status}\n`;
     }
 
-    await editMainMessage(ctx, text, backKeyboard('account'));
+    await editMainMessage(ctx, text, backKeyboard('wallet'));
   }
 
   async function renderMyGiveaways(ctx: Context, userId: string): Promise<void> {
@@ -121,7 +156,13 @@ export function registerCallbacks(bot: any): void {
       include: { claims: true },
     });
 
-    let text = formatMyGiveawaysMessage(giveaways);
+    let text = `${e('chart')} <b>MY GIVEAWAYS</b>\n\n`;
+    if (giveaways.length === 0) text += 'No giveaways created yet.';
+
+    for (const g of giveaways) {
+      const status = g.status === 'ACTIVE' ? '🟢' : g.status === 'FULL' ? '🔴' : '⚪';
+      text += `${status} ${g.totalAmount} ${g.asset} | ${g.claimedCount}/${g.maxClaimers} claimed | ${g.status}\n`;
+    }
 
     // Cancel only while nothing has been paid out
     const rows: any[] = giveaways
@@ -149,8 +190,8 @@ export function registerCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-        }
-                                  const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
+}
+    const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
     } catch (err) {
@@ -373,7 +414,7 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
     await renderHistory(ctx);
   }));
-      // === ACCOUNT ===
+                                                           // === ACCOUNT ===
   bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
