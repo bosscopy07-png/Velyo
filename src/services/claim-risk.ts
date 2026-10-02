@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../database';
 import { logger } from '../utils/logger';
 
@@ -14,7 +15,7 @@ export type RiskSignal = 'SHARED_WALLET' | 'CROSS_ACCOUNT_WALLET' | 'CLAIM_VELOC
 
 interface SignalCheck {
   signal: RiskSignal;
-  detail: Record<string, unknown>;
+  detail: Prisma.InputJsonObject;
 }
 
 /** Pure classifier — exported for unit tests (no DB). */
@@ -140,3 +141,4 @@ class ClaimRiskService {
 }
 
 export const claimRiskService = new ClaimRiskService();
+  
