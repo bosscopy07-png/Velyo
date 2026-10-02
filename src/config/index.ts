@@ -49,7 +49,13 @@ const envSchema = z.object({
   // wallet (OPERATOR_WALLET_KEY / PLATFORM_FEE_WALLET); the creator's balance
   // lock is unchanged (internal reservation only).
   PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('creator'),
-
+    // ── Phase-2 upgrade: legacy per-user deposit monitoring ──
+  // New deposits use company pool sessions (services/deposit-session.ts).
+  // Personal wallets are NOT monitored for deposits when this is false.
+  // User wallets REMAIN in the DB and still custody giveaway funds/gas —
+  // they are only retired as deposit endpoints.
+  ENABLE_LEGACY_DEPOSIT_MONITOR: z.string().default('false').transform((s) => s === 'true'),
+  
   // ── Phase-2 upgrade: deposit session window (minutes) ──
   DEPOSIT_SESSION_TTL_MINUTES: z.string().default('30').transform(Number),
 
