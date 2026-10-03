@@ -100,23 +100,29 @@ export function registerCallbacks(bot: any): void {
     // The DB is only a fallback if the chain read fails.
     const reserve = await getPlatformReserve(user.id, user.wallet.address);
 
+    // UPGRADE (spec §23/§37): the INTERNAL ledger balance is the source of
+    // truth for spending — deposits and rewards credit it directly, and
+    // giveaways spend from it. On-chain is only a fallback display when the
+    // DB row is missing (legacy custodial users).
     const balances = await Promise.all(
       (['BNB', 'USDT'] as const).map(async (asset) => {
         const db = user!.balances.find((b) => b.asset === asset);
         const locked = Number(db?.lockedBalance ?? 0);
         const platformReserve = reserve[asset] ?? 0;
 
-        let onChain = Number(db?.availableBalance ?? 0);
-        try {
-          const raw = await blockchain.getBalance(user!.wallet!.address, asset);
-          onChain = Number(raw) / 1e18;
-        } catch (err) {
-          logger.warn(`Live balance failed for ${asset}, using DB: ${(err as Error).message}`);
+        let available = Number(db?.availableBalance ?? 0);
+        if (!db) {
+          try {
+            const raw = await blockchain.getBalance(user!.wallet!.address, asset);
+            available = Number(raw) / 1e18;
+          } catch (err) {
+            logger.warn(`Live balance failed for ${asset}: ${(err as Error).message}`);
+          }
         }
 
         return {
           asset,
-          available: Math.max(0, onChain - locked - platformReserve),
+          available: Math.max(0, available - platformReserve),
           locked,
         };
       })
@@ -190,7 +196,7 @@ export function registerCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-}
+  }
     const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
