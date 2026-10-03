@@ -157,26 +157,34 @@ class GiveawayService {
     // Lazy wallet: creators need a real custodial wallet (funds + gas live there)
     await walletService.createWallet(data.creatorId);
 
-    // ── REAL-BALANCE GATE ──
-    // DB can hold phantom credits (old refunds, admin-era redeems). Only
-    // on-chain truth may fund a giveaway.
-    const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
-    if (creatorWallet) {
-      const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
-      const onChain = Number(raw) / 1e18;
-      const lockedRow = await prisma.balance.findUnique({
-        where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
-      });
-      const pendingFees = await prisma.platformFee.aggregate({
-        where: { sweptAt: null, asset: data.asset, transaction: { userId: data.creatorId } },
-        _sum: { amount: true },
-      });
-      const realAvailable = onChain - Number(lockedRow?.lockedBalance ?? 0) - Number(pendingFees._sum.amount ?? 0);
-      if (realAvailable < preTotalCost) {
-        throw new Error(
-          `Insufficient ${data.asset} — your wallet holds ${realAvailable.toFixed(6)} ${data.asset} on-chain ` +
-          `(need ${preTotalCost.toFixed(6)} including fees). Deposit more ${data.asset} first.`
-        );
+    // ── BALANCE GATE (UPGRADE §23/§37) ──
+    // The INTERNAL ledger balance is the PRIMARY spendable source: deposit
+    // sessions and rewards credit it directly. Only when it cannot cover
+    // the full cost do we fall back to the legacy custodial on-chain check.
+    const preBalanceRow = await prisma.balance.findUnique({
+      where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
+    });
+    const internalAvailable = Number(preBalanceRow?.availableBalance ?? 0);
+    const internalCovers = internalAvailable >= preTotalCost;
+
+    if (!internalCovers) {
+      // Legacy path: the full cost must be covered by on-chain custody.
+      const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
+      if (creatorWallet) {
+        const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
+        const onChain = Number(raw) / 1e18;
+        const pendingFees = await prisma.platformFee.aggregate({
+          where: { sweptAt: null, asset: data.asset, transaction: { userId: data.creatorId } },
+          _sum: { amount: true },
+        });
+        const realAvailable = onChain - Number(preBalanceRow?.lockedBalance ?? 0) - Number(pendingFees._sum.amount ?? 0);
+        if (realAvailable < preTotalCost) {
+          throw new Error(
+            `Insufficient ${data.asset} — you have ${internalAvailable.toFixed(6)} in your VEYLO balance ` +
+            `(${realAvailable.toFixed(6)} on-chain) and need ${preTotalCost.toFixed(6)} including fees. ` +
+            `Deposit more ${data.asset} first.`
+          );
+        }
       }
     }
 
@@ -185,7 +193,13 @@ class GiveawayService {
     // BEFORE the giveaway exists — no locked funds, no unpayable giveaway.
     // (Old behavior: seed after creation, swallow failures, discover the
     // empty wallet at payout time as a permanent INSUFFICIENT_FUNDS unwind.)
-    const seedHash = await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
+    // Platform payout mode pays claimants from the PLATFORM wallet — no
+    // per-giveaway gas seed on the creator's wallet is needed. Legacy
+    // (creator) mode keeps seeding exactly as before.
+    const seedHash =
+      config.PAYOUT_ORIGIN === 'platform'
+        ? null
+        : await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
 
     const giveaway = await prisma.$transaction(async (tx) => {
       // ── REWARD CREDIT DISCOUNT (spec §4/§6) ──
@@ -286,11 +300,26 @@ class GiveawayService {
 
       return g;
     });
-
-    // Immediately forward the full creation fee on-chain to the platform
+                // Immediately forward the full creation fee on-chain to the platform
     // wallet — waits for the seed to MINE first (cross-wallet ordering).
-    const feeForward = Number((cost.fee).toFixed(6));
-    await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, feeForward, seedHash);
+    if (config.PAYOUT_ORIGIN === 'platform') {
+      // Platform mode: the creator's payment is INTERNAL — their balance was
+      // debited and treasury already holds the backing (deposits forward
+      // there). No on-chain fee forward or gas seed: settle the fee rows
+      // internally as swept.
+      await prisma.platformFee.updateMany({
+        where: {
+          sweptAt: null,
+          transaction: { userId: data.creatorId, metadata: { path: ['giveawayId'], equals: giveaway.id } },
+        },
+        data: { sweptAt: new Date() },
+      });
+    } else {
+      // Immediately forward the full creation fee on-chain to the platform
+      // wallet — waits for the seed to MINE first (cross-wallet ordering).
+      const feeForward = Number((cost.fee).toFixed(6));
+      await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, feeForward, seedHash);
+    }
 
     // ── CREATOR CASHBACK (spec §4/§49) ──
     // Percentage from the CENTRAL fee config (default 1%). Credited to the
@@ -320,8 +349,9 @@ class GiveawayService {
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
-}
-      /**
+  }
+
+  /**
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
@@ -489,8 +519,7 @@ class GiveawayService {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
     }
   }
-
-  async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+    async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
       await assertUserOperational(userId);
@@ -693,4 +722,4 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-                                                  
+    
