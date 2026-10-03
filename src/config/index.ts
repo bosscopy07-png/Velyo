@@ -16,6 +16,7 @@ const envSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
 
   BSC_PRIMARY_RPC: z.string().min(1),
+  // QuickNode endpoint (legacy small-scan provider, kept for failover).
   BSC_QUICKNODE_RPC: z
     .string()
     .url()
@@ -23,17 +24,24 @@ const envSchema = z.object({
   BSC_PUBLIC_RPCS: z.string().transform((s) => s.split(',').map((url) => url.trim())),
   BSC_CHAIN_ID: z.string().default('56').transform(Number),
 
+  // Dedicated RPC for ALL transaction sends (payouts, seeds, forwards) —
+  // isolated from the read/scan pools so scanning never delays or
+  // rate-limits broadcasting.
   BSC_TX_RPC: z.string().min(1),
+  // Dedicated RPC for the SMALL safety scan only (30s after each BIG scan).
   BSC_SMALL_SCAN_RPC: z.string().min(1),
 
   WALLET_ENCRYPTION_KEY: z.string().min(32),
   PLATFORM_FEE_WALLET: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  // Encrypted private key of the operator/admin wallet (same wallet as
+  // PLATFORM_FEE_WALLET): supplies tiny BNB gas and receives fees.
   OPERATOR_WALLET_KEY: z.string().optional(),
 
   PLATFORM_FEE_PERCENT: z.string().default('1.0').transform(Number),
   MINIMUM_AMOUNT_USD: z.string().default('0.25').transform(Number),
   ENABLE_FEES: z.string().default('true').transform((s) => s === 'true'),
 
+  // Deposit flat fee: standard tier, and the reduced tier for small deposits
   DEPOSIT_FLAT_FEE_USD: z.string().default('0.1').transform(Number),
   DEPOSIT_FLAT_FEE_SMALL_USD: z.string().default('0.05').transform(Number),
   DEPOSIT_FLAT_FEE_TIER_USD: z.string().default('0.5').transform(Number),
@@ -44,20 +52,21 @@ const envSchema = z.object({
   REWARD_REFERRAL_PERCENT: z.string().default('1.0').transform(Number),
 
   // ── Phase-2 upgrade: who signs giveaway payout transactions ──
-  // 'creator' (legacy, default) = claimant is paid from the creator's
-  // custodial wallet. 'platform' = claimant is paid from the platform payout
-  // wallet (OPERATOR_WALLET_KEY / PLATFORM_FEE_WALLET); the creator's balance
-  // lock is unchanged (internal reservation only).
-  PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('creator'),
-    // ── Phase-2 upgrade: legacy per-user deposit monitoring ──
-  // New deposits use company pool sessions (services/deposit-session.ts).
-  // Personal wallets are NOT monitored for deposits when this is false.
-  // User wallets REMAIN in the DB and still custody giveaway funds/gas —
-  // they are only retired as deposit endpoints.
-  ENABLE_LEGACY_DEPOSIT_MONITOR: z.string().default('false').transform((s) => s === 'true'),
-  
+  // 'platform' (default) = the platform payout wallet (OPERATOR_WALLET_KEY /
+  // PLATFORM_FEE_WALLET) pays claimants on-chain; the creator pays from their
+  // internal VEYLO balance (which deposits and rewards credit). 'creator' =
+  // legacy custodial mode (claimant paid from the creator's wallet).
+  PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('platform'),
+
   // ── Phase-2 upgrade: deposit session window (minutes) ──
   DEPOSIT_SESSION_TTL_MINUTES: z.string().default('30').transform(Number),
+
+  // ── Phase-2 upgrade: legacy per-user deposit monitoring ──
+  // New deposits use company pool sessions (services/deposit-session.ts).
+  // Personal wallets are NOT monitored for deposits when this is false.
+  // User wallets REMAIN in the DB and still custody legacy funds — they are
+  // only retired as deposit endpoints.
+  ENABLE_LEGACY_DEPOSIT_MONITOR: z.string().default('false').transform((s) => s === 'true'),
 
   PRICE_API_URL: z.string().default('https://api.coingecko.com/api/v3'),
   NGN_RATE_API_URL: z.string().default('https://api.exchangerate-api.com/v4/latest/USD'),
@@ -69,7 +78,10 @@ const envSchema = z.object({
   ENABLE_DEPOSITS: z.string().default('true').transform((s) => s === 'true'),
   ENABLE_GIVEAWAYS: z.string().default('true').transform((s) => s === 'true'),
   ENABLE_PAYOUTS: z.string().default('true').transform((s) => s === 'true'),
+  // Initial default only — the live maintenance state is stored in the database
+  // (SystemConfig 'maintenance_mode') and toggled from the admin panel.
   MAINTENANCE_MODE: z.string().default('false').transform((s) => s === 'true'),
+  // Shown in the maintenance notice so users can follow updates.
   COMMUNITY_CHANNEL_URL: z.string().url().default('https://t.me/VeyloNetwork'),
 });
 
@@ -106,4 +118,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
-    
+  
