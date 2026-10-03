@@ -44,9 +44,9 @@ interface TreasuryThresholds {
 }
 
 const DEFAULT_THRESHOLDS: TreasuryThresholds = {
-  minBnb: 0.05,
-  minUsdt: 25,
-  maxPendingPayouts: 50,
+  minBnb: 0.00000005,
+  minUsdt: 0.15,
+  maxPendingPayouts: 500,
 };
 
 async function getThresholds(): Promise<TreasuryThresholds> {
