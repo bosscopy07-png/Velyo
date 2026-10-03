@@ -1,41 +1,67 @@
 /**
- * Pure financial math helpers — NO config, NO database imports, so they are
- * unit-testable in isolation (tests/upgrade.test.ts).
+ * Unique amount suffix.
  *
- * Convention (matches the codebase): one rounding to 8dp at the boundary,
- * never chain floats beyond it. Prisma persists Decimal(36,18).
+ * The first decimal digit is ALWAYS `1`.
+ *
+ * Examples:
+ *   $5     -> $5.113
+ *   $5     -> $5.157
+ *   $5     -> $5.1047
+ *
+ * Structure:
+ *   requested + fee + 0.1 + unique digits
+ *
+ * The permanent `1` is never replaced.
  */
 
-/** percent of amount, rounded once to 8dp. */
-export function percentOf(amount: number, percent: number): number {
-  if (!(amount > 0) || !(percent > 0)) return 0;
-  return Number(((amount * percent) / 100).toFixed(8));
-}
+export const SUFFIX_MIN = 0.101;
+export const SUFFIX_MAX = 0.199;
 
-/** Tiered deposit flat fee in USD (same rule as the legacy flatFeeFor). */
-export function depositFlatFeeUSD(
-  amountUSD: number,
-  fees: { enableFees: boolean; depositFlatFeeTierUSD: number; depositFlatFeeSmallUSD: number; depositFlatFeeUSD: number }
+const FALLBACK_MIN = 0.1001;
+const FALLBACK_MAX = 0.1999;
+
+export function pickUniqueSuffix(
+  taken: number[],
+  rand: () => number = Math.random
 ): number {
-  if (!fees.enableFees) return 0;
-  return amountUSD < fees.depositFlatFeeTierUSD ? fees.depositFlatFeeSmallUSD : fees.depositFlatFeeUSD;
-}
+  // First try 2 digits after the permanent `1`.
+  // Produces: 0.101 ... 0.199
+  const taken3 = new Set(
+    taken.map((t) => Number(t.toFixed(3)))
+  );
 
-export const SUFFIX_MIN = 1e-6;
-export const SUFFIX_MAX = 999e-6;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const candidate = Number(
+      (0.101 + Math.floor(rand() * 99) * 0.001).toFixed(3)
+    );
 
-/** Pick a unique amount suffix not present in `taken` (active sessions). */
-export function pickUniqueSuffix(taken: number[], rand: () => number = Math.random): number {
-  const takenSet = new Set(taken.map((t) => Number(t.toFixed(6))));
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const candidate = Number((SUFFIX_MIN + Math.floor(rand() * 999) * SUFFIX_MIN).toFixed(6));
-    if (candidate >= SUFFIX_MIN && candidate <= SUFFIX_MAX && !takenSet.has(candidate)) return candidate;
+    if (
+      candidate >= SUFFIX_MIN &&
+      candidate <= SUFFIX_MAX &&
+      !taken3.has(candidate)
+    ) {
+      return candidate;
+    }
   }
-  // Fallback: deterministic shift outside the taken set.
-  return Number((SUFFIX_MAX + taken.length * SUFFIX_MIN).toFixed(6));
-}
 
-/** expected on-chain amount = requested + fee + unique suffix (one rounding). */
-export function computeExpectedAmount(requested: number, fee: number, suffix: number): number {
-  return Number((requested + fee + suffix).toFixed(8));
+  // Fallback: 3 digits after the permanent `1`.
+  // Produces: 0.1001 ... 0.1999
+  const taken4 = new Set(
+    taken.map((t) => Number(t.toFixed(4)))
+  );
+
+  for (let i = 101; i <= 1999; i++) {
+    const candidate = Number((i / 10000).toFixed(4));
+
+    if (
+      candidate >= FALLBACK_MIN &&
+      candidate <= FALLBACK_MAX &&
+      !taken4.has(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  // Deterministic escape.
+  return FALLBACK_MAX;
 }
