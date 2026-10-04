@@ -5,6 +5,8 @@ import { blockchain } from '../services/blockchain';
 import { ensureGas, estimateBnbTransferCost } from '../services/gas';
 import { config, ASSETS } from '../config';
 import { logger } from '../utils/logger';
+// UPGRADE (spec §23): dedicated platform payout wallet
+import { getPayoutWallet } from '../services/treasury';
 
 const CONFIRMATIONS = 15;
 const CONFIRM_TIMEOUT_MS = 300_000;
@@ -90,21 +92,24 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   }
 
   // ── UPGRADE (spec §23): select the signing wallet ──
-  // 'creator' (default/legacy): claimant is paid from the creator's
-  // custodial wallet (funds + seeded gas live there).
-  // 'platform': the platform payout wallet (OPERATOR_WALLET_KEY /
-  // PLATFORM_FEE_WALLET) sends the funds; the creator's balance lock is
-  // unchanged — the lock is an internal reservation either way.
+  // 'platform' (default): the dedicated payout wallet pays the claimant
+  // on-chain (env-configurable via PAYOUT_WALLET_ADDRESS/PAYOUT_WALLET_KEY);
+  // the creator's payment was their internal VEYLO balance, which was
+  // locked at creation. 'creator' (legacy): the claimant is paid from the
+  // creator's custodial wallet.
   const payoutOrigin = config.PAYOUT_ORIGIN;
   let signerAddress: string;
   let signerEncryptedKey: string;
 
   if (payoutOrigin === 'platform') {
-    if (!config.OPERATOR_WALLET_KEY) {
-      throw new UnrecoverableError('PAYOUT_ORIGIN=platform but OPERATOR_WALLET_KEY is not configured');
+    let payoutWallet: { address: string; key: string };
+    try {
+      payoutWallet = getPayoutWallet();
+    } catch (err) {
+      throw new UnrecoverableError((err as Error).message);
     }
-    signerAddress = config.PLATFORM_FEE_WALLET;
-    signerEncryptedKey = config.OPERATOR_WALLET_KEY;
+    signerAddress = payoutWallet.address;
+    signerEncryptedKey = payoutWallet.key;
   } else {
     const creatorWallet = await prisma.wallet.findUnique({
       where: { userId: claim.giveaway.creatorId },
@@ -131,17 +136,15 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
     );
   }
 
-  // ── Gas top-up BEFORE marking PROCESSING ──
-  // ensureGas seeds from the operator wallet to the CURRENT network cost
-  // and waits for the seed to mine, so the payout can never hit the
-  // INSUFFICIENT_FUNDS unwind path anymore. Runs BEFORE the PROCESSING
-  // transition so a failure here leaves the claim cleanly in QUEUED.
-  //
-  // UPGRADE: in platform mode the signer IS the operator wallet, so
-  // ensureGas (which tops up FROM the operator wallet) cannot fund itself.
-  // Instead we verify the payout wallet already holds enough BNB for one
-  // transfer; if not, this is a transient failure (retry) and the treasury
-  // monitor alerts the admins to top up gas.
+  // ── Gas BEFORE marking PROCESSING ──
+  // Creator mode: ensureGas seeds from the operator wallet to the CURRENT
+  // network cost and waits for the seed to mine, so the payout can never
+  // hit the INSUFFICIENT_FUNDS unwind path anymore.
+  // Platform mode: the payout wallet is a standing platform wallet — it
+  // cannot seed itself, so we verify it already holds enough BNB; if not,
+  // this is TRANSIENT (retry after top-up) and the treasury monitor alerts
+  // the admins. Runs BEFORE the PROCESSING transition either way, so a
+  // failure here leaves the claim cleanly in QUEUED.
   if (payoutOrigin === 'platform') {
     const needed = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18));
     const bnbBalance = await blockchain.getBalance(signerAddress, 'BNB');
@@ -223,10 +226,14 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
 /**
  * Reclaim seeded gas once every claim is in a terminal state (PAID).
- * UPGRADE: no-op in platform payout mode — there are no per-giveaway gas
- * seeds to reclaim (the payout wallet is a standing platform wallet).
+ * Note: failed-then-left-QUEUED claims keep the giveaway out of the
+ * reclaim condition until the creator cancels (cancelGiveaway →
+ * reclaimGas handles it there). That's intentional — the seed stays
+ * available in case the payout is ever requeued after a top-up.
  */
 async function maybeReclaimGas(giveawayId: string): Promise<void> {
+  // UPGRADE: no-op in platform payout mode — there are no per-giveaway gas
+  // seeds to reclaim (the payout wallet is a standing platform wallet).
   if (config.PAYOUT_ORIGIN === 'platform') return;
   try {
     const [totalClaims, paidClaims] = await Promise.all([
@@ -305,4 +312,4 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN})`);
-                 
+  
