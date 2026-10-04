@@ -37,6 +37,15 @@ const envSchema = z.object({
   // PLATFORM_FEE_WALLET): supplies tiny BNB gas and receives fees.
   OPERATOR_WALLET_KEY: z.string().optional(),
 
+  // ── Phase-2 upgrade: dedicated payout wallet (platform mode) ──
+  // The wallet that SIGNS giveaway payouts when PAYOUT_ORIGIN=platform.
+  // Falls back to OPERATOR_WALLET_KEY/PLATFORM_FEE_WALLET when unset — set
+  // both values here if your operator key belongs to a DIFFERENT wallet than
+  // PLATFORM_FEE_WALLET (e.g. fee wallet separate from the funded admin
+  // wallet), so payouts come from the right address.
+  PAYOUT_WALLET_ADDRESS: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional(),
+  PAYOUT_WALLET_KEY: z.string().optional(),
+
   PLATFORM_FEE_PERCENT: z.string().default('1.0').transform(Number),
   MINIMUM_AMOUNT_USD: z.string().default('0.25').transform(Number),
   ENABLE_FEES: z.string().default('true').transform((s) => s === 'true'),
@@ -52,10 +61,9 @@ const envSchema = z.object({
   REWARD_REFERRAL_PERCENT: z.string().default('1.0').transform(Number),
 
   // ── Phase-2 upgrade: who signs giveaway payout transactions ──
-  // 'platform' (default) = the platform payout wallet (OPERATOR_WALLET_KEY /
-  // PLATFORM_FEE_WALLET) pays claimants on-chain; the creator pays from their
-  // internal VEYLO balance (which deposits and rewards credit). 'creator' =
-  // legacy custodial mode (claimant paid from the creator's wallet).
+  // 'platform' (default) = the platform payout wallet pays claimants
+  // on-chain; the creator pays from their internal VEYLO balance (which
+  // deposits and rewards credit). 'creator' = legacy custodial mode.
   PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('platform'),
 
   // ── Phase-2 upgrade: deposit session window (minutes) ──
@@ -118,4 +126,3 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
-  
