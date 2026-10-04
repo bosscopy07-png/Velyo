@@ -5,7 +5,7 @@ import { blockchain } from '../services/blockchain';
 import { ensureGas, estimateBnbTransferCost } from '../services/gas';
 import { config, ASSETS } from '../config';
 import { logger } from '../utils/logger';
-// UPGRADE (spec §23): dedicated platform payout wallet
+// UPGRADE (spec §23): dedicated platform payout wallet (DB-configurable)
 import { getPayoutWallet } from '../services/treasury';
 
 const CONFIRMATIONS = 15;
@@ -77,6 +77,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
       if (receipt?.status === 1) {
         await finalizePaid(claim, userId, address, amount, idempotencyKey, claim.payoutTransactionHash);
         await maybeReclaimGas(claim.giveawayId);
+        await maybeCompleteGiveaway(claim.giveawayId);
         return { status: 'completed', hash: claim.payoutTransactionHash };
       }
       // Dropped or reverted on-chain — clear the stale hash and rebroadcast below
@@ -92,11 +93,9 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   }
 
   // ── UPGRADE (spec §23): select the signing wallet ──
-  // 'platform' (default): the dedicated payout wallet pays the claimant
-  // on-chain (env-configurable via PAYOUT_WALLET_ADDRESS/PAYOUT_WALLET_KEY);
-  // the creator's payment was their internal VEYLO balance, which was
-  // locked at creation. 'creator' (legacy): the claimant is paid from the
-  // creator's custodial wallet.
+  // 'platform' (default): the payout wallet pays the claimant on-chain;
+  // the creator's payment was their internal VEYLO balance, locked at
+  // creation. 'creator' (legacy): paid from the creator's custodial wallet.
   const payoutOrigin = config.PAYOUT_ORIGIN;
   let signerAddress: string;
   let signerEncryptedKey: string;
@@ -104,7 +103,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   if (payoutOrigin === 'platform') {
     let payoutWallet: { address: string; key: string };
     try {
-      payoutWallet = getPayoutWallet();
+      payoutWallet = await getPayoutWallet();
     } catch (err) {
       throw new UnrecoverableError((err as Error).message);
     }
@@ -137,14 +136,11 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   }
 
   // ── Gas BEFORE marking PROCESSING ──
-  // Creator mode: ensureGas seeds from the operator wallet to the CURRENT
-  // network cost and waits for the seed to mine, so the payout can never
-  // hit the INSUFFICIENT_FUNDS unwind path anymore.
-  // Platform mode: the payout wallet is a standing platform wallet — it
-  // cannot seed itself, so we verify it already holds enough BNB; if not,
-  // this is TRANSIENT (retry after top-up) and the treasury monitor alerts
-  // the admins. Runs BEFORE the PROCESSING transition either way, so a
-  // failure here leaves the claim cleanly in QUEUED.
+  // Creator mode: ensureGas seeds to the CURRENT network cost and waits
+  // for the seed to mine — no INSUFFICIENT_FUNDS unwind path anymore.
+  // Platform mode: the payout wallet is standing — it can't seed itself, so
+  // we verify it holds enough BNB (transient if short; treasury monitor
+  // alerts admins). Runs BEFORE the PROCESSING transition either way.
   if (payoutOrigin === 'platform') {
     const needed = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18));
     const bnbBalance = await blockchain.getBalance(signerAddress, 'BNB');
@@ -188,6 +184,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
     await finalizePaid(claim, userId, address, amount, idempotencyKey, hash);
     await maybeReclaimGas(claim.giveawayId);
+    await maybeCompleteGiveaway(claim.giveawayId);
 
     logger.info(`Payout completed: ${hash} for claim ${claimId} (origin: ${payoutOrigin})`);
     return { status: 'completed', hash };
@@ -224,6 +221,73 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   concurrency: config.QUEUE_CONCURRENCY,
 });
 
+// UPGRADE: cashback + referral settle at COMPLETION (not creation).
+// When EVERY slot is PAID: mark COMPLETED (guarded — one worker wins), then
+// credit exactly once each:
+//   - CREATOR CASHBACK: creatorCashbackPercent (default 1%) of totalAmount
+//     to the creator ("credited after it's all given out").
+//   - REFERRAL REWARD: referralRewardPercent (default 1%) of totalAmount to
+//     the user who referred the CREATOR (earliest giveaway-link attribution
+//     of that creator) — for the referred person CREATING and completing a
+//     giveaway, NOT for claiming.
+// Both idempotent via deterministic per-giveaway keys — retries never
+// double-pay. Cancelled/expired giveaways never reach COMPLETED.
+async function maybeCompleteGiveaway(giveawayId: string): Promise<void> {
+  try {
+    const g = await prisma.giveaway.findUnique({ where: { id: giveawayId }, include: { claims: true } });
+    if (!g) return;
+    const paid = g.claims.filter((c) => c.status === 'PAID').length;
+    if (paid < g.maxClaimers) return; // not fully given out yet
+
+    const transitioned = await prisma.giveaway.updateMany({
+      where: { id: giveawayId, status: { in: ['ACTIVE', 'FULL'] } },
+      data: { status: 'COMPLETED' },
+    });
+    if (transitioned.count === 0) return; // another worker already settled it
+
+    const { feeConfig } = await import('../services/fee-config');
+    const { rewardsService } = await import('../services/rewards');
+    const { attributionService } = await import('../services/attribution');
+    const { hashIdempotencyKey } = await import('../utils/encryption');
+    const fees = await feeConfig.getFees();
+    const total = Number(g.totalAmount);
+
+    const cashback = feeConfig.percentOf(total, fees.creatorCashbackPercent);
+    if (cashback > 0) {
+      await rewardsService.creditReward({
+        userId: g.creatorId,
+        type: 'GIVEAWAY_CASHBACK',
+        sourceType: 'giveaway',
+        sourceId: giveawayId,
+        asset: g.asset,
+        amount: cashback,
+        idempotencyKey: hashIdempotencyKey('cashback', giveawayId),
+      });
+    }
+
+    const referrer = await attributionService.getReferrerOf(g.creatorId);
+    if (referrer && referrer.id !== g.creatorId) {
+      const refReward = feeConfig.percentOf(total, fees.referralRewardPercent);
+      if (refReward > 0) {
+        await rewardsService.creditReward({
+          userId: referrer.id,
+          type: 'REFERRAL_REWARD',
+          sourceType: 'giveaway',
+          sourceId: giveawayId,
+          asset: g.asset,
+          amount: refReward,
+          idempotencyKey: hashIdempotencyKey('referral-reward', giveawayId),
+          metadata: { referredCreatorId: g.creatorId },
+        });
+      }
+    }
+    logger.info(`Giveaway ${giveawayId} COMPLETED — cashback/referral settled`);
+  } catch (err) {
+    // Non-fatal: keys are idempotent, a later attempt is safe.
+    logger.error(`maybeCompleteGiveaway(${giveawayId}) failed (non-fatal): ${(err as Error).message}`);
+  }
+}
+
 /**
  * Reclaim seeded gas once every claim is in a terminal state (PAID).
  * Note: failed-then-left-QUEUED claims keep the giveaway out of the
@@ -232,8 +296,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
  * available in case the payout is ever requeued after a top-up.
  */
 async function maybeReclaimGas(giveawayId: string): Promise<void> {
-  // UPGRADE: no-op in platform payout mode — there are no per-giveaway gas
-  // seeds to reclaim (the payout wallet is a standing platform wallet).
+  // UPGRADE: no-op in platform payout mode — no per-giveaway gas seeds.
   if (config.PAYOUT_ORIGIN === 'platform') return;
   try {
     const [totalClaims, paidClaims] = await Promise.all([
@@ -307,9 +370,9 @@ worker.on('failed', (job, err) => {
   if (err instanceof UnrecoverableError) {
     logger.error(`Payout job ${job?.id} permanently stopped (no more retries): ${err.message}`);
   } else {
-    logger.error(`Payout job ${job?.id} failed:`, err);
+    logger.error(`Payout job ${job?.id} failed (will retry):`, err);
   }
 });
 
 logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN})`);
-  
+        
