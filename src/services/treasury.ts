@@ -13,11 +13,13 @@ import { logger } from '../utils/logger';
  *   USER_BALANCE    → internal accounting rows (Balance table)
  *   DEPOSIT_ADDRESS → company pool addresses (CompanyDepositWallet)
  *   TREASURY        → platform operational funds = PLATFORM_FEE_WALLET
- *   PAYOUT_WALLET   → signs giveaway payouts; = OPERATOR_WALLET_KEY wallet
- *                     when PAYOUT_ORIGIN=platform, else the creator wallet
+ *   PAYOUT_WALLET   → signs giveaway payouts; env-configurable via
+ *                     PAYOUT_WALLET_ADDRESS/PAYOUT_WALLET_KEY, falling back
+ *                     to OPERATOR_WALLET_KEY/PLATFORM_FEE_WALLET
  *
- * Alerting: low BNB / low USDT / large pending payout queue / empty deposit
- * pool. Debounced in Redis (one alert per kind per hour) — never spams.
+ * Alerting: low BNB on the PAYOUT wallet / low USDT in treasury / large
+ * pending payout queue / empty deposit pool. Debounced in Redis (one alert
+ * per kind per hour) — never spams.
  */
 
 export const TREASURY_ROLES = {
@@ -37,16 +39,44 @@ export function getTreasuryAddress(): string {
   return config.PLATFORM_FEE_WALLET;
 }
 
+export interface PayoutWallet {
+  address: string;
+  key: string;
+  source: 'dedicated' | 'operator-fallback';
+}
+
+/**
+ * The wallet that SIGNS giveaway payouts in platform mode.
+ * Priority: dedicated PAYOUT_WALLET_* env → OPERATOR_WALLET_KEY (legacy
+ * assumption that it controls PLATFORM_FEE_WALLET). Throws with a clear
+ * message if neither is configured.
+ */
+export function getPayoutWallet(): PayoutWallet {
+  if (config.PAYOUT_WALLET_KEY) {
+    if (!config.PAYOUT_WALLET_ADDRESS) {
+      throw new Error('PAYOUT_WALLET_KEY is set but PAYOUT_WALLET_ADDRESS is missing');
+    }
+    return { address: config.PAYOUT_WALLET_ADDRESS, key: config.PAYOUT_WALLET_KEY, source: 'dedicated' };
+  }
+  if (config.OPERATOR_WALLET_KEY) {
+    return { address: config.PLATFORM_FEE_WALLET, key: config.OPERATOR_WALLET_KEY, source: 'operator-fallback' };
+  }
+  throw new Error(
+    'PAYOUT_ORIGIN=platform but no payout wallet key configured. ' +
+    'Set PAYOUT_WALLET_ADDRESS + PAYOUT_WALLET_KEY (recommended), or OPERATOR_WALLET_KEY.'
+  );
+}
+
 interface TreasuryThresholds {
-  minBnb: number; // alert when treasury BNB < this
+  minBnb: number; // alert when the gas wallet BNB < this
   minUsdt: number; // alert when treasury USDT < this
   maxPendingPayouts: number; // alert when payout queue deeper than this
 }
 
 const DEFAULT_THRESHOLDS: TreasuryThresholds = {
-  minBnb: 0.00000005,
+  minBnb: 0.000005,
   minUsdt: 0.15,
-  maxPendingPayouts: 500,
+  maxPendingPayouts: 101,
 };
 
 async function getThresholds(): Promise<TreasuryThresholds> {
@@ -69,6 +99,7 @@ async function getThresholds(): Promise<TreasuryThresholds> {
 
 export interface TreasuryStatus {
   address: string;
+  payoutAddress: string;
   payoutOrigin: 'creator' | 'platform';
   legacyMonitorEnabled: boolean;
   bnb: number;
@@ -108,6 +139,8 @@ class TreasuryMonitor {
 
     return {
       address: config.PLATFORM_FEE_WALLET,
+      payoutAddress:
+        getPayoutOrigin() === 'platform' ? getPayoutWallet().address : config.PLATFORM_FEE_WALLET,
       payoutOrigin: getPayoutOrigin(),
       legacyMonitorEnabled: config.ENABLE_LEGACY_DEPOSIT_MONITOR,
       bnb: Number(bnbRaw) / 1e18,
@@ -136,11 +169,16 @@ class TreasuryMonitor {
     try {
       const [status, thresholds] = await Promise.all([this.getStatus(), getThresholds()]);
 
-      if (status.bnb < thresholds.minBnb) {
+      // Gas lives on the PAYOUT wallet in platform mode (it signs the txs);
+      // on the treasury wallet otherwise.
+      const gasAddress =
+        getPayoutOrigin() === 'platform' ? getPayoutWallet().address : config.PLATFORM_FEE_WALLET;
+      const gasBnb = Number(await blockchain.getBalance(gasAddress, 'BNB').catch(() => 0n)) / 1e18;
+      if (gasBnb < thresholds.minBnb) {
         await this.maybeAlert(
           'low_bnb',
-          `⚠️ <b>TREASURY LOW ON GAS</b>\n\nPayout/treasury wallet <code>${status.address}</code> holds ` +
-            `<b>${status.bnb.toFixed(6)} BNB</b> (threshold ${thresholds.minBnb}).\n` +
+          `⚠️ <b>PAYOUT WALLET LOW ON GAS</b>\n\nPayout wallet <code>${gasAddress}</code> holds ` +
+            `<b>${gasBnb.toFixed(6)} BNB</b> (threshold ${thresholds.minBnb}).\n` +
             `Payouts and forwarding may stall until topped up.`
         );
       }
@@ -157,7 +195,7 @@ class TreasuryMonitor {
         await this.maybeAlert(
           'queue_depth',
           `⚠️ <b>PAYOUT QUEUE BACKLOG</b>\n\n${status.pendingPayouts} payouts waiting (threshold ` +
-            `${thresholds.maxPendingPayouts}). Check RPC health and treasury BNB.`
+            `${thresholds.maxPendingPayouts}). Check RPC health and payout-wallet BNB.`
         );
       }
 
@@ -175,4 +213,4 @@ class TreasuryMonitor {
 }
 
 export const treasuryMonitor = new TreasuryMonitor();
-          
+  
