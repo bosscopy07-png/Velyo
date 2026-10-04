@@ -257,8 +257,8 @@ export function registerTextHandlers(bot: any): void {
             backKeyboard('main')
           );
           break;
-              }
-                                                  // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
+             }
+                    // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
         case 'deposit_amount': {
           const asset = ((session as any).asset || 'USDT') as string;
           const amountStr = text.trim().split(' ')[0];
@@ -408,8 +408,41 @@ export function registerTextHandlers(bot: any): void {
             );
           }
           break;
-            }
-                                                     // === PAYOUT ADDRESS ===
+        }
+
+        // === ADMIN: SET PAYOUT WALLET ("<address> <privateKey>") ===
+        case 'admin_payout_wallet': {
+          if (!config.ADMIN_TELEGRAM_IDS.includes(telegramId)) {
+            await clearUserSession(telegramId);
+            return;
+          }
+          await clearUserSession(telegramId);
+
+          const parts = text.trim().split(/\s+/);
+          const [address, privateKey] = parts;
+          if (!address || !privateKey || !isValidEVMAddress(address)) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>INVALID FORMAT</b>\n\nExpected:\n<code>0xAddress 0xPrivateKey</code>`,
+              backKeyboard('admin:treasury')
+            );
+            return;
+          }
+
+          try {
+            const { setPayoutWallet } = await import('../../services/treasury');
+            await setPayoutWallet(telegramId, address, privateKey);
+            await editMainMessage(ctx, `${e('check')} Payout wallet set and verified.`, backKeyboard('admin:treasury'));
+          } catch (err) {
+            await editMainMessage(
+              ctx,
+              `${e('warning')} <b>FAILED</b>\n\n${(err as Error).message.slice(0, 250)}`,
+              backKeyboard('admin:treasury')
+            );
+          }
+          break;
+        }
+                  // === PAYOUT ADDRESS ===
         case 'awaiting_payout_address': {
           const address = text.trim();
           const { claimId, asset } = session as any;
