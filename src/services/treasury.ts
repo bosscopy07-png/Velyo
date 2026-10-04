@@ -1,3 +1,4 @@
+
 import cron from 'node-cron';
 import { prisma } from '../database';
 import { redis } from './redis';
@@ -62,7 +63,7 @@ async function getStoredPayoutWallet(): Promise<StoredPayoutWallet | null> {
   try {
     const row = await prisma.systemConfig.findUnique({ where: { key: PAYOUT_WALLET_CONFIG_KEY } });
     if (row?.value && typeof row.value === 'object') {
-      const v = row.value as StoredPayoutWallet;
+      const v = row.value as unknown as StoredPayoutWallet;
       if (typeof v.address === 'string' && typeof v.encryptedKey === 'string') {
         try {
           await redis.setex(PAYOUT_WALLET_CACHE_KEY, PAYOUT_WALLET_CACHE_TTL, JSON.stringify(v));
@@ -147,9 +148,9 @@ interface TreasuryThresholds {
 }
 
 const DEFAULT_THRESHOLDS: TreasuryThresholds = {
-  minBnb: 0.0000005,
-  minUsdt: 0.15,
-  maxPendingPayouts: 500,
+  minBnb: 0.05,
+  minUsdt: 25,
+  maxPendingPayouts: 50,
 };
 
 async function getThresholds(): Promise<TreasuryThresholds> {
