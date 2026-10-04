@@ -7,15 +7,12 @@ import { backKeyboard } from '../bot/keyboards/main';
 import { feeConfig, type FeeConfig } from '../services/fee-config';
 import { claimRiskService } from '../services/claim-risk';
 import { treasuryMonitor } from '../services/treasury';
-import { encrypt } from '../utils/encryption';
-import { isValidEVMAddress } from '../utils/validation';
 import { redis, setUserSession } from '../services/redis';
 
 /**
  * Phase-2 admin surface: Finance (runtime fee config), Security (duplicate
- * claim flags), Treasury (roles, balances, deposit pool, monitor status).
- * All actions: admin-only (isAdmin middleware already guards the Admin
- * entry), audited, validated.
+ * claim flags), Treasury (roles, balances, payout wallet, deposit pool).
+ * All actions: admin-only, audited, validated.
  */
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
@@ -119,8 +116,6 @@ export function registerAdminUpgrade(bot: any): void {
     const [, action, flagId] = (ctx as any).match;
     await claimRiskService.reviewFlag(flagId, ctx.from!.id.toString(), action === 'dismiss' ? 'DISMISSED' : 'CONFIRMED');
     await ctx.answerCbQuery(action === 'dismiss' ? 'Flag dismissed.' : 'Flag confirmed.');
-    // Note: confirming abuse does NOT auto-ban — an admin still acts via the
-    // existing user-management tools (global bans stay admin-only, spec §8).
     await editMainMessage(
       ctx,
       `${e('check')} Flag ${action === 'dismiss' ? 'dismissed' : 'confirmed'}.` +
@@ -129,7 +124,7 @@ export function registerAdminUpgrade(bot: any): void {
     );
   }));
 
-  // ═══════════════ TREASURY: roles, balances, deposit pool ═══════════════
+  // ═══════════════ TREASURY: roles, balances, payout wallet, deposit pool ═══════════════
   bot.action('admin:treasury', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const status = await treasuryMonitor.getStatus();
@@ -139,6 +134,7 @@ export function registerAdminUpgrade(bot: any): void {
       DIVIDER,
       '',
       `<b>Address:</b> <code>${status.address}</code>`,
+      `<b>Payout wallet:</b> <code>${status.payoutAddress}</code>`,
       `<b>Payout origin:</b> ${status.payoutOrigin === 'platform' ? '🏦 Platform wallet' : '👤 Creator wallets (legacy)'}`,
       `<b>Legacy user-wallet deposit monitoring:</b> ${status.legacyMonitorEnabled ? '🟡 ON (transition mode)' : '⚫ OFF (company sessions only)'}`,
       '',
@@ -191,7 +187,7 @@ export function registerAdminUpgrade(bot: any): void {
       ctx,
       `${eb('deposit')} <b>ADD COMPANY DEPOSIT ADDRESS</b>\n${DIVIDER}\n\n` +
       `Send one message in the format:\n\n<code>0xAddress 0xPrivateKey</code>\n\n` +
-      `⚠️ The private key is encrypted with WALLET_ENCRYPTION_KEY before storage. ` +
+      `⚠️ The key is verified against the address and encrypted with WALLET_ENCRYPTION_KEY before storage. ` +
       `Never paste keys anywhere else.`,
       backKeyboard('admin:dwallets')
     );
@@ -207,7 +203,6 @@ export function registerAdminUpgrade(bot: any): void {
     await editMainMessage(ctx, `${e('check')} Company deposit address disabled.\nHistorical records remain for audit.`, backKeyboard('admin:dwallets'));
   }));
 
-  // Treasury alert debounce key hygiene reference — TTL handles expiry;
-  // this import keeps the module graph explicit.
   void redis;
-                                                       }
+   }
+      
