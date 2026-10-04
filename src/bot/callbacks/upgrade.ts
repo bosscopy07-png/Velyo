@@ -12,10 +12,9 @@ import { assertUserOperational } from '../../services/maintenance';
 
 /**
  * Phase-2 upgrade callbacks: rewards dashboard, deposit sessions, creator
- * claimant management (view / block / unblock), plus the creator-level
- * AUDIENCE view (everyone who ever claimed any of your giveaways, with
- * per-user totals) and the FLAGGED USERS view (possible multi-account
- * claimants across all your giveaways).
+ * claimant management (view / block / unblock), creator-level AUDIENCE view
+ * (everyone who ever claimed any of your giveaways, with per-user totals)
+ * and FLAGGED USERS view (possible multi-account claimants).
  *
  * Security: every giveaway-scoped action re-verifies creator ownership
  * server-side — callback payload is never trusted (spec §36).
@@ -166,8 +165,7 @@ export function registerUpgradeCallbacks(bot: any): void {
     await ctx.answerCbQuery('Deposit session cancelled.');
     await editMainMessage(ctx, `${e('check')} Deposit session cancelled.`, backKeyboard('account:deposits'));
   }));
-
-  // ══════════════════════ CREATOR: CLAIMANTS (per giveaway) ══════════════════════
+                                            // ══════════════════════ CREATOR: CLAIMANTS (per giveaway) ══════════════════════
   bot.action(/giveaway:claimants:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -271,29 +269,27 @@ export function registerUpgradeCallbacks(bot: any): void {
       take: 300,
     });
 
-    // Aggregate per user: total claims, total amount, last claim
+    // Amount per claim from the giveaway rows (single query, no N+1)
+    const giveawayAmounts = new Map(
+      (await prisma.giveaway.findMany({ where: { id: { in: ids } }, select: { id: true, amountPerUser: true } }))
+        .map((g) => [g.id, Number(g.amountPerUser)])
+    );
+
+    // Aggregate per user: total claims, total amount claimed, last claim
     const agg = new Map<string, {
       user: { id: string; telegramId: string; username: string | null; firstName: string | null; lastName: string | null };
       totalClaims: number; totalAmount: number; lastClaim: Date;
     }>();
     for (const c of claims) {
-      const amt = Number(c.giveaway ? 0 : 0); // amount per user comes from giveaway.amountPerUser
       const existing = agg.get(c.userId);
+      const amt = giveawayAmounts.get(c.giveawayId) ?? 0;
       if (existing) {
         existing.totalClaims += 1;
-        existing.lastClaim = c.claimedAt > existing.lastClaim ? c.claimedAt : existing.lastClaim;
+        existing.totalAmount += amt;
+        if (c.claimedAt > existing.lastClaim) existing.lastClaim = c.claimedAt;
       } else {
-        agg.set(c.userId, { user: c.user, totalClaims: 1, totalAmount: 0, lastClaim: c.claimedAt });
+        agg.set(c.userId, { user: c.user, totalClaims: 1, totalAmount: amt, lastClaim: c.claimedAt });
       }
-    }
-    // Amounts: join giveaway amounts
-    const giveawayAmounts = new Map(
-      (await prisma.giveaway.findMany({ where: { id: { in: ids } }, select: { id: true, amountPerUser: true } }))
-        .map((g) => [g.id, Number(g.amountPerUser)])
-    );
-    for (const c of claims) {
-      const a = agg.get(c.userId);
-      if (a) a.totalAmount += giveawayAmounts.get(c.giveawayId) ?? 0;
     }
 
     const audience = [...agg.values()].sort((a, b) => b.totalAmount - a.totalAmount).slice(0, 20);
@@ -327,7 +323,7 @@ export function registerUpgradeCallbacks(bot: any): void {
     if (!user) return;
 
     const ids = await myGiveawayIds(user.id);
-    const [target, claims, flags, referrer, isBlockedNow] = await Promise.all([
+    const [target, claims, flags, referrer, blockedNow] = await Promise.all([
       prisma.user.findUnique({ where: { id: targetUserId }, select: { telegramId: true, username: true, firstName: true, lastName: true } }),
       prisma.giveawayClaim.findMany({
         where: { userId: targetUserId, giveawayId: { in: ids } },
@@ -341,8 +337,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       attributionService.getReferrerOf(targetUserId),
       attributionService.isBlocked({ creatorId: user.id, giveawayId: ids[0] ?? '', userId: targetUserId }),
     ]);
-
-    if (!target || claims.length === 0) {
+                                     if (!target || claims.length === 0) {
       await editMainMessage(ctx, `${e('warning')} User not found in your audience.`, backKeyboard('giveaway:audience'));
       return;
     }
@@ -355,27 +350,26 @@ export function registerUpgradeCallbacks(bot: any): void {
       `👤 <b>${name}</b>`, DIVIDER,
       `TG ID: <code>${target.telegramId}</code>`,
       `Username: ${target.username ? '@' + target.username : '—'}`,
-      referrer && referrer.telegramId !== target.telegramId
-        ? `Referred by: ${referrer.username ? '@' + referrer.username : `ID ${referrer.telegramId}`}` : null,
+      referrer ? `Referred by: ${referrer.username ? '@' + referrer.username : `ID ${referrer.telegramId}`}` : '',
       `Claims from YOUR giveaways: <b>${claims.length}</b>`,
       `Total claimed from you: <b>${totalAmount.toFixed(6)}</b>`,
-      flaggedSignals.length > 0 ? `⚠️ Flags: <i>${flaggedSignals.join(', ')}</i>` : null,
+      flaggedSignals.length > 0 ? `⚠️ Flags: <i>${flaggedSignals.join(', ')}</i>` : '',
       '',
       '<b>Claim history</b>',
       ...claims.slice(0, 12).map((c) => {
         const icon = c.status === 'PAID' ? '✅' : c.status === 'FAILED' ? '❌' : '⏳';
         const flagged = flags.some((f) => f.claimId === c.id) ? ' ⚠️' : '';
-        return `${icon} ${Number(c.giveaway.amountPerUser)} ${c.giveaway.asset} from ${c.giveaway.totalAmount} ${c.giveaway.asset} giveaway · ${c.claimedAt.toLocaleDateString()} · ${c.status}${flagged}`;
+        return `${icon} ${Number(c.giveaway.amountPerUser)} ${c.giveaway.asset} from a ${c.giveaway.totalAmount} ${c.giveaway.asset} giveaway · ${c.claimedAt.toLocaleDateString()} · ${c.status}${flagged}`;
       }),
-    ].filter(Boolean).join('\n');
+    ].filter((l) => l !== '');
 
     const rows: any[] = [
-      isBlockedNow
+      blockedNow
         ? [Markup.button.callback(`✅ Unblock (all my giveaways)`, `giveaway:unblockc:${targetUserId}`)]
         : [Markup.button.callback(`🚫 Block (all my giveaways)`, `giveaway:blockc:${targetUserId}`)],
       [Markup.button.callback(`${eb('back')} My Audience`, 'giveaway:audience')],
     ];
-    await editMainMessage(ctx, lines, Markup.inlineKeyboard(rows));
+    await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
   }));
 
   // ══════════════════════ CREATOR: FLAGGED USERS ══════════════════════
@@ -402,7 +396,7 @@ export function registerUpgradeCallbacks(bot: any): void {
     const rows: any[] = [];
     for (const f of flags) {
       const u = f.claim.user;
-      const name = u.firstName || u.username || 'User';
+      const name = u.firstName || u.username || 'Name';
       lines.push(
         `⚠️ <b>${name}</b> (${u.username ? '@' + u.username : `ID ${u.telegramId}`})`,
         `   signal: <b>${f.signal}</b> · ${f.createdAt.toLocaleString()}`
@@ -421,4 +415,75 @@ export function registerUpgradeCallbacks(bot: any): void {
   }));
 
   // ══════════════════════ BLOCK / UNBLOCK ══════════════════════
-  bot.action(/
+  bot.action(/giveaway:blockg:(.+):(.+)/, guard(async (ctx: Context) => {
+    const [, giveawayId, blockedUserId] = (ctx as any).match;
+    const user = await currentUser(ctx);
+    if (!user) return;
+    const giveaway = await prisma.giveaway.findUnique({ where: { id: giveawayId }, select: { creatorId: true } });
+    if (!giveaway || giveaway.creatorId !== user.id) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await attributionService.blockUser({ creatorId: user.id, blockedUserId, giveawayId });
+    await ctx.answerCbQuery('User blocked from this giveaway.');
+    await editMainMessage(ctx, `${e('check')} User blocked from this giveaway.`, backKeyboard(`giveaway:claimants:${giveawayId}`));
+  }));
+
+  bot.action(/giveaway:unblockg:(.+):(.+)/, guard(async (ctx: Context) => {
+    const [, giveawayId, blockedUserId] = (ctx as any).match;
+    const user = await currentUser(ctx);
+    if (!user) return;
+    await attributionService.unblockUser({ creatorId: user.id, blockedUserId, giveawayId });
+    await ctx.answerCbQuery('User unblocked.');
+    await editMainMessage(ctx, `${e('check')} User unblocked for this giveaway.`, backKeyboard(`giveaway:claimants:${giveawayId}`));
+  }));
+
+  bot.action(/giveaway:blockc:(.+)/, guard(async (ctx: Context) => {
+    const blockedUserId = (ctx as any).match[1];
+    const user = await currentUser(ctx);
+    if (!user) return;
+    await attributionService.blockUser({ creatorId: user.id, blockedUserId, giveawayId: null });
+    await ctx.answerCbQuery('User blocked from all your giveaways.');
+    await editMainMessage(
+      ctx,
+      `${e('check')} User blocked from <b>all your giveaways</b>.\n\nThis is your personal list only — it is not a platform ban. Only admins can ban users globally.`,
+      backKeyboard('giveaway:mine')
+    );
+  }));
+
+  bot.action(/giveaway:unblockc:(.+)/, guard(async (ctx: Context) => {
+    const blockedUserId = (ctx as any).match[1];
+    const user = await currentUser(ctx);
+    if (!user) return;
+    await attributionService.unblockUser({ creatorId: user.id, blockedUserId, giveawayId: null });
+    await ctx.answerCbQuery('User unblocked.');
+    await editMainMessage(ctx, `${e('check')} User removed from your block list.`, backKeyboard('giveaway:mine'));
+  }));
+
+  bot.action('giveaway:blocklist', guard(async (ctx: Context) => {
+    await ctx.answerCbQuery();
+    const user = await currentUser(ctx);
+    if (!user) return;
+    const blocks = await prisma.claimBlock.findMany({
+      where: { creatorId: user.id },
+      include: { blockedUser: { select: { telegramId: true, username: true, firstName: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    });
+    const lines = [`${e('shield')} <b>MY BLOCKED USERS</b>`, DIVIDER, ''];
+    const rows: any[] = [];
+    if (blocks.length === 0) lines.push('No blocked users.');
+    for (const b of blocks) {
+      const name = b.blockedUser.firstName || b.blockedUser.username || `ID ${b.blockedUser.telegramId}`;
+      lines.push(`🚫 <b>${name}</b> — ${b.giveawayId ? 'one giveaway' : 'all my giveaways'}`);
+      rows.push([
+        b.giveawayId
+          ? Markup.button.callback(`✅ Unblock`, `giveaway:unblockg:${b.giveawayId}:${b.blockedUserId}`)
+          : Markup.button.callback(`✅ Unblock`, `giveaway:unblockc:${b.blockedUserId}`),
+      ]);
+    }
+    rows.push([Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine')]);
+    await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
+  }));
+}
+
