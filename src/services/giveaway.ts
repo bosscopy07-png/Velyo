@@ -300,8 +300,10 @@ class GiveawayService {
 
       return g;
     });
-                // Immediately forward the full creation fee on-chain to the platform
-    // wallet — waits for the seed to MINE first (cross-wallet ordering).
+            // NOTE: creator cashback NO LONGER settles here — it settles at
+    // COMPLETION (workers/payout.maybeCompleteGiveaway), when every slot is
+    // paid out. Cancelled/expired giveaways pay no cashback.
+
     if (config.PAYOUT_ORIGIN === 'platform') {
       // Platform mode: the creator's payment is INTERNAL — their balance was
       // debited and treasury already holds the backing (deposits forward
@@ -319,32 +321,6 @@ class GiveawayService {
       // wallet — waits for the seed to MINE first (cross-wallet ordering).
       const feeForward = Number((cost.fee).toFixed(6));
       await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, feeForward, seedHash);
-    }
-
-    // ── CREATOR CASHBACK (spec §4/§49) ──
-    // Percentage from the CENTRAL fee config (default 1%). Credited to the
-    // internal Reward ledger (Reward row + REWARD transaction + balance
-    // credit in one $transaction — see services/rewards.ts). Atomic +
-    // idempotent: the key is deterministic per giveaway, so a retried
-    // confirmation or a crash between creation and credit can never pay
-    // twice. Runs AFTER the giveaway exists; failure is logged and never
-    // breaks creation (the same call is safe to replay).
-    try {
-      const fees = await feeConfig.getFees();
-      const cashback = feeConfig.percentOf(data.totalAmount, fees.creatorCashbackPercent);
-      if (cashback > 0) {
-        await rewardsService.creditReward({
-          userId: data.creatorId,
-          type: 'GIVEAWAY_CASHBACK',
-          sourceType: 'giveaway',
-          sourceId: giveaway.id,
-          asset: data.asset,
-          amount: cashback,
-          idempotencyKey: hashIdempotencyKey('cashback', giveaway.id),
-        });
-      }
-    } catch (err) {
-      logger.error(`Creator cashback failed for giveaway ${giveaway.id} (retry-safe, reconcile manually): ${(err as Error).message}`);
     }
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee})`);
@@ -682,8 +658,7 @@ class GiveawayService {
     await this.reclaimGas(giveawayId);
     return { success: true };
   }
-
-  async getGiveawayStats(giveawayId: string): Promise<{
+    async getGiveawayStats(giveawayId: string): Promise<{
     totalReward: number;
     totalSlots: number;
     linkOpens: number;
@@ -722,4 +697,3 @@ class GiveawayService {
 }
 
 export const giveawayService = new GiveawayService();
-    
