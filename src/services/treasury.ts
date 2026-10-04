@@ -13,9 +13,9 @@ import { logger } from '../utils/logger';
  *   USER_BALANCE    → internal accounting rows (Balance table)
  *   DEPOSIT_ADDRESS → company pool addresses (CompanyDepositWallet)
  *   TREASURY        → platform operational funds = PLATFORM_FEE_WALLET
- *   PAYOUT_WALLET   → signs giveaway payouts; env-configurable via
- *                     PAYOUT_WALLET_ADDRESS/PAYOUT_WALLET_KEY, falling back
- *                     to OPERATOR_WALLET_KEY/PLATFORM_FEE_WALLET
+ *   PAYOUT_WALLET   → signs giveaway payouts; set from the admin panel
+ *                     (stored encrypted in SystemConfig) or PAYOUT_WALLET_*
+ *                     env, falling back to OPERATOR_WALLET_KEY
  *
  * Alerting: low BNB on the PAYOUT wallet / low USDT in treasury / large
  * pending payout queue / empty deposit pool. Debounced in Redis (one alert
@@ -41,42 +41,115 @@ export function getTreasuryAddress(): string {
 
 export interface PayoutWallet {
   address: string;
-  key: string;
-  source: 'dedicated' | 'operator-fallback';
+  key: string; // ENCRYPTED — sendTransaction decrypts it (never store plain)
+  source: 'database' | 'dedicated-env' | 'operator-fallback';
+}
+
+const PAYOUT_WALLET_CONFIG_KEY = 'payout_wallet';
+const PAYOUT_WALLET_CACHE_KEY = 'payout_wallet:cfg';
+const PAYOUT_WALLET_CACHE_TTL = 60;
+
+interface StoredPayoutWallet {
+  address: string;
+  encryptedKey: string;
+}
+
+async function getStoredPayoutWallet(): Promise<StoredPayoutWallet | null> {
+  try {
+    const cached = await redis.get(PAYOUT_WALLET_CACHE_KEY);
+    if (cached) return JSON.parse(cached) as StoredPayoutWallet;
+  } catch {}
+  try {
+    const row = await prisma.systemConfig.findUnique({ where: { key: PAYOUT_WALLET_CONFIG_KEY } });
+    if (row?.value && typeof row.value === 'object') {
+      const v = row.value as StoredPayoutWallet;
+      if (typeof v.address === 'string' && typeof v.encryptedKey === 'string') {
+        try {
+          await redis.setex(PAYOUT_WALLET_CACHE_KEY, PAYOUT_WALLET_CACHE_TTL, JSON.stringify(v));
+        } catch {}
+        return v;
+      }
+    }
+  } catch {}
+  return null;
 }
 
 /**
  * The wallet that SIGNS giveaway payouts in platform mode.
- * Priority: dedicated PAYOUT_WALLET_* env → OPERATOR_WALLET_KEY (legacy
- * assumption that it controls PLATFORM_FEE_WALLET). Throws with a clear
- * message if neither is configured.
+ * Priority: DB (set from the admin panel) → PAYOUT_WALLET_* env →
+ * OPERATOR_WALLET_KEY legacy fallback. `key` is ALWAYS the encrypted key.
  */
-export function getPayoutWallet(): PayoutWallet {
+export async function getPayoutWallet(): Promise<PayoutWallet> {
+  const stored = await getStoredPayoutWallet();
+  if (stored) return { address: stored.address, key: stored.encryptedKey, source: 'database' };
+
   if (config.PAYOUT_WALLET_KEY) {
     if (!config.PAYOUT_WALLET_ADDRESS) {
       throw new Error('PAYOUT_WALLET_KEY is set but PAYOUT_WALLET_ADDRESS is missing');
     }
-    return { address: config.PAYOUT_WALLET_ADDRESS, key: config.PAYOUT_WALLET_KEY, source: 'dedicated' };
+    return { address: config.PAYOUT_WALLET_ADDRESS, key: config.PAYOUT_WALLET_KEY, source: 'dedicated-env' };
   }
   if (config.OPERATOR_WALLET_KEY) {
     return { address: config.PLATFORM_FEE_WALLET, key: config.OPERATOR_WALLET_KEY, source: 'operator-fallback' };
   }
   throw new Error(
-    'PAYOUT_ORIGIN=platform but no payout wallet key configured. ' +
-    'Set PAYOUT_WALLET_ADDRESS + PAYOUT_WALLET_KEY (recommended), or OPERATOR_WALLET_KEY.'
+    'PAYOUT_ORIGIN=platform but no payout wallet configured. ' +
+    'Set it in Admin → Treasury → Set Payout Wallet, or configure PAYOUT_WALLET_ADDRESS + PAYOUT_WALLET_KEY (encrypted).'
   );
 }
 
+/**
+ * Admin panel: set/rotate the payout wallet. Accepts the PLAIN key, verifies
+ * it actually controls the address, encrypts it with WALLET_ENCRYPTION_KEY,
+ * persists in SystemConfig and invalidates the cache. Audit-logged.
+ */
+export async function setPayoutWallet(
+  adminTelegramId: string,
+  address: string,
+  plainPrivateKey: string
+): Promise<void> {
+  const { normalizeAddress } = await import('../utils/validation');
+  const { encrypt } = await import('../utils/encryption');
+  const { ethers } = await import('ethers');
+
+  const normalized = normalizeAddress(address);
+  const derived = normalizeAddress(new ethers.Wallet(plainPrivateKey.trim()).address);
+  if (derived !== normalized) {
+    throw new Error(`Key mismatch: that private key controls ${derived}, not ${normalized}`);
+  }
+
+  const value = { address: normalized, encryptedKey: encrypt(plainPrivateKey.trim()) };
+  await prisma.systemConfig.upsert({
+    where: { key: PAYOUT_WALLET_CONFIG_KEY },
+    create: { key: PAYOUT_WALLET_CONFIG_KEY, value },
+    update: { value },
+  });
+  try {
+    await redis.del(PAYOUT_WALLET_CACHE_KEY);
+  } catch {}
+
+  await prisma.auditLog.create({
+    data: {
+      adminId: adminTelegramId,
+      action: 'PAYOUT_WALLET_SET',
+      entityType: 'system_config',
+      entityId: PAYOUT_WALLET_CONFIG_KEY,
+      newValue: { address: normalized },
+    },
+  });
+  logger.info(`Payout wallet set to ${normalized} by admin ${adminTelegramId}`);
+}
+
 interface TreasuryThresholds {
-  minBnb: number; // alert when the gas wallet BNB < this
-  minUsdt: number; // alert when treasury USDT < this
-  maxPendingPayouts: number; // alert when payout queue deeper than this
+  minBnb: number;
+  minUsdt: number;
+  maxPendingPayouts: number;
 }
 
 const DEFAULT_THRESHOLDS: TreasuryThresholds = {
-  minBnb: 0.000005,
+  minBnb: 0.0000005,
   minUsdt: 0.15,
-  maxPendingPayouts: 101,
+  maxPendingPayouts: 500,
 };
 
 async function getThresholds(): Promise<TreasuryThresholds> {
@@ -106,15 +179,12 @@ export interface TreasuryStatus {
   usdt: number;
   companyWalletsActive: number;
   depositSessionsAwaiting: number;
-  pendingPayouts: number | null; // null when the queue is unreachable
+  pendingPayouts: number | null;
 }
 
 class TreasuryMonitor {
   private onAlert: ((message: string) => void) | null = null;
 
-  /**
-   * @param alertHandler wired by bot/index.ts to Telegram admin messages.
-   */
   start(alertHandler: (message: string) => void): void {
     this.onAlert = alertHandler;
     cron.schedule('*/5 * * * *', () => void this.check());
@@ -133,14 +203,12 @@ class TreasuryMonitor {
     try {
       const { payoutQueue } = await import('../queues');
       pendingPayouts = await payoutQueue.getWaitingCount();
-    } catch {
-      // Queue unreachable — non-fatal for a status view.
-    }
+    } catch {}
 
     return {
       address: config.PLATFORM_FEE_WALLET,
       payoutAddress:
-        getPayoutOrigin() === 'platform' ? getPayoutWallet().address : config.PLATFORM_FEE_WALLET,
+        getPayoutOrigin() === 'platform' ? (await getPayoutWallet()).address : config.PLATFORM_FEE_WALLET,
       payoutOrigin: getPayoutOrigin(),
       legacyMonitorEnabled: config.ENABLE_LEGACY_DEPOSIT_MONITOR,
       bnb: Number(bnbRaw) / 1e18,
@@ -151,16 +219,14 @@ class TreasuryMonitor {
     };
   }
 
-  /** One debounced alert per kind per hour (spec §34). */
   private async maybeAlert(kind: string, message: string): Promise<void> {
     if (!this.onAlert) return;
     const key = `treasury:alert:${kind}`;
     try {
       const set = await redis.set(key, '1', 'EX', 3600, 'NX');
-      if (set !== 'OK') return; // already alerted recently
+      if (set !== 'OK') return;
       this.onAlert(message);
     } catch {
-      // Redis down → deliver anyway (better than missing a funds alert).
       this.onAlert(message);
     }
   }
@@ -169,10 +235,9 @@ class TreasuryMonitor {
     try {
       const [status, thresholds] = await Promise.all([this.getStatus(), getThresholds()]);
 
-      // Gas lives on the PAYOUT wallet in platform mode (it signs the txs);
-      // on the treasury wallet otherwise.
+      // Gas lives on the PAYOUT wallet in platform mode (it signs the txs).
       const gasAddress =
-        getPayoutOrigin() === 'platform' ? getPayoutWallet().address : config.PLATFORM_FEE_WALLET;
+        getPayoutOrigin() === 'platform' ? (await getPayoutWallet()).address : config.PLATFORM_FEE_WALLET;
       const gasBnb = Number(await blockchain.getBalance(gasAddress, 'BNB').catch(() => 0n)) / 1e18;
       if (gasBnb < thresholds.minBnb) {
         await this.maybeAlert(
@@ -206,7 +271,6 @@ class TreasuryMonitor {
         );
       }
     } catch (err) {
-      // A monitor failure must never crash the bot process.
       logger.error(`Treasury check failed: ${(err as Error).message}`);
     }
   }
