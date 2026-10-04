@@ -18,10 +18,16 @@ export { pickUniqueSuffix, computeExpectedAmount };
  *
  * A deposit is a TIME-BOXED session, not a permanent per-user monitor:
  *   DEPOSIT tap → session created (30-min window, company pool address
- *   assigned, expected amount = requested + fee + unique suffix)
+ *   assigned, expected amount = requested + unique 0.1-band component)
  *   → user sends funds → "I HAVE DEPOSITED" performs an immediate active
  *   verification → confirmed → credit (guarded, idempotent) → funds
  *   forwarded to treasury.
+ *
+ * AMOUNT DESIGN: the payment's fractional part is a SINGLE component in the
+ *   0.1000–0.1999 band — it is simultaneously the unique identifier AND the
+ *   platform fee. So $1 → "1.1234", $5 → "5.1568" — never stacked
+ *   "1.228811"-style amounts. The user is credited exactly what they
+ *   requested; the component stays platform-side.
  *
  * Identification (spec §14): PRIMARY = session + assigned address + txHash
  * uniqueness + amount match. The unique suffix is a SECONDARY aid only.
@@ -66,7 +72,8 @@ class DepositSessionService {
     });
     if (!wallet) throw new Error('Deposit system is temporarily unavailable — no deposit addresses free');
 
-    // Fee in asset units (deposit fees are configured in USD).
+    // Configured deposit fee in asset units — rounded to 4dp so it never
+    // produces long decimals (USDT price drift can't turn 0.1 into 0.100011).
     let feeAsset = 0;
     if (fees.enableFees) {
       try {
@@ -74,15 +81,18 @@ class DepositSessionService {
         const usdPerUnit = await pricing.convertToUSD(asset, 1);
         const usdValue = usdPerUnit > 0 ? requestedAmount * usdPerUnit : requestedAmount;
         const feeUSD = feeConfig.depositFlatFeeUSD(usdValue, fees);
-        feeAsset = usdPerUnit > 0 ? Number((feeUSD / usdPerUnit).toFixed(8)) : feeUSD;
+        feeAsset = usdPerUnit > 0 ? Number((feeUSD / usdPerUnit).toFixed(4)) : Number(feeUSD.toFixed(4));
       } catch {
-        // Pricing unreachable → proceed with zero fee rather than block the deposit.
-        logger.warn('Pricing unavailable for deposit fee calc — fee set to 0');
+        // Pricing unreachable → proceed with zero configured fee; the
+        // unique component below still covers identification + revenue.
+        logger.warn('Pricing unavailable for deposit fee calc — configured fee set to 0');
       }
     }
 
-    // Unique amount suffix — collision-checked against ALL live sessions so
-    // two simultaneous deposits can never share an identifier (spec §14).
+    // Unique component — always in the 0.1 band (0.1000–0.1999). It is BOTH
+    // the unique identifier and the platform fee: the larger of the
+    // configured fee and the suffix wins, so $1 → "1.1234", never
+    // "1.228811".
     const takenSuffixes = (
       await prisma.depositSession.findMany({
         where: { status: { in: ['AWAITING', 'DETECTED'] } },
@@ -90,14 +100,15 @@ class DepositSessionService {
       })
     ).map((s) => Number(s.uniqueSuffix));
     const suffix = pickUniqueSuffix(takenSuffixes);
-    const expectedAmount = computeExpectedAmount(requestedAmount, feeAsset, suffix);
+    const feeComponent = Math.max(feeAsset, suffix); // single fractional component
+    const expectedAmount = computeExpectedAmount(requestedAmount, feeComponent, 0);
 
     const session = await prisma.depositSession.create({
       data: {
         userId,
         asset,
         requestedAmount,
-        platformFee: feeAsset,
+        platformFee: feeComponent, // auditable: the full component is platform revenue
         expectedAmount,
         uniqueSuffix: suffix,
         assignedWalletId: wallet.id,
@@ -273,7 +284,7 @@ class DepositSessionService {
     try {
       await prisma.$transaction(async (tx) => {
         // Only the INTENDED deposit amount becomes user balance (spec §15);
-        // the fee and unique-suffix components stay platform-side.
+        // the 0.1-band component stays platform-side.
         await tx.balance.upsert({
           where: { userId_asset: { userId: session.userId, asset: session.asset } },
           create: { userId: session.userId, asset: session.asset, availableBalance: session.requestedAmount },
@@ -449,4 +460,4 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-    
+      
