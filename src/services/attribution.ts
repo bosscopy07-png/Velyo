@@ -2,21 +2,21 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../database';
 import { hashIdempotencyKey } from '../utils/encryption';
 import { logger } from '../utils/logger';
-import { feeConfig } from './fee-config';
 import { rewardsService } from './rewards';
 
 /**
  * Giveaway-link referral attribution.
  *
  * Velyo deliberately has NO separate referral-link system: the giveaway
- * link IS the attribution mechanism. User B claims User A's giveaway →
- * one GiveawayAttribution row (unique per giveaway+claimant, stable
- * internal user IDs — never usernames).
+ * link IS the attribution mechanism. User B claims User A's giveaway → one
+ * GiveawayAttribution row (unique per giveaway+claimant, stable internal
+ * user IDs — never usernames).
  *
- * Referral reward rule: when a claimant is attributed for the FIRST time
- * platform-wide, the creator of that giveaway (the referrer) earns the
- * configured referral % of the giveaway's per-user amount. Idempotency:
- * hash('referral-reward', attribution.id) — one attribution, one reward.
+ * REWARD MODEL (UPGRADE): the referral reward does NOT pay on first claim.
+ * Instead: when a referred user CREATES a giveaway and it is fully paid
+ * out, the referrer earns the configured % (settled in
+ * workers/payout.maybeCompleteGiveaway). getReferrerOf() resolves the
+ * referrer as the creator of the user's EARLIEST attribution.
  */
 
 export interface AttributionInput {
@@ -47,9 +47,8 @@ class AttributionService {
       select: { id: true },
     });
 
-    let attribution;
     try {
-      attribution = await prisma.giveawayAttribution.create({
+      const attribution = await prisma.giveawayAttribution.create({
         data: {
           giveawayId: input.giveawayId,
           claimantId: input.claimantId,
@@ -58,6 +57,7 @@ class AttributionService {
           source: input.source,
         },
       });
+      return { id: attribution.id, alreadyExisted: false };
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         const winner = await prisma.giveawayAttribution.findUnique({
@@ -67,44 +67,21 @@ class AttributionService {
       }
       throw err;
     }
+  }
 
-    // ── First-time referral reward ──
-    try {
-      const priorCount = await prisma.giveawayAttribution.count({
-        where: { claimantId: input.claimantId, id: { not: attribution.id } },
-      });
-      if (priorCount === 0) {
-        const fees = await feeConfig.getFees();
-        const amount = feeConfig.percentOf(Number(giveaway.amountPerUser), fees.referralRewardPercent);
-        if (amount > 0) {
-          await rewardsService.creditReward({
-            userId: giveaway.creatorId,
-            type: 'REFERRAL_REWARD',
-            sourceType: 'giveaway_attribution',
-            sourceId: attribution.id,
-            asset: giveaway.asset,
-            amount,
-            idempotencyKey: hashIdempotencyKey('referral-reward', attribution.id),
-            metadata: { claimantId: input.claimantId, giveawayId: input.giveawayId },
-          });
-          await prisma.auditLog.create({
-            data: {
-              action: 'REFERRAL_REWARD_CREDIT',
-              entityType: 'reward',
-              entityId: attribution.id,
-              newValue: { claimantId: input.claimantId, amount, asset: giveaway.asset },
-            },
-          });
-        }
-      }
-    } catch (err) {
-      // Reward failure must never break attribution recording — the retry
-      // path (reward idempotency) cannot re-trigger because priorCount is
-      // now > 0. Log loudly for manual reconciliation instead.
-      logger.error(`Referral reward FAILED for attribution ${attribution.id} — reconcile manually: ${(err as Error).message}`);
-    }
-
-    return { id: attribution.id, alreadyExisted: false };
+  /**
+   * The referrer of a user = the creator of the EARLIEST giveaway that user
+   * claimed through a giveaway link. Drives the referral reward: when the
+   * referred user CREATES and fully pays out a giveaway, this referrer earns
+   * the configured % (settled in workers/payout.maybeCompleteGiveaway).
+   */
+  async getReferrerOf(userId: string): Promise<{ id: string; telegramId: string; username: string | null } | null> {
+    const first = await prisma.giveawayAttribution.findFirst({
+      where: { claimantId: userId },
+      orderBy: { createdAt: 'asc' },
+      include: { creator: { select: { id: true, telegramId: true, username: true } } },
+    });
+    return first?.creator ?? null;
   }
 
   /**
@@ -132,9 +109,6 @@ class AttributionService {
     reason?: string;
   }): Promise<void> {
     const giveawayId = args.giveawayId ?? null;
-    // Dedup first (Postgres NULLs don't collide in unique indexes; a benign
-    // duplicate row is impossible to create here because we check first and
-    // the UI only exposes one block action per user).
     const existing = await prisma.claimBlock.findFirst({
       where: { creatorId: args.creatorId, blockedUserId: args.blockedUserId, giveawayId },
     });
@@ -173,3 +147,4 @@ class AttributionService {
 }
 
 export const attributionService = new AttributionService();
+      
