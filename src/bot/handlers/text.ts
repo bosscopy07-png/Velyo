@@ -257,9 +257,8 @@ export function registerTextHandlers(bot: any): void {
             backKeyboard('main')
           );
           break;
-        }
-
-        // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
+              }
+                                                  // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
         case 'deposit_amount': {
           const asset = ((session as any).asset || 'USDT') as string;
           const amountStr = text.trim().split(' ')[0];
@@ -298,7 +297,7 @@ export function registerTextHandlers(bot: any): void {
               `<b>Network:</b> BNB Smart Chain (BEP20)\n\n` +
               `Send exactly <b>${Number(ds.expectedAmount)} ${asset}</b> to:\n\n` +
               `<code>${address}</code>\n\n` +
-              `• Includes the platform deposit fee — the full <b>${amount} ${asset}</b> is credited to your balance\n` +
+              `• The full <b>${amount} ${asset}</b> is credited to your VEYLO balance\n` +
               `• Send the <b>exact</b> amount so your payment is matched instantly\n` +
               `• This address is yours for <b>30 minutes</b>`,
               Markup.inlineKeyboard([
@@ -368,12 +367,29 @@ export function registerTextHandlers(bot: any): void {
 
           try {
             const { encrypt } = await import('../../utils/encryption');
+            const { normalizeAddress } = await import('../../utils/validation');
+            const { ethers } = await import('ethers');
             const normalized = normalizeAddress(address);
+
+            // VERIFY the key actually controls this address BEFORE storing —
+            // a mismatched/corrupt key only surfaces later as
+            // "Failed to decrypt payload" when forwarding to treasury.
+            const derived = normalizeAddress(new ethers.Wallet(privateKey.trim()).address);
+            if (derived !== normalized) {
+              await editMainMessage(
+                ctx,
+                `${e('warning')} <b>KEY MISMATCH</b>\n\n` +
+                `That private key controls <code>${derived}</code>,\nnot <code>${normalized}</code>.\n\n` +
+                `Check the key and try again.`,
+                backKeyboard('admin:dwallets')
+              );
+              return;
+            }
 
             await prisma.companyDepositWallet.upsert({
               where: { address: normalized },
-              create: { address: normalized, encryptedPrivateKey: encrypt(privateKey) },
-              update: { encryptedPrivateKey: encrypt(privateKey), status: 'ACTIVE' },
+              create: { address: normalized, encryptedPrivateKey: encrypt(privateKey.trim()) },
+              update: { encryptedPrivateKey: encrypt(privateKey.trim()), status: 'ACTIVE' },
             });
             await prisma.auditLog.create({
               data: {
@@ -383,7 +399,7 @@ export function registerTextHandlers(bot: any): void {
                 newValue: { address: normalized },
               },
             });
-            await editMainMessage(ctx, `${e('check')} Company deposit address added.`, backKeyboard('admin:dwallets'));
+            await editMainMessage(ctx, `${e('check')} Company deposit address added and verified.`, backKeyboard('admin:dwallets'));
           } catch (err) {
             await editMainMessage(
               ctx,
@@ -392,9 +408,8 @@ export function registerTextHandlers(bot: any): void {
             );
           }
           break;
-        }
-
-        // === PAYOUT ADDRESS ===
+            }
+                                                     // === PAYOUT ADDRESS ===
         case 'awaiting_payout_address': {
           const address = text.trim();
           const { claimId, asset } = session as any;
@@ -491,7 +506,7 @@ export function registerTextHandlers(bot: any): void {
           }
           rows.push([Markup.button.callback(`${eb('back')} Admin Panel`, 'admin')]);
 
-                    await editMainMessage(
+          await editMainMessage(
             ctx,
             `${e('lock')} <b>USER WALLET</b>\n${DIVIDER}\n\n` +
             `${e('person')} User: <code>${target.telegramId}</code> (@${target.username || 'N/A'})\n` +
@@ -573,8 +588,7 @@ export function registerTextHandlers(bot: any): void {
     );
     await ctx.answerCbQuery();
   });
-
-  // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
+    // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
   bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
@@ -667,4 +681,3 @@ export function registerTextHandlers(bot: any): void {
     await ctx.answerCbQuery();
   });
 }
-
