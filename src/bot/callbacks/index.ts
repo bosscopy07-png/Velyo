@@ -22,6 +22,10 @@ import { editMainMessage } from '../utils/editMainMessage';
 // Telegram t.me links break if the username contains "@"
 const BOT_USERNAME = config.BOT_USERNAME.replace(/^@/, '');
 
+/** History entries per page — each entry is 2–3 lines with detail text,
+ *  and photo captions cap at 1,024 chars. */
+const HISTORY_PER_PAGE = 5;
+
 export function registerCallbacks(bot: any): void {
   const isAdmin = (ctx: Context): boolean =>
     !!ctx.from && config.ADMIN_TELEGRAM_IDS.includes(ctx.from.id.toString());
@@ -121,8 +125,13 @@ export function registerCallbacks(bot: any): void {
    * it came from — cashback vs referral, deposit session vs giveaway,
    * cancelled-giveaway refund vs returned gas, and reward-credit discounts.
    * All icons are the premium custom emoji set (e()/eb()).
+   *
+   * PAGINATED: each entry is 2–3 lines and photo captions cap at 1,024
+   * chars, so a fixed "latest N" list blows the cap quickly. 5 per page
+   * keeps a full page well under it. Page navigation via
+   * wallet:history:<page> callbacks.
    */
-  async function renderHistory(ctx: Context): Promise<void> {
+  async function renderHistory(ctx: Context, page: number = 1): Promise<void> {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
     if (!user) return;
@@ -130,7 +139,7 @@ export function registerCallbacks(bot: any): void {
     const txs = await prisma.transaction.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: 'desc' },
-      take: 12,
+      take: 300, // fetch enough to page over; each page slices below
     });
 
     const TYPE_LABEL: Record<string, string> = {
@@ -147,10 +156,14 @@ export function registerCallbacks(bot: any): void {
     const INFLOW = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND', 'REWARD'];
     const divider = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
 
-    let text = `${e('document')} <b>ACTIVITY HISTORY</b>\n${divider}\n\n`;
-    if (txs.length === 0) text += 'No transactions yet.';
+    const totalPages = Math.max(1, Math.ceil(txs.length / HISTORY_PER_PAGE));
+    const p = Math.min(Math.max(1, page), totalPages);
+    const slice = txs.slice((p - 1) * HISTORY_PER_PAGE, p * HISTORY_PER_PAGE);
 
-    for (const tx of txs) {
+    let text = `${e('document')} <b>ACTIVITY HISTORY</b> (${p}/${totalPages})\n${divider}\n\n`;
+    if (slice.length === 0) text += 'No transactions yet.';
+
+    for (const tx of slice) {
       const meta = (tx.metadata ?? {}) as Record<string, any>;
       const base = TYPE_LABEL[tx.type] ?? tx.type;
 
@@ -179,7 +192,17 @@ export function registerCallbacks(bot: any): void {
       text += `${base}${detail}\n   ${sign}${tx.amount} ${tx.asset} · ${tx.status} · ${when}\n\n`;
     }
 
-    await editMainMessage(ctx, text.trimEnd(), backKeyboard('wallet'));
+    const rows: any[] = [];
+    if (totalPages > 1) {
+      const nav: any[] = [];
+      if (p > 1) nav.push(Markup.button.callback(`◀️ ${p - 1}`, `wallet:history:${p - 1}`));
+      nav.push(Markup.button.callback(`${p}/${totalPages}`, 'giveaway:noop'));
+      if (p < totalPages) nav.push(Markup.button.callback(`${p + 1} ▶️`, `wallet:history:${p + 1}`));
+      rows.push(nav);
+    }
+    rows.push([Markup.button.callback(`${eb('back')} Back`, 'wallet')]);
+
+    await editMainMessage(ctx, text.trimEnd(), Markup.inlineKeyboard(rows));
   }
 
   async function renderMyGiveaways(ctx: Context, userId: string): Promise<void> {
@@ -224,8 +247,9 @@ export function registerCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-        }
-        const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
+  }
+
+  const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
     } catch (err) {
@@ -321,10 +345,15 @@ export function registerCallbacks(bot: any): void {
 
   bot.action('wallet:history', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
-    await renderHistory(ctx);
+    await renderHistory(ctx, 1);
   }));
 
-  // === GIVEAWAY ===
+  // Paginated history — page number in the callback data.
+  bot.action(/wallet:history:(\d+)/, guard(async (ctx: Context) => {
+    await ctx.answerCbQuery();
+    await renderHistory(ctx, parseInt((ctx as any).match[1], 10));
+  }));
+                                // === GIVEAWAY ===
   bot.action('giveaway', guard(async (ctx: Context) => {
     if (!config.ENABLE_GIVEAWAYS) {
       await ctx.answerCbQuery('Giveaways are temporarily disabled.', { show_alert: true });
@@ -418,7 +447,8 @@ export function registerCallbacks(bot: any): void {
       await renderMyGiveaways(ctx, user.id);
     }
   }));
-    // === GIVEAWAY STATISTICS ===
+
+  // === GIVEAWAY STATISTICS ===
   bot.action(/giveaway:stats:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -449,7 +479,7 @@ export function registerCallbacks(bot: any): void {
   // === HISTORY ===
   bot.action('history', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
-    await renderHistory(ctx);
+    await renderHistory(ctx, 1);
   }));
 
   // === ACCOUNT ===
@@ -499,8 +529,7 @@ export function registerCallbacks(bot: any): void {
 
     await editMainMessage(ctx, caption, keyboard);
   }));
-
-  // === HELP ===
+                                    // === HELP ===
   bot.action('help', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     await editMainMessage(
@@ -583,5 +612,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-      }
-      
+          }
+        
