@@ -16,28 +16,22 @@ export { pickUniqueSuffix, computeExpectedAmount };
 /**
  * Deposit-session architecture (spec §11–21).
  *
- * A deposit is a TIME-BOXED session, not a permanent per-user monitor:
- *   DEPOSIT tap → session created (30-min window, company pool address
- *   assigned, expected amount = requested + unique 0.1-band component)
- *   → user sends funds → "I HAVE DEPOSITED" performs an immediate active
- *   verification → confirmed → credit (guarded, idempotent) → funds
- *   forwarded to treasury.
+ * A deposit is a TIME-BOXED session: DEPOSIT tap → session created (30-min
+ * window, company pool address, expected amount = requested + unique 0.1
+ * band component) → user sends funds → "I HAVE DEPOSITED" verifies on-chain
+ * → guarded idempotent credit → funds forwarded to treasury.
  *
- * AMOUNT DESIGN: the payment's fractional part is a SINGLE component in the
- *   0.1000–0.1999 band — it is simultaneously the unique identifier AND the
- *   platform fee. So $1 → "1.1234", $5 → "5.1568" — never stacked
- *   "1.228811"-style amounts. The user is credited exactly what they
- *   requested; the component stays platform-side.
+ * RPC PROFILE (UPGRADE): there is NO recurring blockchain polling at all.
+ * The chain is contacted ONLY in response to an explicit user action
+ * (starting a session, tapping "I Have Deposited") or a payout job. The
+ * background cron below is DB-ONLY (session expiry). A DETECTED session
+ * matures when its owner taps "I Have Deposited"/"Check Again" again —
+ * never from a background loop.
  *
- * Identification (spec §14): PRIMARY = session + assigned address + txHash
- * uniqueness + amount match. The unique suffix is a SECONDARY aid only.
- *
- * RPC profile (spec §17/§19): the only background polling is a light sweep
- * (2×/min) over DETECTED sessions awaiting confirmation depth and session
- * expiry — bounded by ACTIVE SESSION COUNT, never by total user count.
- * No permanent per-user loop is created by this module. (The legacy
- * deposit-monitor.ts per-user scanning remains in place until deliberately
- * decommissioned — historical DepositMonitor rows stay for audit.)
+ * AMOUNT DESIGN: the fractional part is a SINGLE component in the
+ * 0.1000–0.1999 band — simultaneously the unique identifier AND the
+ * platform fee. $1 → "1.1234", $5 → "5.1568". The user is credited exactly
+ * what they requested; the component stays platform-side.
  */
 
 const SESSION_TTL_MS = config.DEPOSIT_SESSION_TTL_MINUTES * 60_000;
@@ -56,8 +50,7 @@ export type VerifyResult =
 class DepositSessionService {
   /**
    * Creates a deposit session and assigns a company pool address
-   * (least-recently-assigned ACTIVE wallet — deterministic, recorded against
-   * the session for audit; spec §13).
+   * (least-recently-assigned ACTIVE wallet — deterministic, recorded).
    */
   async createSession(userId: string, asset: AssetSymbol, requestedAmount: number) {
     if (!config.ENABLE_DEPOSITS) throw new Error('Deposits are temporarily disabled');
@@ -91,8 +84,7 @@ class DepositSessionService {
 
     // Unique component — always in the 0.1 band (0.1000–0.1999). It is BOTH
     // the unique identifier and the platform fee: the larger of the
-    // configured fee and the suffix wins, so $1 → "1.1234", never
-    // "1.228811".
+    // configured fee and the suffix wins, so $1 → "1.1234", never 1.228811.
     const takenSuffixes = (
       await prisma.depositSession.findMany({
         where: { status: { in: ['AWAITING', 'DETECTED'] } },
@@ -138,8 +130,11 @@ class DepositSessionService {
 
   /**
    * "I HAVE DEPOSITED" — immediate active verification (spec §18).
-   * Idempotent and race-safe: the guarded status transition guarantees a
-   * single crediting path even if two taps arrive together (spec §20).
+   * This is the ONLY on-chain deposit check, and it runs ONLY because the
+   * user tapped. Idempotent and race-safe: the guarded status transition
+   * guarantees a single crediting path even if two taps arrive together.
+   * Handles AWAITING and DETECTED sessions (a DETECTED session matures here
+   * once its transaction reaches REQUIRED_CONFIRMATIONS).
    */
   async verifySession(sessionId: string, requesterUserId: string): Promise<VerifyResult> {
     const session = await prisma.depositSession.findUnique({
@@ -173,7 +168,7 @@ class DepositSessionService {
       const confirmations = detected.blockNumber ? currentBlock - detected.blockNumber + 1 : 0;
 
       if (confirmations < REQUIRED_CONFIRMATIONS) {
-        // Seen but immature — record DETECTED once; the sweep matures it.
+        // Seen but immature — record DETECTED once; the user tap matures it.
         await prisma.depositSession.updateMany({
           where: { id: session.id, status: 'AWAITING' },
           data: { status: 'DETECTED', detectedTxHash: detected.txHash, detectedAmount: detected.amount },
@@ -205,7 +200,7 @@ class DepositSessionService {
    * delta between two observations (company deposit wallets only receive
    * user deposits — forwards go OUT), so a positive delta in the window is
    * a deposit; the synthetic ref embeds the session id and is unique per
-   * session (txHash @unique).
+   * session (txHash @unique). Runs only on explicit user taps.
    */
   private async findInboundTransfer(session: {
     id: string;
@@ -227,8 +222,6 @@ class DepositSessionService {
         currentBlock
       );
       const events = eventsByAddress.get(address) ?? [];
-      // Closest-amount match above the requested minimum; below-minimum
-      // transfers are ignored (they can't be this session's payment).
       let best: { txHash: string; amount: number; blockNumber?: number } | null = null;
       let bestDiff = Infinity;
       for (const ev of events) {
@@ -243,9 +236,9 @@ class DepositSessionService {
       return best;
     }
 
-    // BNB: balance delta. First tap records the baseline; a later tap (or
-    // the sweep's maturation path) compares. Honest trade-off: BNB has no
-    // transfer-event log, and this keeps RPC usage to two balance reads.
+    // BNB: balance delta. First tap records the baseline; a later tap
+    // compares. Honest trade-off: BNB has no transfer-event log, and this
+    // keeps RPC usage to two balance reads per tap.
     const key = `ds:bal:${session.id}`;
     const prevRaw = await redis.get(key);
     const current = Number(await blockchain.getBalance(session.assignedWallet.address, 'BNB')) / 1e18;
@@ -339,7 +332,8 @@ class DepositSessionService {
 
     logger.info(`Deposit session ${session.id} credited: ${session.requestedAmount} ${session.asset} (tx ${txHash})`);
 
-    // Forward to treasury fire-and-forget (spec §21).
+    // Forward to treasury fire-and-forget (spec §21) — the only other chain
+    // call, and only ever after a user-initiated successful credit.
     void this.forwardToTreasury(session.id).catch((err) =>
       logger.error(`Treasury forward failed for session ${session.id}: ${(err as Error).message}`)
     );
@@ -397,48 +391,23 @@ class DepositSessionService {
   }
 
   /**
-   * Background sweeps (spec §17/§19) — the ONLY recurring RPC work this
-   * module performs: session expiry (DB-only) + maturation of DETECTED
-   * sessions (real txHash path, bounded by live-session count).
-   * Starts from bot/index.ts.
+   * Background cron — DB-ONLY. No blockchain calls, ever. Its only job is
+   * flipping expired sessions. A DETECTED session is matured by the owner
+   * tapping "I Have Deposited" again (verifySession handles DETECTED).
    */
   start(): void {
-    cron.schedule('20 * * * * *', () => void this.sweep());
-    cron.schedule('50 * * * * *', () => void this.sweep());
-    logger.info('Deposit session sweeps started (expiry + DETECTED maturation, 2×/min)');
+    cron.schedule('20 * * * * *', () => void this.expireSweep());
+    cron.schedule('50 * * * * *', () => void this.expireSweep());
+    logger.info('Deposit session sweeps started (DB-only expiry; no blockchain polling)');
   }
 
-  private async sweep(): Promise<void> {
+  private async expireSweep(): Promise<void> {
     try {
-      const now = new Date();
-
       const expired = await prisma.depositSession.updateMany({
-        where: { status: { in: ['AWAITING', 'DETECTED'] }, expiresAt: { lt: now } },
+        where: { status: { in: ['AWAITING', 'DETECTED'] }, expiresAt: { lt: new Date() } },
         data: { status: 'EXPIRED' },
       });
       if (expired.count > 0) logger.info(`Expired ${expired.count} deposit session(s)`);
-
-      const maturing = await prisma.depositSession.findMany({
-        where: { status: 'DETECTED', expiresAt: { gte: now }, detectedTxHash: { not: null } },
-        take: 20,
-      });
-      for (const s of maturing) {
-        try {
-          const receipt = await blockchain.getTransactionReceipt(s.detectedTxHash!);
-          if (!receipt || receipt.status !== 1) continue; // not final — check again next sweep
-          const provider = await blockchain.getProvider();
-          const currentBlock = await provider.getBlockNumber();
-          const confs = receipt.blockNumber ? currentBlock - receipt.blockNumber + 1 : 0;
-          if (confs < REQUIRED_CONFIRMATIONS) continue;
-          await this.creditSession(
-            { id: s.id, userId: s.userId, asset: s.asset, requestedAmount: Number(s.requestedAmount), platformFee: Number(s.platformFee) },
-            s.detectedTxHash!,
-            Number(s.detectedAmount ?? s.expectedAmount)
-          );
-        } catch (err) {
-          logger.warn(`Maturation check failed for session ${s.id}: ${(err as Error).message}`);
-        }
-      }
     } catch (err) {
       logger.error(`Deposit session sweep error: ${(err as Error).message}`);
     }
@@ -460,4 +429,3 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-      
