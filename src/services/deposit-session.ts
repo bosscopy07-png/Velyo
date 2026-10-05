@@ -18,15 +18,17 @@ export { pickUniqueSuffix, computeExpectedAmount };
  *
  * A deposit is a TIME-BOXED session: DEPOSIT tap → session created (30-min
  * window, company pool address, expected amount = requested + unique 0.1
- * band component) → user sends funds → "I HAVE DEPOSITED" verifies on-chain
- * → guarded idempotent credit → funds forwarded to treasury.
+ * band component) → user sends funds → credit → funds forwarded to treasury.
  *
- * RPC PROFILE (UPGRADE): there is NO recurring blockchain polling at all.
- * The chain is contacted ONLY in response to an explicit user action
- * (starting a session, tapping "I Have Deposited") or a payout job. The
- * background cron below is DB-ONLY (session expiry). A DETECTED session
- * matures when its owner taps "I Have Deposited"/"Check Again" again —
- * never from a background loop.
+ * RPC PROFILE (UPGRADE):
+ *   - LIGHT: while a session is alive (AWAITING/DETECTED, not expired), a
+ *     ~1/min background check watches ONLY that session's address. A few
+ *     RPC calls per live session per minute — and it STOPS AUTOMATICALLY
+ *     when the session expires (30 min) or credits. Nothing runs when no
+ *     session is live.
+ *   - FULL: tapping "I HAVE DEPOSITED" performs an immediate full
+ *     verification on demand (same detection path, no waiting).
+ *   There is NO permanent per-user monitoring anywhere.
  *
  * AMOUNT DESIGN: the fractional part is a SINGLE component in the
  * 0.1000–0.1999 band — simultaneously the unique identifier AND the
@@ -38,6 +40,10 @@ const SESSION_TTL_MS = config.DEPOSIT_SESSION_TTL_MINUTES * 60_000;
 const REQUIRED_CONFIRMATIONS = 15;
 /** Amount match tolerance (asset units) — suffix is advisory, not exact. */
 const AMOUNT_TOLERANCE = 0.001;
+/** Light background check interval (seconds) — only while sessions are live. */
+const MONITOR_INTERVAL_SEC = 60;
+/** Max sessions the light sweep handles per tick (bounded RPC usage). */
+const MONITOR_BATCH = 10;
 
 export type VerifyResult =
   | { status: 'credited'; amount: number }
@@ -51,6 +57,8 @@ class DepositSessionService {
   /**
    * Creates a deposit session and assigns a company pool address
    * (least-recently-assigned ACTIVE wallet — deterministic, recorded).
+   * Starting this session is what turns ON its light background monitoring
+   * (the monitor sweep only looks at live sessions).
    */
   async createSession(userId: string, asset: AssetSymbol, requestedAmount: number) {
     if (!config.ENABLE_DEPOSITS) throw new Error('Deposits are temporarily disabled');
@@ -129,12 +137,11 @@ class DepositSessionService {
   }
 
   /**
-   * "I HAVE DEPOSITED" — immediate active verification (spec §18).
-   * This is the ONLY on-chain deposit check, and it runs ONLY because the
-   * user tapped. Idempotent and race-safe: the guarded status transition
-   * guarantees a single crediting path even if two taps arrive together.
-   * Handles AWAITING and DETECTED sessions (a DETECTED session matures here
-   * once its transaction reaches REQUIRED_CONFIRMATIONS).
+   * "I HAVE DEPOSITED" — the FULL on-demand verification. Runs the same
+   * detection path as the light monitor, immediately, because the user
+   * tapped. Idempotent and race-safe: the guarded status transition
+   * guarantees a single crediting path even if the tap and the light
+   * sweep run simultaneously.
    */
   async verifySession(sessionId: string, requesterUserId: string): Promise<VerifyResult> {
     const session = await prisma.depositSession.findUnique({
@@ -142,7 +149,24 @@ class DepositSessionService {
       include: { assignedWallet: true },
     });
     if (!session || session.userId !== requesterUserId) return { status: 'error', reason: 'Session not found' };
+    return this.processSession(session);
+  }
 
+  /**
+   * The shared detection + crediting path, used by BOTH the user tap and
+   * the light background sweep. Never throws to its caller.
+   */
+  private async processSession(session: {
+    id: string;
+    userId: string;
+    asset: string;
+    requestedAmount: unknown;
+    expectedAmount: unknown;
+    platformFee: unknown;
+    expiresAt: Date;
+    status: string;
+    assignedWallet: { address: string };
+  }): Promise<VerifyResult> {
     if (session.status === 'CREDITED') return { status: 'already_credited' };
 
     if (session.expiresAt < new Date() || session.status === 'EXPIRED') {
@@ -168,7 +192,8 @@ class DepositSessionService {
       const confirmations = detected.blockNumber ? currentBlock - detected.blockNumber + 1 : 0;
 
       if (confirmations < REQUIRED_CONFIRMATIONS) {
-        // Seen but immature — record DETECTED once; the user tap matures it.
+        // Seen but immature — record DETECTED once; the next light sweep or
+        // user tap matures it.
         await prisma.depositSession.updateMany({
           where: { id: session.id, status: 'AWAITING' },
           data: { status: 'DETECTED', detectedTxHash: detected.txHash, detectedAmount: detected.amount },
@@ -188,8 +213,8 @@ class DepositSessionService {
         detected.amount
       );
     } catch (err) {
-      // RPC failure ≠ deposit failure (spec §35) — report inconclusive, mutate nothing.
-      logger.error(`verifySession(${sessionId}) error: ${(err as Error).message}`);
+      // RPC failure ≠ deposit failure (spec §35) — inconclusive, mutate nothing.
+      logger.error(`processSession(${session.id}) error: ${(err as Error).message}`);
       return { status: 'error', reason: 'Verification unavailable right now — please try again in a minute' };
     }
   }
@@ -200,7 +225,8 @@ class DepositSessionService {
    * delta between two observations (company deposit wallets only receive
    * user deposits — forwards go OUT), so a positive delta in the window is
    * a deposit; the synthetic ref embeds the session id and is unique per
-   * session (txHash @unique). Runs only on explicit user taps.
+   * session (txHash @unique). The light sweep doubles as the BNB second
+   * observation, so BNB deposits are found without repeated user taps.
    */
   private async findInboundTransfer(session: {
     id: string;
@@ -236,9 +262,8 @@ class DepositSessionService {
       return best;
     }
 
-    // BNB: balance delta. First tap records the baseline; a later tap
-    // compares. Honest trade-off: BNB has no transfer-event log, and this
-    // keeps RPC usage to two balance reads per tap.
+    // BNB: balance delta. First observation records the baseline; a later
+    // one (next light sweep or user tap) compares.
     const key = `ds:bal:${session.id}`;
     const prevRaw = await redis.get(key);
     const current = Number(await blockchain.getBalance(session.assignedWallet.address, 'BNB')) / 1e18;
@@ -333,7 +358,7 @@ class DepositSessionService {
     logger.info(`Deposit session ${session.id} credited: ${session.requestedAmount} ${session.asset} (tx ${txHash})`);
 
     // Forward to treasury fire-and-forget (spec §21) — the only other chain
-    // call, and only ever after a user-initiated successful credit.
+    // call, and only ever after a successful credit.
     void this.forwardToTreasury(session.id).catch((err) =>
       logger.error(`Treasury forward failed for session ${session.id}: ${(err as Error).message}`)
     );
@@ -391,14 +416,19 @@ class DepositSessionService {
   }
 
   /**
-   * Background cron — DB-ONLY. No blockchain calls, ever. Its only job is
-   * flipping expired sessions. A DETECTED session is matured by the owner
-   * tapping "I Have Deposited" again (verifySession handles DETECTED).
+   * Background crons:
+   *   - expireSweep (DB-only, 2×/min): flips expired sessions. This is what
+   *     turns the light monitoring OFF — expired sessions leave the live
+   *     set, so the monitor has nothing to watch.
+   *   - monitorSweep (every 60s): the LIGHT check. It iterates ONLY live
+   *     sessions (AWAITING/DETECTED, not expired), so when no one is
+   *     depositing it makes zero RPC calls. Bounded batch per tick.
    */
   start(): void {
     cron.schedule('20 * * * * *', () => void this.expireSweep());
     cron.schedule('50 * * * * *', () => void this.expireSweep());
-    logger.info('Deposit session sweeps started (DB-only expiry; no blockchain polling)');
+    cron.schedule(`*/${MONITOR_INTERVAL_SEC} * * * * *`, () => void this.monitorSweep());
+    logger.info(`Deposit sessions started (light monitor 1/${MONITOR_INTERVAL_SEC}s for live sessions only; auto-off at expiry)`);
   }
 
   private async expireSweep(): Promise<void> {
@@ -407,9 +437,34 @@ class DepositSessionService {
         where: { status: { in: ['AWAITING', 'DETECTED'] }, expiresAt: { lt: new Date() } },
         data: { status: 'EXPIRED' },
       });
-      if (expired.count > 0) logger.info(`Expired ${expired.count} deposit session(s)`);
+      if (expired.count > 0) logger.info(`Expired ${expired.count} deposit session(s) — light monitoring off for them`);
     } catch (err) {
       logger.error(`Deposit session sweep error: ${(err as Error).message}`);
+    }
+  }
+
+  /** LIGHT background check — ONLY live sessions; zero RPC when none exist. */
+  private async monitorSweep(): Promise<void> {
+    try {
+      const live = await prisma.depositSession.findMany({
+        where: { status: { in: ['AWAITING', 'DETECTED'] }, expiresAt: { gte: new Date() } },
+        include: { assignedWallet: true },
+        orderBy: { createdAt: 'asc' },
+        take: MONITOR_BATCH,
+      });
+      for (const s of live) {
+        try {
+          const result = await this.processSession(s);
+          if (result.status === 'credited') {
+            logger.info(`Light monitor auto-credited session ${s.id}`);
+          }
+        } catch (err) {
+          // One bad session must never break the sweep.
+          logger.warn(`Light monitor failed for session ${s.id}: ${(err as Error).message}`);
+        }
+      }
+    } catch (err) {
+      logger.error(`Deposit monitor sweep error: ${(err as Error).message}`);
     }
   }
 
@@ -429,3 +484,4 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
+    
