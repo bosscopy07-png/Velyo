@@ -37,12 +37,12 @@ const envSchema = z.object({
   // PLATFORM_FEE_WALLET): supplies tiny BNB gas and receives fees.
   OPERATOR_WALLET_KEY: z.string().optional(),
 
-  // ── Phase-2 upgrade: dedicated payout wallet (platform mode) ──
+  // ── Payout wallet (platform mode) ──
   // The wallet that SIGNS giveaway payouts when PAYOUT_ORIGIN=platform.
-  // Falls back to OPERATOR_WALLET_KEY/PLATFORM_FEE_WALLET when unset — set
-  // both values here if your operator key belongs to a DIFFERENT wallet than
-  // PLATFORM_FEE_WALLET (e.g. fee wallet separate from the funded admin
-  // wallet), so payouts come from the right address.
+  // Prefer setting it from the admin panel (Admin → Treasury → Set Payout
+  // Wallet) — it is stored encrypted in the database, verified, and can be
+  // rotated without a redeploy. These env values are the fallback and must
+  // contain the ENCRYPTED key (same scheme as OPERATOR_WALLET_KEY).
   PAYOUT_WALLET_ADDRESS: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional(),
   PAYOUT_WALLET_KEY: z.string().optional(),
 
@@ -55,26 +55,34 @@ const envSchema = z.object({
   DEPOSIT_FLAT_FEE_SMALL_USD: z.string().default('0.05').transform(Number),
   DEPOSIT_FLAT_FEE_TIER_USD: z.string().default('0.5').transform(Number),
 
-  // ── Phase-2 upgrade: central reward business rules (defaults only; the
-  // live values live in SystemConfig 'fee_config' and are editable by admins) ──
+  // ── Central reward business rules (defaults only; the live values live
+  // in SystemConfig 'fee_config' and are editable by admins at runtime) ──
   REWARD_CREATOR_PERCENT: z.string().default('1.0').transform(Number),
   REWARD_REFERRAL_PERCENT: z.string().default('1.0').transform(Number),
 
-  // ── Phase-2 upgrade: who signs giveaway payout transactions ──
+  // ── Who signs giveaway payout transactions ──
   // 'platform' (default) = the platform payout wallet pays claimants
   // on-chain; the creator pays from their internal VEYLO balance (which
   // deposits and rewards credit). 'creator' = legacy custodial mode.
   PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('platform'),
 
-  // ── Phase-2 upgrade: deposit session window (minutes) ──
+  // ── Deposit session window (minutes) ──
+  // While a session is live, its address gets a LIGHT background check
+  // (~1/min). Monitoring stops automatically when the session expires.
   DEPOSIT_SESSION_TTL_MINUTES: z.string().default('30').transform(Number),
 
-  // ── Phase-2 upgrade: legacy per-user deposit monitoring ──
-  // New deposits use company pool sessions (services/deposit-session.ts).
-  // Personal wallets are NOT monitored for deposits when this is false.
-  // User wallets REMAIN in the DB and still custody legacy funds — they are
-  // only retired as deposit endpoints.
+  // ── Legacy per-user deposit monitoring ──
+  // Kept only as a documented transition switch. The legacy monitor
+  // (services/deposit-monitor.ts) is NOT started by bot/index.ts anymore.
+  // User wallets REMAIN in the DB — they are simply retired as deposit
+  // endpoints; deposits use company pool sessions.
   ENABLE_LEGACY_DEPOSIT_MONITOR: z.string().default('false').transform((s) => s === 'true'),
+
+  // ── Treasury health alerts ──
+  // When 'true', reads the payout-wallet BNB and treasury USDT on-chain
+  // every 5 min and alerts admins on low balances / queue backlog.
+  // OFF by default — operation does not require recurring RPC.
+  ENABLE_TREASURY_MONITOR: z.string().default('false').transform((s) => s === 'true'),
 
   PRICE_API_URL: z.string().default('https://api.coingecko.com/api/v3'),
   NGN_RATE_API_URL: z.string().default('https://api.exchangerate-api.com/v4/latest/USD'),
