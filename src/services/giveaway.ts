@@ -157,35 +157,19 @@ class GiveawayService {
     // Lazy wallet: creators need a real custodial wallet (funds + gas live there)
     await walletService.createWallet(data.creatorId);
 
-    // ── BALANCE GATE (UPGRADE §23/§37) ──
-    // The INTERNAL ledger balance is the PRIMARY spendable source: deposit
-    // sessions and rewards credit it directly. Only when it cannot cover
-    // the full cost do we fall back to the legacy custodial on-chain check.
+    // ── BALANCE GATE (spec §23/§37) ──
+    // The DB ledger is the ONLY spendable source: deposit sessions and
+    // rewards credit it; giveaways spend from it. Every mutation is
+    // ledger-recorded. No on-chain fallback — no per-user chain reads.
     const preBalanceRow = await prisma.balance.findUnique({
       where: { userId_asset: { userId: data.creatorId, asset: data.asset } },
     });
     const internalAvailable = Number(preBalanceRow?.availableBalance ?? 0);
-    const internalCovers = internalAvailable >= preTotalCost;
-
-    if (!internalCovers) {
-      // Legacy path: the full cost must be covered by on-chain custody.
-      const creatorWallet = await prisma.wallet.findUnique({ where: { userId: data.creatorId } });
-      if (creatorWallet) {
-        const raw = await blockchain.getBalance(creatorWallet.address, data.asset);
-        const onChain = Number(raw) / 1e18;
-        const pendingFees = await prisma.platformFee.aggregate({
-          where: { sweptAt: null, asset: data.asset, transaction: { userId: data.creatorId } },
-          _sum: { amount: true },
-        });
-        const realAvailable = onChain - Number(preBalanceRow?.lockedBalance ?? 0) - Number(pendingFees._sum.amount ?? 0);
-        if (realAvailable < preTotalCost) {
-          throw new Error(
-            `Insufficient ${data.asset} — you have ${internalAvailable.toFixed(6)} in your VEYLO balance ` +
-            `(${realAvailable.toFixed(6)} on-chain) and need ${preTotalCost.toFixed(6)} including fees. ` +
-            `Deposit more ${data.asset} first.`
-          );
-        }
-      }
+    if (internalAvailable < preTotalCost) {
+      throw new Error(
+        `Insufficient ${data.asset} — you have ${internalAvailable.toFixed(6)} in your VEYLO balance ` +
+        `and need ${preTotalCost.toFixed(6)} including fees. Deposit more ${data.asset} first.`
+      );
     }
 
     // ── SEED GAS FIRST ──────────────────────────────────────────────────
@@ -300,9 +284,10 @@ class GiveawayService {
 
       return g;
     });
-            // NOTE: creator cashback NO LONGER settles here — it settles at
-    // COMPLETION (workers/payout.maybeCompleteGiveaway), when every slot is
-    // paid out. Cancelled/expired giveaways pay no cashback.
+
+    // NOTE: creator cashback settles at COMPLETION (workers/payout.
+    // maybeCompleteGiveaway), when every slot is paid out — not here.
+    // Cancelled/expired giveaways pay no cashback.
 
     if (config.PAYOUT_ORIGIN === 'platform') {
       // Platform mode: the creator's payment is INTERNAL — their balance was
@@ -325,9 +310,8 @@ class GiveawayService {
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser };
-  }
-
-  /**
+      }
+            /**
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
