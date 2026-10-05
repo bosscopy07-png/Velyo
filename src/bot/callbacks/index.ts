@@ -3,7 +3,6 @@ import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
-import { blockchain } from '../../services/blockchain';
 import { redis, setUserSession } from '../../services/redis';
 import { config } from '../../config';
 import { e, eb } from '../../utils/emoji';
@@ -93,32 +92,17 @@ export function registerCallbacks(bot: any): void {
 
     if (!user?.wallet) return;
 
-    // LIVE on-chain balances minus everything that's reserved:
-    //   locked          → giveaway escrow (DB is authoritative)
-    //   unswept fees    → platform's USDT, still in the wallet
-    //   gas floats      → seeded BNB, reclaimed by admin later
-    // The DB is only a fallback if the chain read fails.
+    // UPGRADE (spec §37): the DB ledger is the SINGLE source of truth —
+    // deposits and rewards credit it, giveaways spend from it, every change
+    // is ledger-recorded. No on-chain balance reads for user balances.
     const reserve = await getPlatformReserve(user.id, user.wallet.address);
 
-    // UPGRADE (spec §23/§37): the INTERNAL ledger balance is the source of
-    // truth for spending — deposits and rewards credit it directly, and
-    // giveaways spend from it. On-chain is only a fallback display when the
-    // DB row is missing (legacy custodial users).
     const balances = await Promise.all(
       (['BNB', 'USDT'] as const).map(async (asset) => {
         const db = user!.balances.find((b) => b.asset === asset);
         const locked = Number(db?.lockedBalance ?? 0);
         const platformReserve = reserve[asset] ?? 0;
-
-        let available = Number(db?.availableBalance ?? 0);
-        if (!db) {
-          try {
-            const raw = await blockchain.getBalance(user!.wallet!.address, asset);
-            available = Number(raw) / 1e18;
-          } catch (err) {
-            logger.warn(`Live balance failed for ${asset}: ${(err as Error).message}`);
-          }
-        }
+        const available = Number(db?.availableBalance ?? 0);
 
         return {
           asset,
@@ -390,8 +374,7 @@ export function registerCallbacks(bot: any): void {
       await renderMyGiveaways(ctx, user.id);
     }
   }));
-
-  // === GIVEAWAY STATISTICS ===
+    // === GIVEAWAY STATISTICS ===
   bot.action(/giveaway:stats:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -424,7 +407,8 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
     await renderHistory(ctx);
   }));
-    // === ACCOUNT ===
+
+  // === ACCOUNT ===
   bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
@@ -490,7 +474,7 @@ export function registerCallbacks(bot: any): void {
       `• A ${config.PLATFORM_FEE_PERCENT}% platform fee + network gas applies at creation.\n` +
       `• Funds are locked until claimed or cancelled.\n\n` +
       `<b>Support</b>\n` +
-      `For assistance, contact @VeyloSupport`,
+      `For assistance, join https`,
       backKeyboard('main')
     );
   }));
@@ -552,4 +536,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-}
+                              }
+        
