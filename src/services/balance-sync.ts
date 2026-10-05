@@ -1,118 +1,364 @@
+import { Prisma } from '@prisma/client';
+import cron from 'node-cron';
+
 import { prisma } from '../database';
 import { redis } from './redis';
 import { logger } from '../utils/logger';
-import cron from 'node-cron';
 
 /**
- * DB-INTEGRITY WATCHDOG ONLY (spec §37). The DB ledger is the single
- * source of truth; this detects impossible internal states and writes
- * audit rows. It NEVER mutates balances. Alerts are debounced to one log
- * line + one audit row per user:asset per 24h — known legacy leftovers
- * must not spam the console every 5 minutes.
+ * BALANCE INTEGRITY WATCHDOG
+ *
+ * Purpose:
+ * - Detect impossible balance states.
+ * - Detect giveaway escrow/locked-balance mismatches.
+ * - Use Prisma Decimal for ALL financial arithmetic.
+ * - Debounce repeated alerts.
+ * - Write audit records for detected inconsistencies.
+ *
+ * IMPORTANT:
+ * This service NEVER mutates balances.
+ *
+ * The database ledger remains the single source of truth.
  */
 
 const CRON_SCHEDULE = '30 */5 * * * *';
-const TOLERANCE = 0.000001;
-const ALERT_DEBOUNCE_SEC = 24 * 3600;
+
+const DECIMAL_ZERO = new Prisma.Decimal(0);
+const TOLERANCE = new Prisma.Decimal('0.000000000000000001');
+
+const ALERT_DEBOUNCE_SEC = 24 * 60 * 60;
+
+const ACTIVE_GIVEAWAY_STATUSES = [
+  'ACTIVE',
+  'FULL',
+] as const;
 
 class BalanceSyncService {
   private isRunning = false;
 
+  /**
+   * Start the watchdog.
+   *
+   * Runs every 5 minutes at second 30.
+   */
   start(): void {
-    cron.schedule(CRON_SCHEDULE, () => void this.checkIntegrity());
-    logger.info('Balance integrity monitor started (DB-only, debounced)');
+    cron.schedule(CRON_SCHEDULE, () => {
+      void this.checkIntegrity();
+    });
+
+    logger.info(
+      '[BALANCE INTEGRITY] watchdog started — DB-only, Decimal-safe, debounced'
+    );
   }
 
+  /**
+   * Prevent overlapping watchdog runs.
+   */
   private async checkIntegrity(): Promise<void> {
-    if (this.isRunning) return;
+    if (this.isRunning) {
+      logger.debug?.(
+        '[BALANCE INTEGRITY] previous check still running; skipping'
+      );
+
+      return;
+    }
+
     this.isRunning = true;
+
     try {
       await this.checkNegativeBalances();
-      await this.checkEscrowVsLocked();
+      await this.checkGiveawayEscrow();
     } catch (err) {
-      logger.error('Balance integrity run failed:', err);
+      logger.error(
+        '[BALANCE INTEGRITY] watchdog run failed:',
+        err
+      );
     } finally {
       this.isRunning = false;
     }
   }
 
-  /** True only for the FIRST check inside the debounce window. */
+  /**
+   * Returns true only when this is the first alert for the
+   * specified key during the debounce window.
+   *
+   * Redis failure intentionally fails OPEN:
+   * we still want the integrity alert delivered.
+   */
   private async freshAlert(key: string): Promise<boolean> {
     try {
-      const ok = await redis.set(`balint:${key}`, '1', 'EX', ALERT_DEBOUNCE_SEC, 'NX');
-      return ok === 'OK';
-    } catch {
-      return true; // redis down → deliver anyway
+      const result = await redis.set(
+        `balint:${key}`,
+        '1',
+        'EX',
+        ALERT_DEBOUNCE_SEC,
+        'NX'
+      );
+
+      return result === 'OK';
+    } catch (err) {
+      logger.warn(
+        '[BALANCE INTEGRITY] Redis debounce unavailable; delivering alert',
+        err
+      );
+
+      return true;
     }
   }
 
+  /**
+   * Detect negative available / locked / pending balances.
+   *
+   * Financial balances should never be negative.
+   */
   private async checkNegativeBalances(): Promise<void> {
     const rows = await prisma.balance.findMany({
       where: {
-        OR: [{ availableBalance: { lt: 0 } }, { lockedBalance: { lt: 0 } }, { pendingBalance: { lt: 0 } }],
+        OR: [
+          {
+            availableBalance: {
+              lt: DECIMAL_ZERO,
+            },
+          },
+          {
+            lockedBalance: {
+              lt: DECIMAL_ZERO,
+            },
+          },
+          {
+            pendingBalance: {
+              lt: DECIMAL_ZERO,
+            },
+          },
+        ],
       },
       take: 100,
+      orderBy: {
+        updatedAt: 'asc',
+      },
     });
 
-    for (const r of rows) {
-      const key = `${r.userId}:${r.asset}`;
-      if (!(await this.freshAlert(`neg:${key}`))) continue; // debounced — stay silent
+    if (rows.length === 0) {
+      return;
+    }
+
+    for (const balance of rows) {
+      const key = `${balance.userId}:${balance.asset}`;
+
+      if (!(await this.freshAlert(`negative:${key}`))) {
+        continue;
+      }
+
       logger.warn(
-        `[BALANCE INTEGRITY] negative balance user=${r.userId} asset=${r.asset} ` +
-        `available=${r.availableBalance} locked=${r.lockedBalance} pending=${r.pendingBalance}`
+        `[BALANCE INTEGRITY] NEGATIVE BALANCE ` +
+        `user=${balance.userId} ` +
+        `asset=${balance.asset} ` +
+        `available=${balance.availableBalance.toString()} ` +
+        `locked=${balance.lockedBalance.toString()} ` +
+        `pending=${balance.pendingBalance.toString()}`
       );
-      await prisma.auditLog.create({
-        data: {
-          userId: r.userId,
-          action: 'BALANCE_NEGATIVE',
-          entityType: 'Balance',
-          entityId: key,
-          newValue: {
-            available: r.availableBalance.toString(),
-            locked: r.lockedBalance.toString(),
-            pending: r.pendingBalance.toString(),
+
+      try {
+        await prisma.auditLog.create({
+          data: {
+            userId: balance.userId,
+            action: 'BALANCE_NEGATIVE',
+            entityType: 'Balance',
+            entityId: key,
+            newValue: {
+              available: balance.availableBalance.toString(),
+              locked: balance.lockedBalance.toString(),
+              pending: balance.pendingBalance.toString(),
+            },
           },
-        },
-      });
+        });
+      } catch (err) {
+        logger.error(
+          `[BALANCE INTEGRITY] failed to create negative-balance audit ` +
+          `user=${balance.userId} asset=${balance.asset}`,
+          err
+        );
+      }
     }
   }
 
-  private async checkEscrowVsLocked(): Promise<void> {
+  /**
+   * Calculate the amount that should remain locked for every
+   * creator + asset based on active giveaways.
+   *
+   * IMPORTANT:
+   *
+   * We intentionally use Prisma.Decimal everywhere.
+   *
+   * No Number().
+   * No floating-point multiplication.
+   * No Math.max().
+   */
+  private async calculateExpectedEscrow(): Promise<
+    Map<
+      string,
+      {
+        creatorId: string;
+        asset: string;
+        expected: Prisma.Decimal;
+      }
+    >
+  > {
     const giveaways = await prisma.giveaway.findMany({
-      where: { status: { in: ['ACTIVE', 'FULL'] } },
-      include: { claims: true },
+      where: {
+        status: {
+          in: [...ACTIVE_GIVEAWAY_STATUSES],
+        },
+      },
+      include: {
+        claims: {
+          select: {
+            status: true,
+          },
+        },
+      },
     });
 
-    const escrow = new Map<string, number>();
-    for (const g of giveaways) {
-      const paidOut = g.claims.filter((c) => c.status === 'PAID').length * Number(g.amountPerUser);
-      const outstanding = Math.max(0, Number(g.totalAmount) - paidOut);
-      const key = `${g.creatorId}:${g.asset}`;
-      escrow.set(key, (escrow.get(key) ?? 0) + outstanding);
+    const escrow = new Map<
+      string,
+      {
+        creatorId: string;
+        asset: string;
+        expected: Prisma.Decimal;
+      }
+    >();
+
+    for (const giveaway of giveaways) {
+      const paidClaims = giveaway.claims.filter(
+        (claim) => claim.status === 'PAID'
+      ).length;
+
+      /**
+       * totalAmount
+       *
+       * minus:
+       *
+       * amountPerUser * number of PAID claims
+       */
+      const paidOut = giveaway.amountPerUser.mul(paidClaims);
+
+      let outstanding = giveaway.totalAmount.sub(paidOut);
+
+      /**
+       * Never allow the expected escrow calculation to become
+       * negative due to an inconsistent giveaway record.
+       */
+      if (outstanding.lessThan(DECIMAL_ZERO)) {
+        outstanding = DECIMAL_ZERO;
+      }
+
+      if (outstanding.lessThanOrEqualTo(TOLERANCE)) {
+        continue;
+      }
+
+      const key = `${giveaway.creatorId}:${giveaway.asset}`;
+
+      const existing = escrow.get(key);
+
+      if (existing) {
+        existing.expected = existing.expected.add(outstanding);
+      } else {
+        escrow.set(key, {
+          creatorId: giveaway.creatorId,
+          asset: giveaway.asset,
+          expected: outstanding,
+        });
+      }
     }
 
-    for (const [key, expected] of escrow) {
-      if (expected <= TOLERANCE) continue;
-      const [userId, asset] = key.split(':');
-      const bal = await prisma.balance.findUnique({
-        where: { userId_asset: { userId, asset } },
+    return escrow;
+  }
+
+  /**
+   * Compare expected giveaway escrow against Balance.lockedBalance.
+   *
+   * This method NEVER changes Balance.
+   */
+  private async checkGiveawayEscrow(): Promise<void> {
+    const escrow = await this.calculateExpectedEscrow();
+
+    if (escrow.size === 0) {
+      return;
+    }
+
+    for (const entry of escrow.values()) {
+      const {
+        creatorId,
+        asset,
+        expected,
+      } = entry;
+
+      const balance = await prisma.balance.findUnique({
+        where: {
+          userId_asset: {
+            userId: creatorId,
+            asset,
+          },
+        },
+        select: {
+          userId: true,
+          asset: true,
+          lockedBalance: true,
+        },
       });
-      const locked = Number(bal?.lockedBalance ?? 0);
-      if (Math.abs(locked - expected) > TOLERANCE) {
-        if (!(await this.freshAlert(`mismatch:${key}`))) continue; // debounced — stay silent
-        logger.warn(
-          `[BALANCE INTEGRITY] locked mismatch user=${userId} asset=${asset} locked=${locked} expectedEscrow=${expected}`
-        );
+
+      const actualLocked =
+        balance?.lockedBalance ?? DECIMAL_ZERO;
+
+      const difference = actualLocked.sub(expected).abs();
+
+      if (difference.lessThanOrEqualTo(TOLERANCE)) {
+        continue;
+      }
+
+      const key = `${creatorId}:${asset}`;
+
+      /**
+       * Only alert once per 24 hours for the same
+       * user + asset mismatch.
+       */
+      if (!(await this.freshAlert(`mismatch:${key}`))) {
+        continue;
+      }
+
+      logger.warn(
+        `[BALANCE INTEGRITY] ESCROW / LOCKED MISMATCH ` +
+        `user=${creatorId} ` +
+        `asset=${asset} ` +
+        `locked=${actualLocked.toString()} ` +
+        `expectedEscrow=${expected.toString()} ` +
+        `difference=${difference.toString()}`
+      );
+
+      try {
         await prisma.auditLog.create({
           data: {
-            userId,
+            userId: creatorId,
             action: 'ESCROW_LOCKED_MISMATCH',
             entityType: 'Balance',
             entityId: key,
-            oldValue: { locked },
-            newValue: { expectedEscrow: expected },
+
+            oldValue: {
+              locked: actualLocked.toString(),
+            },
+
+            newValue: {
+              expectedEscrow: expected.toString(),
+              difference: difference.toString(),
+            },
           },
         });
+      } catch (err) {
+        logger.error(
+          `[BALANCE INTEGRITY] failed to create escrow mismatch audit ` +
+          `user=${creatorId} asset=${asset}`,
+          err
+        );
       }
     }
   }
