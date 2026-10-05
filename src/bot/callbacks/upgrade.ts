@@ -22,9 +22,17 @@ import { assertUserOperational } from '../../services/maintenance';
  * NOTE on callback_data: Telegram caps it at 64 bytes. Giveaway-scoped
  * block/unblock therefore uses the CLAIM id / ClaimBlock row id (resolved
  * server-side), never giveawayId+userId pairs.
+ *
+ * NOTE on message length: these views are rendered as photo captions, which
+ * Telegram caps at 1,024 chars (vs 4,096 for text). All list views are
+ * paginated to stay well under that, and inline keyboards stay under the
+ * 100-button cap.
  */
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
+
+/** Claimants per page — sized so a full page fits the 1,024-char caption. */
+const CLAIMANTS_PER_PAGE = 5;
 
 const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
   try {
@@ -169,10 +177,23 @@ export function registerUpgradeCallbacks(bot: any): void {
     await ctx.answerCbQuery('Deposit session cancelled.');
     await editMainMessage(ctx, `${e('check')} Deposit session cancelled.`, backKeyboard('account:deposits'));
   }));
-        // ══════════════════════ CREATOR: CLAIMANTS (per giveaway) ══════════════════════
-  bot.action(/giveaway:claimants:(.+)/, guard(async (ctx: Context) => {
+
+  // No-op for non-navigable buttons (e.g. the "3/7" page indicator).
+  bot.action('giveaway:noop', async (ctx: Context) => {
     await ctx.answerCbQuery();
-    const giveawayId = (ctx as any).match[1];
+  });
+
+  // ══════════════════════ CREATOR: CLAIMANTS (per giveaway, PAGINATED) ══════════════════════
+  // Paginated because photo captions cap at 1,024 chars — with ~250 chars
+  // per claimant a full list of 18+ blows the limit (and approaches the
+  // 100-button keyboard cap). Page size keeps a full page well under both.
+  //
+  // The optional :page segment is matched non-greedily so the giveaway id
+  // (a UUID, never contains ':') is never swallowed into it.
+  bot.action(/giveaway:claimants:(.+?)(?::(\d+))?$/, guard(async (ctx: Context) => {
+    await ctx.answerCbQuery();
+    const giveawayId = (ctx as any).match[1] as string;
+    const requestedPage = Math.max(1, parseInt((ctx as any).match[2] ?? '1', 10));
     const user = await currentUser(ctx);
     if (!user) return;
 
@@ -190,60 +211,64 @@ export function registerUpgradeCallbacks(bot: any): void {
       return;
     }
 
-    const claimantIds = giveaway.claims.map((c) => c.userId);
-    const [flags, claimStats, attributions] = await Promise.all([
-      claimRiskService.listOpenFlags(giveawayId),
-      claimantIds.length
-        ? prisma.giveawayClaim.groupBy({
-            by: ['userId'], where: { userId: { in: claimantIds } }, _count: { id: true }, _max: { claimedAt: true },
-          })
-        : Promise.resolve([] as any[]),
-      claimantIds.length
-        ? prisma.giveawayAttribution.findMany({
-            where: { claimantId: { in: claimantIds } }, orderBy: { createdAt: 'asc' },
-            include: { creator: { select: { username: true, telegramId: true } } },
-          })
-        : Promise.resolve([] as any[]),
-    ]);
+    const flags = await claimRiskService.listOpenFlags(giveawayId);
     const flagMap = new Map<string, string[]>();
     for (const f of flags) flagMap.set(f.claimId, [...(flagMap.get(f.claimId) ?? []), f.signal]);
-    const statMap = new Map(claimStats.map((s: any) => [s.userId, s]));
-    const referrerMap = new Map(attributions.map((a) => [a.claimantId, a.creator]));
+
+    const totalPages = Math.max(1, Math.ceil(giveaway.claims.length / CLAIMANTS_PER_PAGE));
+    const page = Math.min(requestedPage, totalPages);
+    const slice = giveaway.claims.slice((page - 1) * CLAIMANTS_PER_PAGE, page * CLAIMANTS_PER_PAGE);
 
     const lines = [
-      `${e('people')} <b>CLAIMANTS</b>`, DIVIDER,
+      `${e('people')} <b>CLAIMANTS</b> (${page}/${totalPages})`, DIVIDER,
       `🎁 ${giveaway.totalAmount} ${giveaway.asset} · ${giveaway.claimedCount}/${giveaway.maxClaimers} claimed`, '',
     ];
     const rows: any[] = [];
-    if (giveaway.claims.length === 0) lines.push('No claimants yet.');
 
-    for (const c of giveaway.claims) {
+    if (slice.length === 0) {
+      lines.push('No claimants yet.');
+    }
+
+    // Compact rows: one summary line (+ optional tx hash) per claimant.
+    // Total-claims stats, referrer info and full history live in Details —
+    // fetching them for every claimant on every page was what blew the cap.
+    for (const c of slice) {
       const name = [c.user.firstName, c.user.lastName].filter(Boolean).join(' ') || c.user.username || 'User';
       const handle = c.user.username ? `@${c.user.username}` : `ID ${c.user.telegramId}`;
       const statusIcon = c.status === 'PAID' ? '✅' : c.status === 'FAILED' ? '❌' : '⏳';
-      const stat = statMap.get(c.userId);
-      const totalClaims = stat?._count?.id ?? 1;
-      const lastClaim = stat?._max?.claimedAt ? new Date(stat._max.claimedAt).toLocaleDateString() : '—';
-      const referrer = referrerMap.get(c.userId);
       const flagIcon = flagMap.has(c.id) ? ` ⚠️ <i>${flagMap.get(c.id)!.join(', ')}</i>` : '';
 
       lines.push(
         `${statusIcon} <b>${name}</b> (${handle})`,
-        `   TG ID <code>${c.user.telegramId}</code> · ${c.status} · ${c.claimedAt.toLocaleString()}` +
-          (c.payoutTransactionHash ? `\n   Tx <code>${c.payoutTransactionHash.slice(0, 16)}…</code>` : ''),
-        `   Claims on VEYLO: <b>${totalClaims}</b> · last: ${lastClaim}` +
-          (referrer ? ` · referred by ${referrer.username ? '@' + referrer.username : `ID ${referrer.telegramId}`}` : '') +
+        `   ${c.status} · ${c.claimedAt.toLocaleString()}` +
+          (c.payoutTransactionHash ? ` · Tx <code>${c.payoutTransactionHash.slice(0, 16)}…</code>` : '') +
           flagIcon
       );
 
+      // Three buttons per claimant: one row, well under the 100-button cap.
       rows.push([
         Markup.button.callback(`🚫 Block (this giveaway)`, `giveaway:blockg:${c.id}`),
         Markup.button.callback(`🚫 Block (all mine)`, `giveaway:blockc:${c.userId}`),
+        Markup.button.callback(`👤 Details`, `giveaway:audience:user:${c.userId}`),
       ]);
-      rows.push([Markup.button.callback(`👤 Details`, `giveaway:audience:user:${c.userId}`)]);
     }
 
-    if (flags.length > 0) lines.push('', `⚠️ <b>${flags.length}</b> claim(s) flagged — review the ⚠️ lines above.`);
+    if (flags.length > 0) {
+      lines.push('', `⚠️ <b>${flags.length}</b> claim(s) flagged — see ⚠️ lines above.`);
+    }
+
+    // Page navigation (only when there's more than one page)
+    if (totalPages > 1) {
+      const nav: any[] = [];
+      if (page > 1) {
+        nav.push(Markup.button.callback(`◀️ ${page - 1}`, `giveaway:claimants:${giveawayId}:${page - 1}`));
+      }
+      nav.push(Markup.button.callback(`${page}/${totalPages}`, 'giveaway:noop'));
+      if (page < totalPages) {
+        nav.push(Markup.button.callback(`${page + 1} ▶️`, `giveaway:claimants:${giveawayId}:${page + 1}`));
+      }
+      rows.push(nav);
+    }
 
     rows.push([
       Markup.button.callback(`${eb('people')} My Audience`, 'giveaway:audience'),
@@ -341,7 +366,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       attributionService.getReferrerOf(targetUserId),
       attributionService.isBlocked({ creatorId: user.id, giveawayId: ids[0] ?? '', userId: targetUserId }),
     ]);
-               if (!target || claims.length === 0) {
+    if (!target || claims.length === 0) {
       await editMainMessage(ctx, `${e('warning')} User not found in your audience.`, backKeyboard('giveaway:audience'));
       return;
     }
@@ -397,7 +422,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       'Users with POSSIBLE_DUPLICATE signals across your giveaways.', '',
       flags.length === 0 ? 'No flagged users. 🎉' : '',
     ];
-    const rows: any[] = [];
+        const rows: any[] = [];
     for (const f of flags) {
       const u = f.claim.user;
       const name = u.firstName || u.username || 'Name';
