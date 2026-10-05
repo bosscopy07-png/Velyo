@@ -106,9 +106,9 @@ if (config.ENABLE_TREASURY_MONITOR) {
   logger.info('Treasury monitor DISABLED (enable with ENABLE_TREASURY_MONITOR=true)');
 }
 
-// ── Deposit credited notifier: AUTO-EDIT with premium emoji, never a new
-//    message. Skipped when the user is mid-flow so a giveaway-creation
-//    prompt is never clobbered. ──
+// ── Deposit credited notifier: AUTO-EDIT with premium emoji in the CAPTION
+//    (custom emojis only render in message text, never in button labels).
+//    Skipped when the user is mid-flow so another screen is never clobbered. ──
 depositSessionService.setNotifier(({ userId, amount, asset }) => {
   void (async () => {
     try {
@@ -121,8 +121,9 @@ depositSessionService.setNotifier(({ userId, amount, asset }) => {
         `${e('check')} <b>DEPOSIT CREDITED</b>\n\n` +
         `Your deposit of <b>${amount} ${asset}</b> was detected and added to your VEYLO balance automatically.\n\n` +
         `No action needed.`;
+      // Buttons must use plain Unicode — Telegram ignores custom emoji here.
       const reply_markup = {
-        inline_keyboard: [[{ text: `${e('wallet')} Open Wallet`, callback_data: 'wallet' }]],
+        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
       };
       const chatId = u.chatId;
       const msgId = parseInt(u.mainMessageId, 10);
@@ -153,7 +154,7 @@ setPayoutNotifier(({ userId, amount, asset, hash }) => {
         `Your giveaway reward of <b>${amount} ${asset}</b> has been sent on-chain.\n\n` +
         `Tx: <code>${hash}</code>`;
       const reply_markup = {
-        inline_keyboard: [[{ text: `${e('wallet')} Open Wallet`, callback_data: 'wallet' }]],
+        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
       };
       const chatId = u.chatId;
       const msgId = parseInt(u.mainMessageId, 10);
@@ -192,4 +193,4 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
-      
+        
