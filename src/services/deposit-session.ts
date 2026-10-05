@@ -376,9 +376,8 @@ class DepositSessionService {
     );
 
     return { status: 'credited', amount: session.requestedAmount };
-  }
-
-  /**
+    }
+          /**
    * Forwards the received funds (minus a gas reserve for future forwards)
    * from the company deposit address to the platform treasury. Never sends
    * the full balance — the reserve stays behind as gas (spec §21).
@@ -389,6 +388,37 @@ class DepositSessionService {
       include: { assignedWallet: true },
     });
     if (!session || session.forwardedAt || session.status !== 'CREDITED' || !session.txHash) return;
+
+    // ── Circuit breaker: a wallet whose key won't decrypt can never
+    // forward — disable it once and stop retrying, instead of spamming the
+    // console every minute. The funds stay in the company address until an
+    // admin re-adds the correct key (Admin → Treasury → Deposit Pool). ──
+    let signerKey: string;
+    try {
+      signerKey = decrypt(session.assignedWallet.encryptedPrivateKey);
+    } catch (err) {
+      await prisma.companyDepositWallet.update({
+        where: { id: session.assignedWalletId },
+        data: { status: 'DISABLED' },
+      });
+      await prisma.depositSession.updateMany({
+        where: { assignedWalletId: session.assignedWalletId, status: 'CREDITED', forwardedAt: null },
+        data: { forwardedAt: new Date() }, // stop retrying — funds remain in the address
+      });
+      await prisma.auditLog.create({
+        data: {
+          action: 'DEPOSIT_WALLET_KEY_INVALID',
+          entityType: 'company_deposit_wallet',
+          entityId: session.assignedWalletId,
+          newValue: { address: session.assignedWallet.address, error: (err as Error).message },
+        },
+      });
+      logger.error(
+        `Pool wallet ${session.assignedWallet.address} DISABLED: key undecryptable. ` +
+        `Re-add it via Admin → Treasury with the correct key to recover the stuck funds.`
+      );
+      return;
+    }
 
     const asset = session.asset as AssetSymbol;
     const assetConfig = ASSETS[asset];
@@ -405,7 +435,7 @@ class DepositSessionService {
     }
 
     const { hash } = await blockchain.sendTransaction(
-      decrypt(session.assignedWallet.encryptedPrivateKey),
+      signerKey,
       config.PLATFORM_FEE_WALLET,
       forwardable,
       asset,
@@ -433,7 +463,8 @@ class DepositSessionService {
    *     turns the light monitoring OFF (expired sessions leave the live set).
    *   - monitorSweep (every 60s): the LIGHT check over ONLY live sessions
    *     (zero RPC when none are live), plus a bounded forward-retry for
-   *     credited-but-unforwarded sessions (e.g. a pool key an admin fixed).
+   *     credited-but-unforwarded sessions. The circuit breaker in
+   *     forwardToTreasury ensures a bad key silences itself after one hit.
    */
   start(): void {
     cron.schedule('20 * * * * *', () => void this.expireSweep());
@@ -475,8 +506,10 @@ class DepositSessionService {
         }
       }
 
-            // Forward retry: credited but not yet forwarded (e.g. a bad pool key
-      // that an admin later fixed). Bounded — one attempt per tick.
+      // Forward retry: credited but not yet forwarded (e.g. a pool key an
+      // admin later fixed). Bounded — one attempt per tick. A bad key trips
+      // the circuit breaker on the first attempt and never reaches here
+      // again for that wallet.
       const unforwarded = await prisma.depositSession.findMany({
         where: { status: 'CREDITED', forwardedAt: null, txHash: { not: null } },
         select: { id: true },
@@ -486,7 +519,7 @@ class DepositSessionService {
         try {
           await this.forwardToTreasury(u.id);
         } catch (err) {
-          // Key still broken etc. — retries next tick after admin fixes it.
+          // Transient RPC error etc. — retries next tick.
           logger.warn(`Forward retry failed for ${u.id}: ${(err as Error).message}`);
         }
       }
@@ -511,4 +544,3 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-                                                    
