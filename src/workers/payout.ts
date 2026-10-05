@@ -8,8 +8,19 @@ import { logger } from '../utils/logger';
 // UPGRADE (spec §23): dedicated platform payout wallet (DB-configurable)
 import { getPayoutWallet } from '../services/treasury';
 
-const CONFIRMATIONS = 15;
+const CONFIRMATIONS = config.PAYOUT_CONFIRMATIONS;
 const CONFIRM_TIMEOUT_MS = 300_000;
+
+/**
+ * Wired by bot/index.ts: auto-EDITS the claimant's main message to
+ * "REWARD PAID" with the tx hash when the payout finalizes — no new
+ * message, no silent waiting at "QUEUED".
+ */
+type PayoutNotifier = (e: { userId: string; amount: number; asset: string; hash: string }) => void;
+let payoutNotifier: PayoutNotifier | null = null;
+export function setPayoutNotifier(fn: PayoutNotifier): void {
+  payoutNotifier = fn;
+}
 
 /** Claim states that are allowed to enter PROCESSING (terminal states excluded) */
 const PAYOUTABLE_STATUSES = ['QUEUED', 'RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'PROCESSING'] as const;
@@ -122,8 +133,13 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   const assetConfig = ASSETS[assetKey];
   const amountBigInt = BigInt(Math.floor(amount * 10 ** assetConfig.decimals));
 
-  // ── Preflight: verify on-chain funds BEFORE broadcasting ──
-  const onChainAsset = await blockchain.getBalance(signerAddress, assetKey);
+  // ── Preflight: funds + gas checked IN PARALLEL (was sequential RPC
+  // round-trips — each could add seconds or trigger a slow failover). ──
+  const [onChainAsset, bnbBalance, transferCost] = await Promise.all([
+    blockchain.getBalance(signerAddress, assetKey),
+    blockchain.getBalance(signerAddress, 'BNB'),
+    estimateBnbTransferCost(),
+  ]);
 
   if (onChainAsset < amountBigInt) {
     // NO unwind, NO refund, NO slot release — just stop.
@@ -142,8 +158,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   // we verify it holds enough BNB (transient if short; treasury monitor
   // alerts admins). Runs BEFORE the PROCESSING transition either way.
   if (payoutOrigin === 'platform') {
-    const needed = BigInt(Math.ceil((await estimateBnbTransferCost()) * 1e18));
-    const bnbBalance = await blockchain.getBalance(signerAddress, 'BNB');
+    const needed = BigInt(Math.ceil(transferCost * 1e18));
     if (bnbBalance < needed) {
       throw new Error(
         `Platform payout wallet ${signerAddress} is short on BNB gas ` +
@@ -151,7 +166,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
       );
     }
   } else {
-    await ensureGas(signerAddress, await estimateBnbTransferCost(), `payout-${claimId}`);
+    await ensureGas(signerAddress, transferCost, `payout-${claimId}`);
   }
 
   // ── Mark PROCESSING (guarded — only one worker wins per claim) ──
@@ -360,6 +375,9 @@ async function finalizePaid(
       data: { payoutTransactionId: payoutTx.id },
     });
   });
+
+  // Tell the claimant immediately (bot/index.ts auto-edits their message).
+  payoutNotifier?.({ userId, amount, asset: claim.giveaway.asset, hash });
 }
 
 worker.on('completed', (job) => {
@@ -374,5 +392,5 @@ worker.on('failed', (job, err) => {
   }
 });
 
-logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN})`);
-        
+logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN}, confs: ${CONFIRMATIONS})`);
+      
