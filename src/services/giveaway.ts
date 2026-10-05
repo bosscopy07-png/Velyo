@@ -1,3 +1,4 @@
+
 import { prisma } from '../database';
 import { assertUserOperational } from './maintenance';
 import { redis, acquireLock, releaseLock } from './redis';
@@ -136,7 +137,7 @@ class GiveawayService {
     totalAmount: number;
     maxClaimers: number;
     expiresAt?: Date;
-  }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number }> {
+  }): Promise<{ giveawayId: string; secureCode: string; amountPerUser: number; appliedCredit: number }> {
     // Maintenance gate — MUST stay first: before gas seeding, wallet creation
     // or any balance/ledger write. Throws a user-safe MaintenanceError.
     await assertUserOperational(data.creatorId);
@@ -185,12 +186,16 @@ class GiveawayService {
         ? null
         : await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
 
+    // Captured inside the transaction so the UI can disclose it (rewards
+    // credit auto-discounts the platform fee).
+    let appliedCredit = 0;
+
     const giveaway = await prisma.$transaction(async (tx) => {
       // ── REWARD CREDIT DISCOUNT (spec §4/§6) ──
       // Earned cashback/referral rewards (internal Reward ledger) are
       // consumed HERE, atomically with creation, as a credit against the
       // platform fee only — never the giveaway principal, never gas.
-      const appliedCredit = await rewardsService.consumeCredit(tx, data.creatorId, data.asset, cost.platformFee);
+      appliedCredit = await rewardsService.consumeCredit(tx, data.creatorId, data.asset, cost.platformFee);
       const platformFeeDue = Number((cost.platformFee - appliedCredit).toFixed(8));
       const fee = Number((platformFeeDue + cost.gasFee).toFixed(6));
       const totalCost = data.totalAmount + fee;
@@ -286,8 +291,8 @@ class GiveawayService {
     });
 
     // NOTE: creator cashback settles at COMPLETION (workers/payout.
-    // maybeCompleteGiveaway), when every slot is paid out — not here.
-    // Cancelled/expired giveaways pay no cashback.
+    // maybeCompleteGiveaway) — ONLY when EVERY claimant has been paid.
+    // Created-then-cancelled giveaways never reach COMPLETED → no cashback.
 
     if (config.PAYOUT_ORIGIN === 'platform') {
       // Platform mode: the creator's payment is INTERNAL — their balance was
@@ -308,10 +313,10 @@ class GiveawayService {
       await this.forwardCreationFee(giveaway.id, data.creatorId, data.asset, feeForward, seedHash);
     }
 
-    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee})`);
-    return { giveawayId: giveaway.id, secureCode, amountPerUser };
-      }
-            /**
+    logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee}, credit ${appliedCredit})`);
+    return { giveawayId: giveaway.id, secureCode, amountPerUser, appliedCredit };
+}
+    /**
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
@@ -478,8 +483,8 @@ class GiveawayService {
     } catch (err) {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
     }
-  }
-    async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+        }
+                                                                                      async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
       await assertUserOperational(userId);
