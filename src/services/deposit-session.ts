@@ -20,11 +20,11 @@ export { pickUniqueSuffix, computeExpectedAmount };
  * window, company pool address, expected amount = requested + unique 0.1
  * band component) → user sends funds → credit → funds forwarded to treasury.
  *
- * RPC PROFILE (UPGRADE):
+ * RPC PROFILE:
  *   - LIGHT: while a session is alive (AWAITING/DETECTED, not expired), a
  *     ~1/min background check watches ONLY that session's address. A few
  *     RPC calls per live session per minute — and it STOPS AUTOMATICALLY
- *     when the session expires (30 min) or credits. Nothing runs when no
+ *     when the session expires (30 min) or credits. Zero RPC when no
  *     session is live.
  *   - FULL: tapping "I HAVE DEPOSITED" performs an immediate full
  *     verification on demand (same detection path, no waiting).
@@ -54,6 +54,15 @@ export type VerifyResult =
   | { status: 'error'; reason: string };
 
 class DepositSessionService {
+  /**
+   * Wired by bot/index.ts: auto-EDITS the user's main message on credit —
+   * never sends a new message.
+   */
+  private notifier: ((e: { userId: string; amount: number; asset: string }) => void) | null = null;
+  setNotifier(fn: (e: { userId: string; amount: number; asset: string }) => void): void {
+    this.notifier = fn;
+  }
+
   /**
    * Creates a deposit session and assigns a company pool address
    * (least-recently-assigned ACTIVE wallet — deterministic, recorded).
@@ -357,6 +366,9 @@ class DepositSessionService {
 
     logger.info(`Deposit session ${session.id} credited: ${session.requestedAmount} ${session.asset} (tx ${txHash})`);
 
+    // Auto-edit the user's main message (bot/index.ts) — never a new message.
+    this.notifier?.({ userId: session.userId, amount: session.requestedAmount, asset: session.asset });
+
     // Forward to treasury fire-and-forget (spec §21) — the only other chain
     // call, and only ever after a successful credit.
     void this.forwardToTreasury(session.id).catch((err) =>
@@ -417,12 +429,11 @@ class DepositSessionService {
 
   /**
    * Background crons:
-   *   - expireSweep (DB-only, 2×/min): flips expired sessions. This is what
-   *     turns the light monitoring OFF — expired sessions leave the live
-   *     set, so the monitor has nothing to watch.
-   *   - monitorSweep (every 60s): the LIGHT check. It iterates ONLY live
-   *     sessions (AWAITING/DETECTED, not expired), so when no one is
-   *     depositing it makes zero RPC calls. Bounded batch per tick.
+   *   - expireSweep (DB-only, 2×/min): flips expired sessions — this is what
+   *     turns the light monitoring OFF (expired sessions leave the live set).
+   *   - monitorSweep (every 60s): the LIGHT check over ONLY live sessions
+   *     (zero RPC when none are live), plus a bounded forward-retry for
+   *     credited-but-unforwarded sessions (e.g. a pool key an admin fixed).
    */
   start(): void {
     cron.schedule('20 * * * * *', () => void this.expireSweep());
@@ -463,6 +474,22 @@ class DepositSessionService {
           logger.warn(`Light monitor failed for session ${s.id}: ${(err as Error).message}`);
         }
       }
+
+            // Forward retry: credited but not yet forwarded (e.g. a bad pool key
+      // that an admin later fixed). Bounded — one attempt per tick.
+      const unforwarded = await prisma.depositSession.findMany({
+        where: { status: 'CREDITED', forwardedAt: null, txHash: { not: null } },
+        select: { id: true },
+        take: 3,
+      });
+      for (const u of unforwarded) {
+        try {
+          await this.forwardToTreasury(u.id);
+        } catch (err) {
+          // Key still broken etc. — retries next tick after admin fixes it.
+          logger.warn(`Forward retry failed for ${u.id}: ${(err as Error).message}`);
+        }
+      }
     } catch (err) {
       logger.error(`Deposit monitor sweep error: ${(err as Error).message}`);
     }
@@ -484,4 +511,4 @@ class DepositSessionService {
 }
 
 export const depositSessionService = new DepositSessionService();
-    
+                                                    
