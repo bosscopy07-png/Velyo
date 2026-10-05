@@ -116,6 +116,12 @@ export function registerCallbacks(bot: any): void {
     await editMainMessage(ctx, caption, walletKeyboard);
   }
 
+  /**
+   * ACTIVITY HISTORY (UPGRADE UX): every entry says WHAT it was and WHERE
+   * it came from — cashback vs referral, deposit session vs giveaway,
+   * cancelled-giveaway refund vs returned gas, and reward-credit discounts.
+   * All icons are the premium custom emoji set (e()/eb()).
+   */
   async function renderHistory(ctx: Context): Promise<void> {
     const from = ctx.from!;
     const user = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
@@ -124,18 +130,56 @@ export function registerCallbacks(bot: any): void {
     const txs = await prisma.transaction.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: 'desc' },
-      take: 10,
+      take: 12,
     });
 
-    let text = `${e('document')} <b>RECENT ACTIVITY</b>\n\n`;
+    const TYPE_LABEL: Record<string, string> = {
+      DEPOSIT: `${e('deposit')} Deposit`,
+      WITHDRAWAL: `${e('money')} Withdrawal`,
+      GIVEAWAY_CREATED: `${e('gift')} Giveaway created`,
+      GIVEAWAY_REWARD: `${e('party')} Giveaway winnings`,
+      CODE_REDEMPTION: `${e('diamond')} Code redeemed`,
+      REFUND: `${e('refresh')} Refund`,
+      PAYOUT: `${e('money')} Payout`,
+      REWARD: `${e('star')} Reward earned`,
+      PLATFORM_FEE: `${e('card')} Platform fee`,
+    };
+    const INFLOW = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND', 'REWARD'];
+    const divider = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
+
+    let text = `${e('document')} <b>ACTIVITY HISTORY</b>\n${divider}\n\n`;
     if (txs.length === 0) text += 'No transactions yet.';
 
     for (const tx of txs) {
-      const sign = ['DEPOSIT', 'GIVEAWAY_REWARD', 'CODE_REDEMPTION', 'REFUND'].includes(tx.type) ? '+' : '-';
-      text += `${sign}${tx.amount} ${tx.asset} — ${tx.status}\n`;
+      const meta = (tx.metadata ?? {}) as Record<string, any>;
+      const base = TYPE_LABEL[tx.type] ?? tx.type;
+
+      // "From where" detail, per type — this is what makes each line self-explanatory.
+      let detail = '';
+      if (tx.type === 'REWARD') {
+        detail = meta.rewardType === 'GIVEAWAY_CASHBACK'
+          ? ' — giveaway cashback (your giveaway fully paid out)'
+          : ' — referral reward (someone you referred completed a giveaway)';
+      } else if (tx.type === 'DEPOSIT') {
+        detail = ' — deposit session (company address)';
+      } else if (tx.type === 'REFUND' && meta.kind === 'gas_refund') {
+        detail = ' — unused gas returned';
+      } else if (tx.type === 'REFUND') {
+        detail = ' — giveaway cancelled';
+      } else if (tx.type === 'GIVEAWAY_CREATED' && meta.feeBreakdown?.appliedRewardCredit > 0) {
+        detail = ` — rewards covered ${meta.feeBreakdown.appliedRewardCredit} of the fees`;
+      } else if (tx.type === 'PLATFORM_FEE' && meta.kind === 'creation_fee_1pct' && meta.appliedRewardCredit > 0) {
+        detail = ` — ${meta.appliedRewardCredit} paid with reward credit`;
+      } else if (tx.type === 'GIVEAWAY_REWARD' && tx.toAddress) {
+        detail = ` — sent to <code>${tx.toAddress.slice(0, 10)}…</code>`;
+      }
+
+      const sign = INFLOW.includes(tx.type) ? '+' : '-';
+      const when = tx.createdAt.toLocaleString();
+      text += `${base}${detail}\n   ${sign}${tx.amount} ${tx.asset} · ${tx.status} · ${when}\n\n`;
     }
 
-    await editMainMessage(ctx, text, backKeyboard('wallet'));
+    await editMainMessage(ctx, text.trimEnd(), backKeyboard('wallet'));
   }
 
   async function renderMyGiveaways(ctx: Context, userId: string): Promise<void> {
@@ -180,8 +224,8 @@ export function registerCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} Back`, 'giveaway')]);
 
     await editMainMessage(ctx, text, Markup.inlineKeyboard(rows));
-  }
-    const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
+        }
+        const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
     try {
       await fn(ctx);
     } catch (err) {
@@ -474,7 +518,7 @@ export function registerCallbacks(bot: any): void {
       `• A ${config.PLATFORM_FEE_PERCENT}% platform fee + network gas applies at creation.\n` +
       `• Funds are locked until claimed or cancelled.\n\n` +
       `<b>Support</b>\n` +
-      `For assistance, join https`,
+      `For assistance, contact @VeyloSupport`,
       backKeyboard('main')
     );
   }));
@@ -497,7 +541,7 @@ export function registerCallbacks(bot: any): void {
     }
 
     try {
-      const { giveawayId, secureCode } = await giveawayService.createGiveaway({
+      const { giveawayId, secureCode, appliedCredit } = await giveawayService.createGiveaway({
         creatorId: user.id,
         asset: asset as any,
         totalAmount: amount,
@@ -515,7 +559,10 @@ export function registerCallbacks(bot: any): void {
 
       await editMainMessage(
         ctx,
-        formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode),
+        formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode) +
+        (appliedCredit > 0
+          ? `\n✨ Your rewards covered <b>${appliedCredit.toFixed(6)} ${asset}</b> of the platform fee.`
+          : ''),
         Markup.inlineKeyboard([
           [Markup.button.url(`${eb('gift')} Share Giveaway`, shareUrl)],
           [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
@@ -536,5 +583,5 @@ export function registerCallbacks(bot: any): void {
     const link = `https://t.me/${BOT_USERNAME}?start=giveaway_${code}`;
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
-                              }
-        
+      }
+      
