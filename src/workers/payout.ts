@@ -76,6 +76,20 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
 
   if (!claim) throw new UnrecoverableError('Claim not found');
 
+  // ── Dead-giveaway guard ──
+  // A CANCELLED/EXPIRED/FAILED giveaway's escrow was already released to the
+  // creator via computeOutstandingEscrow (which counts these unpaid slots).
+  // Paying them would double-spend from the treasury — mark the claims dead
+  // and drain the queue instead.
+  if (['CANCELLED', 'EXPIRED', 'FAILED'].includes(claim.giveaway.status)) {
+    await prisma.giveawayClaim.updateMany({
+      where: { id: claimId, status: { not: 'PAID' } },
+      data: { status: 'FAILED', failedReason: `Giveaway ${claim.giveaway.status.toLowerCase()}` },
+    });
+    logger.info(`Claim ${claimId} closed: giveaway is ${claim.giveaway.status} — no payout, creator already refunded.`);
+    return { status: 'giveaway_closed' };
+  }
+
   if (claim.status === 'PAID') {
     logger.info(`Claim ${claimId} already PAID (tx ${claim.payoutTransactionHash})`);
     return { status: 'already_paid', hash: claim.payoutTransactionHash };
@@ -235,8 +249,7 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   connection: bullmqConnection,
   concurrency: config.QUEUE_CONCURRENCY,
 });
-
-// UPGRADE: cashback + referral settle at COMPLETION (not creation).
+                      // UPGRADE: cashback + referral settle at COMPLETION (not creation).
 // When EVERY slot is PAID: mark COMPLETED (guarded — one worker wins), then
 // credit exactly once each:
 //   - CREATOR CASHBACK: creatorCashbackPercent (default 1%) of totalAmount
@@ -328,7 +341,6 @@ async function maybeReclaimGas(giveawayId: string): Promise<void> {
     logger.error(`Post-payout gas reclaim check failed: ${(err as Error).message}`);
   }
 }
-
 /**
  * Finalize a confirmed payout: guarded PAID transition, release the creator's
  * locked slice, record the reward tx, and link it to the claim via the
@@ -393,4 +405,3 @@ worker.on('failed', (job, err) => {
 });
 
 logger.info(`Payout worker started (origin: ${config.PAYOUT_ORIGIN}, confs: ${CONFIRMATIONS})`);
-      
