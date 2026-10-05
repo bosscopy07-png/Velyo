@@ -18,6 +18,10 @@ import { assertUserOperational } from '../../services/maintenance';
  *
  * Security: every giveaway-scoped action re-verifies creator ownership
  * server-side — callback payload is never trusted (spec §36).
+ *
+ * NOTE on callback_data: Telegram caps it at 64 bytes. Giveaway-scoped
+ * block/unblock therefore uses the CLAIM id / ClaimBlock row id (resolved
+ * server-side), never giveawayId+userId pairs.
  */
 
 const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━━${e('sparkle')}`;
@@ -165,7 +169,7 @@ export function registerUpgradeCallbacks(bot: any): void {
     await ctx.answerCbQuery('Deposit session cancelled.');
     await editMainMessage(ctx, `${e('check')} Deposit session cancelled.`, backKeyboard('account:deposits'));
   }));
-                                            // ══════════════════════ CREATOR: CLAIMANTS (per giveaway) ══════════════════════
+        // ══════════════════════ CREATOR: CLAIMANTS (per giveaway) ══════════════════════
   bot.action(/giveaway:claimants:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const giveawayId = (ctx as any).match[1];
@@ -233,7 +237,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       );
 
       rows.push([
-        Markup.button.callback(`🚫 Block (this giveaway)`, `giveaway:blockg:${giveawayId}:${c.userId}`),
+        Markup.button.callback(`🚫 Block (this giveaway)`, `giveaway:blockg:${c.id}`),
         Markup.button.callback(`🚫 Block (all mine)`, `giveaway:blockc:${c.userId}`),
       ]);
       rows.push([Markup.button.callback(`👤 Details`, `giveaway:audience:user:${c.userId}`)]);
@@ -337,7 +341,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       attributionService.getReferrerOf(targetUserId),
       attributionService.isBlocked({ creatorId: user.id, giveawayId: ids[0] ?? '', userId: targetUserId }),
     ]);
-                                     if (!target || claims.length === 0) {
+               if (!target || claims.length === 0) {
       await editMainMessage(ctx, `${e('warning')} User not found in your audience.`, backKeyboard('giveaway:audience'));
       return;
     }
@@ -415,27 +419,57 @@ export function registerUpgradeCallbacks(bot: any): void {
   }));
 
   // ══════════════════════ BLOCK / UNBLOCK ══════════════════════
-  bot.action(/giveaway:blockg:(.+):(.+)/, guard(async (ctx: Context) => {
-    const [, giveawayId, blockedUserId] = (ctx as any).match;
+  // NOTE: takes the CLAIM id, not giveaway+user — Telegram callback_data
+  // is capped at 64 bytes, and giveaway UUID (36) + user id (25) exceeds it.
+  // The claim row carries both, verified server-side.
+  bot.action(/giveaway:blockg:(.+)/, guard(async (ctx: Context) => {
+    const claimId = (ctx as any).match[1];
     const user = await currentUser(ctx);
     if (!user) return;
-    const giveaway = await prisma.giveaway.findUnique({ where: { id: giveawayId }, select: { creatorId: true } });
-    if (!giveaway || giveaway.creatorId !== user.id) {
+    const claim = await prisma.giveawayClaim.findUnique({
+      where: { id: claimId },
+      include: { giveaway: { select: { creatorId: true } } },
+    });
+    if (!claim || claim.giveaway.creatorId !== user.id) {
       await ctx.answerCbQuery('Not authorized.', { show_alert: true });
       return;
     }
-    await attributionService.blockUser({ creatorId: user.id, blockedUserId, giveawayId });
+    await attributionService.blockUser({
+      creatorId: user.id,
+      blockedUserId: claim.userId,
+      giveawayId: claim.giveawayId,
+    });
     await ctx.answerCbQuery('User blocked from this giveaway.');
-    await editMainMessage(ctx, `${e('check')} User blocked from this giveaway.`, backKeyboard(`giveaway:claimants:${giveawayId}`));
+    await editMainMessage(
+      ctx,
+      `${e('check')} User blocked from this giveaway.`,
+      backKeyboard(`giveaway:claimants:${claim.giveawayId}`)
+    );
   }));
 
-  bot.action(/giveaway:unblockg:(.+):(.+)/, guard(async (ctx: Context) => {
-    const [, giveawayId, blockedUserId] = (ctx as any).match;
+  // Takes the ClaimBlock ROW id — same 64-byte reason as blockg above.
+  bot.action(/giveaway:unblockg:(.+)/, guard(async (ctx: Context) => {
+    const blockId = (ctx as any).match[1];
     const user = await currentUser(ctx);
     if (!user) return;
-    await attributionService.unblockUser({ creatorId: user.id, blockedUserId, giveawayId });
+    const block = await prisma.claimBlock.findUnique({ where: { id: blockId } });
+    if (!block || block.creatorId !== user.id) {
+      await ctx.answerCbQuery('Not authorized.', { show_alert: true });
+      return;
+    }
+    await attributionService.unblockUser({
+      creatorId: block.creatorId,
+      blockedUserId: block.blockedUserId,
+      giveawayId: block.giveawayId,
+    });
     await ctx.answerCbQuery('User unblocked.');
-    await editMainMessage(ctx, `${e('check')} User unblocked for this giveaway.`, backKeyboard(`giveaway:claimants:${giveawayId}`));
+    await editMainMessage(
+      ctx,
+      `${e('check')} User unblocked.`,
+      block.giveawayId
+        ? backKeyboard(`giveaway:claimants:${block.giveawayId}`)
+        : backKeyboard('giveaway:blocklist')
+    );
   }));
 
   bot.action(/giveaway:blockc:(.+)/, guard(async (ctx: Context) => {
@@ -478,7 +512,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       lines.push(`🚫 <b>${name}</b> — ${b.giveawayId ? 'one giveaway' : 'all my giveaways'}`);
       rows.push([
         b.giveawayId
-          ? Markup.button.callback(`✅ Unblock`, `giveaway:unblockg:${b.giveawayId}:${b.blockedUserId}`)
+          ? Markup.button.callback(`✅ Unblock`, `giveaway:unblockg:${b.id}`)
           : Markup.button.callback(`✅ Unblock`, `giveaway:unblockc:${b.blockedUserId}`),
       ]);
     }
@@ -486,4 +520,3 @@ export function registerUpgradeCallbacks(bot: any): void {
     await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
   }));
 }
-
