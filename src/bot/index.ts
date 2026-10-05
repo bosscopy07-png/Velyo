@@ -16,7 +16,9 @@ import { depositSessionService } from '../services/deposit-session';
 import { treasuryMonitor } from '../services/treasury';
 import { claimExpiry } from '../services/claim-expiry';
 import { balanceSync } from '../services/balance-sync';
-import '../workers/payout';
+import { prisma } from '../database';
+import { getUserSession } from '../services/redis';
+import { setPayoutNotifier } from '../workers/payout';
 import '../workers/cleanup';
 import express from 'express';
 import type { Server } from 'http';
@@ -78,12 +80,10 @@ async function startBot(): Promise<void> {
 startBot();
 
 // ───────────────────────── In-process background jobs ─────────────────────────
-// RPC POLICY (UPGRADE): the ONLY recurring chain contact is the deposit
-// session's LIGHT monitor — and only while a session is live (auto-off at
-// its 30-minute expiry). Everything else is DB-only or user/job-triggered.
+// RPC POLICY: the ONLY recurring chain contact is the deposit session's
+// LIGHT monitor — only while a session is live, auto-off at its 30-minute
+// expiry. Everything else is DB-only or user/job-triggered.
 
-// Deposit sessions: DB-only expiry sweeps + light monitoring of LIVE
-// sessions (1/min, bounded batch). Zero RPC when no session is active.
 depositSessionService.start();
 
 // Claim expiry: DB-only.
@@ -92,9 +92,7 @@ claimExpiry.start();
 // Balance integrity: DB-only watchdog (audit rows, no mutation, debounced).
 balanceSync.start();
 
-// Treasury health alerts: recurring RPC (payout-wallet gas + treasury USDT
-// every 5 min). OFF by default — enable with ENABLE_TREASURY_MONITOR=true
-// if you want low-balance alerts; monitoring is not required for operation.
+// Treasury health alerts: recurring RPC every 5 min. OFF by default.
 if (config.ENABLE_TREASURY_MONITOR) {
   treasuryMonitor.start((message) => {
     for (const adminId of config.ADMIN_TELEGRAM_IDS) {
@@ -104,14 +102,72 @@ if (config.ENABLE_TREASURY_MONITOR) {
     }
   });
 } else {
-  logger.info('Treasury monitor DISABLED — no recurring RPC (enable with ENABLE_TREASURY_MONITOR=true if wanted)');
+  logger.info('Treasury monitor DISABLED (enable with ENABLE_TREASURY_MONITOR=true)');
 }
 
-// NOTE: the legacy per-user depositMonitor is NOT started here at all.
-// services/deposit-monitor.ts and workers/deposit.ts are dead code kept
-// only for history — the DepositMonitor table remains in the DB for audit.
-// (If you kept the ENABLE_LEGACY_DEPOSIT_MONITOR gate instead, ensure it is
-//  false; deleting the import + gate entirely is the recommended final state.)
+// ── Deposit credited notifier: AUTO-EDIT, never a new message ──
+depositSessionService.setNotifier(({ userId, amount, asset }) => {
+  void (async () => {
+    try {
+      const u = await prisma.user.findUnique({ where: { id: userId } });
+      if (!u?.chatId || !u.mainMessageId) return;
+      const sess = await getUserSession(u.telegramId);
+      if (sess?.state) return; // user mid-flow — don't touch their screen
+
+      const text =
+        `${'✅'} <b>DEPOSIT CREDITED</b>\n\n` +
+        `Your deposit of <b>${amount} ${asset}</b> was detected and added to your VEYLO balance automatically.\n\n` +
+        `No action needed.`;
+      const reply_markup = {
+        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
+      };
+      const chatId = u.chatId;
+      const msgId = parseInt(u.mainMessageId, 10);
+      if (Number.isNaN(msgId)) return;
+
+      try {
+        await bot.telegram.editMessageCaption(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
+      } catch {
+        try {
+          await bot.telegram.editMessageText(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
+        } catch { /* message gone — silent */ }
+      }
+    } catch { /* notifier is best-effort */ }
+  })();
+});
+
+// ── Payout notifier: AUTO-EDIT the claimant's message to REWARD PAID ──
+setPayoutNotifier(({ userId, amount, asset, hash }) => {
+  void (async () => {
+    try {
+      const u = await prisma.user.findUnique({ where: { id: userId } });
+      if (!u?.chatId || !u.mainMessageId) return;
+      const sess = await getUserSession(u.telegramId);
+      if (sess?.state) return;
+
+      const text =
+        `${'🏆'} <b>REWARD PAID</b>\n\n` +
+        `Your giveaway reward of <b>${amount} ${asset}</b> has been sent on-chain.\n\n` +
+        `Tx: <code>${hash}</code>`;
+      const reply_markup = {
+        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
+      };
+      const chatId = u.chatId;
+      const msgId = parseInt(u.mainMessageId, 10);
+      if (Number.isNaN(msgId)) return;
+
+      try {
+        await bot.telegram.editMessageCaption(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
+      } catch {
+        try {
+          await bot.telegram.editMessageText(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
+        } catch { /* message gone — silent */ }
+      }
+    } catch { /* notifier is best-effort */ }
+  })();
+});
+
+// NOTE: the legacy per-user depositMonitor is not started here at all.
 
 async function shutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal}, shutting down...`);
@@ -133,3 +189,4 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
+        
