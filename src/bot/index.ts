@@ -19,6 +19,7 @@ import { balanceSync } from '../services/balance-sync';
 import { prisma } from '../database';
 import { getUserSession } from '../services/redis';
 import { setPayoutNotifier } from '../workers/payout';
+import { e } from '../utils/emoji';
 import '../workers/cleanup';
 import express from 'express';
 import type { Server } from 'http';
@@ -49,7 +50,7 @@ broadcastService.start(bot.telegram);
 bot.catch((err: unknown, ctx: any) => {
   logger.error('Bot error:', err);
   try {
-    ctx.reply(`${'⚠️'} An unexpected error occurred. Our team has been notified.`);
+    ctx.reply(`${e('warning')} An unexpected error occurred. Our team has been notified.`);
   } catch {}
 });
 
@@ -105,21 +106,23 @@ if (config.ENABLE_TREASURY_MONITOR) {
   logger.info('Treasury monitor DISABLED (enable with ENABLE_TREASURY_MONITOR=true)');
 }
 
-// ── Deposit credited notifier: AUTO-EDIT, never a new message ──
+// ── Deposit credited notifier: AUTO-EDIT with premium emoji, never a new
+//    message. Skipped when the user is mid-flow so a giveaway-creation
+//    prompt is never clobbered. ──
 depositSessionService.setNotifier(({ userId, amount, asset }) => {
   void (async () => {
     try {
       const u = await prisma.user.findUnique({ where: { id: userId } });
       if (!u?.chatId || !u.mainMessageId) return;
       const sess = await getUserSession(u.telegramId);
-      if (sess?.state) return; // user mid-flow — don't touch their screen
+      if (sess?.state) return;
 
       const text =
-        `${'✅'} <b>DEPOSIT CREDITED</b>\n\n` +
+        `${e('check')} <b>DEPOSIT CREDITED</b>\n\n` +
         `Your deposit of <b>${amount} ${asset}</b> was detected and added to your VEYLO balance automatically.\n\n` +
         `No action needed.`;
       const reply_markup = {
-        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
+        inline_keyboard: [[{ text: `${e('wallet')} Open Wallet`, callback_data: 'wallet' }]],
       };
       const chatId = u.chatId;
       const msgId = parseInt(u.mainMessageId, 10);
@@ -130,13 +133,13 @@ depositSessionService.setNotifier(({ userId, amount, asset }) => {
       } catch {
         try {
           await bot.telegram.editMessageText(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
-        } catch { /* message gone — silent */ }
+        } catch { /* main message gone — silent */ }
       }
     } catch { /* notifier is best-effort */ }
   })();
 });
 
-// ── Payout notifier: AUTO-EDIT the claimant's message to REWARD PAID ──
+// ── Payout notifier: AUTO-EDIT the claimant's message to REWARD PAID. ──
 setPayoutNotifier(({ userId, amount, asset, hash }) => {
   void (async () => {
     try {
@@ -146,11 +149,11 @@ setPayoutNotifier(({ userId, amount, asset, hash }) => {
       if (sess?.state) return;
 
       const text =
-        `${'🏆'} <b>REWARD PAID</b>\n\n` +
+        `${e('party')} <b>REWARD PAID</b>\n\n` +
         `Your giveaway reward of <b>${amount} ${asset}</b> has been sent on-chain.\n\n` +
         `Tx: <code>${hash}</code>`;
       const reply_markup = {
-        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
+        inline_keyboard: [[{ text: `${e('wallet')} Open Wallet`, callback_data: 'wallet' }]],
       };
       const chatId = u.chatId;
       const msgId = parseInt(u.mainMessageId, 10);
@@ -161,7 +164,7 @@ setPayoutNotifier(({ userId, amount, asset, hash }) => {
       } catch {
         try {
           await bot.telegram.editMessageText(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
-        } catch { /* message gone — silent */ }
+        } catch { /* main message gone — silent */ }
       }
     } catch { /* notifier is best-effort */ }
   })();
@@ -189,4 +192,4 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
-        
+      
