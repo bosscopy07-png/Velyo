@@ -34,6 +34,9 @@ const DIVIDER = `${e('sparkle')}━━━━━━━━━━━━━━━━
 /** Claimants per page — sized so a full page fits the 1,024-char caption. */
 const CLAIMANTS_PER_PAGE = 5;
 
+/** Audience members per page — two lines each, stays under the caption cap. */
+const AUDIENCE_PER_PAGE = 6;
+
 const guard = (fn: (ctx: Context) => Promise<void>) => async (ctx: Context) => {
   try {
     await fn(ctx);
@@ -279,9 +282,10 @@ export function registerUpgradeCallbacks(bot: any): void {
     await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
   }));
 
-  // ══════════════════════ CREATOR: MY AUDIENCE (all giveaways) ══════════════════════
-  bot.action('giveaway:audience', guard(async (ctx: Context) => {
+  // ══════════════════════ CREATOR: MY AUDIENCE (all giveaways, PAGINATED) ══════════════════════
+  bot.action(/giveaway:audience(?::(\d+))?$/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
+    const requestedPage = Math.max(1, parseInt((ctx as any).match[1] ?? '1', 10));
     const user = await currentUser(ctx);
     if (!user) return;
 
@@ -321,14 +325,24 @@ export function registerUpgradeCallbacks(bot: any): void {
       }
     }
 
-    const audience = [...agg.values()].sort((a, b) => b.totalAmount - a.totalAmount).slice(0, 20);
+    // Deterministic sort (amount desc, then most-recent claim) so page N is stable
+    const sorted = [...agg.values()].sort((a, b) =>
+      b.totalAmount - a.totalAmount || b.lastClaim.getTime() - a.lastClaim.getTime()
+    );
+
+    const totalPages = Math.max(1, Math.ceil(sorted.length / AUDIENCE_PER_PAGE));
+    const page = Math.min(requestedPage, totalPages);
+    const slice = sorted.slice((page - 1) * AUDIENCE_PER_PAGE, page * AUDIENCE_PER_PAGE);
 
     const lines = [
-      `${e('people')} <b>MY AUDIENCE</b>`, DIVIDER,
+      `${e('people')} <b>MY AUDIENCE</b> (${page}/${totalPages})`, DIVIDER,
       `Everyone who claimed ANY of your giveaways: <b>${agg.size}</b> user(s)`, '',
     ];
     const rows: any[] = [];
-    for (const a of audience) {
+
+    if (slice.length === 0) lines.push('No audience yet.');
+
+    for (const a of slice) {
       const name = [a.user.firstName, a.user.lastName].filter(Boolean).join(' ') || a.user.username || 'User';
       lines.push(
         `👤 <b>${name}</b> (${a.user.username ? '@' + a.user.username : `ID ${a.user.telegramId}`})`,
@@ -336,6 +350,15 @@ export function registerUpgradeCallbacks(bot: any): void {
       );
       rows.push([Markup.button.callback(`🔎 Details`, `giveaway:audience:user:${a.user.id}`)]);
     }
+
+    if (totalPages > 1) {
+      const nav: any[] = [];
+      if (page > 1) nav.push(Markup.button.callback(`◀️ ${page - 1}`, `giveaway:audience:${page - 1}`));
+      nav.push(Markup.button.callback(`${page}/${totalPages}`, 'giveaway:noop'));
+      if (page < totalPages) nav.push(Markup.button.callback(`${page + 1} ▶️`, `giveaway:audience:${page + 1}`));
+      rows.push(nav);
+    }
+
     rows.push([
       Markup.button.callback(`⚠️ Flagged Users`, 'giveaway:flagged'),
       Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine'),
@@ -343,8 +366,7 @@ export function registerUpgradeCallbacks(bot: any): void {
 
     await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
   }));
-
-  // ══════════════════════ CREATOR: USER DETAIL ══════════════════════
+          // ══════════════════════ CREATOR: USER DETAIL ══════════════════════
   bot.action(/giveaway:audience:user:(.+)/, guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const targetUserId = (ctx as any).match[1];
@@ -422,7 +444,7 @@ export function registerUpgradeCallbacks(bot: any): void {
       'Users with POSSIBLE_DUPLICATE signals across your giveaways.', '',
       flags.length === 0 ? 'No flagged users. 🎉' : '',
     ];
-        const rows: any[] = [];
+    const rows: any[] = [];
     for (const f of flags) {
       const u = f.claim.user;
       const name = u.firstName || u.username || 'Name';
@@ -544,4 +566,5 @@ export function registerUpgradeCallbacks(bot: any): void {
     rows.push([Markup.button.callback(`${eb('back')} My Giveaways`, 'giveaway:mine')]);
     await editMainMessage(ctx, lines.join('\n'), Markup.inlineKeyboard(rows));
   }));
-}
+      }
+      
