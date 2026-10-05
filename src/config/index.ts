@@ -40,9 +40,9 @@ const envSchema = z.object({
   // ── Payout wallet (platform mode) ──
   // The wallet that SIGNS giveaway payouts when PAYOUT_ORIGIN=platform.
   // Prefer setting it from the admin panel (Admin → Treasury → Set Payout
-  // Wallet) — it is stored encrypted in the database, verified, and can be
-  // rotated without a redeploy. These env values are the fallback and must
-  // contain the ENCRYPTED key (same scheme as OPERATOR_WALLET_KEY).
+  // Wallet) — stored encrypted in the database, verified, rotatable without
+  // a redeploy. These env values are the fallback and must contain the
+  // ENCRYPTED key (same scheme as OPERATOR_WALLET_KEY).
   PAYOUT_WALLET_ADDRESS: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional(),
   PAYOUT_WALLET_KEY: z.string().optional(),
 
@@ -65,6 +65,11 @@ const envSchema = z.object({
   // on-chain; the creator pays from their internal VEYLO balance (which
   // deposits and rewards credit). 'creator' = legacy custodial mode.
   PAYOUT_ORIGIN: z.enum(['creator', 'platform']).default('platform'),
+
+  // ── On-chain confirmations before a payout is finalized and the
+  // claimant notified. BSC reorgs beyond ~5 blocks are practically unheard
+  // of; 15 confirmations added ~45s of dead wait for no real safety. ──
+  PAYOUT_CONFIRMATIONS: z.string().default('5').transform(Number),
 
   // ── Deposit session window (minutes) ──
   // While a session is live, its address gets a LIGHT background check
@@ -134,3 +139,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
+  
