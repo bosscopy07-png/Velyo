@@ -72,6 +72,10 @@ export function registerTextHandlers(bot: any): void {
           const cost = await estimateCreationCost(amount, 1);
           const usdValue = await pricing.convertToUSD(asset, amount);
           const ngnValue = await pricing.convertToNGN(asset, amount);
+          const me = await prisma.user.findUnique({ where: { telegramId } });
+          const { rewardsService } = await import('../../services/rewards');
+          const credit = me ? await rewardsService.getUnappliedCredit(me.id, asset) : 0;
+          const creditApplied = Math.min(credit, cost.platformFee);
 
           await editMainMessage(
             ctx,
@@ -82,8 +86,11 @@ export function registerTextHandlers(bot: any): void {
             `${e('star')} Reward Per User: <b>${amount} ${asset}</b>\n` +
             (cost.fee > 0
               ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+                (creditApplied > 0
+                  ? `${e('star')} Reward credit applied: <b>-${creditApplied.toFixed(6)} ${asset}</b> off the platform fee\n`
+                  : '') +
                 `${e('fire')} Network Gas (${cost.gasUnits} slots: 1 claim + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
-                `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
+                `${e('money')} Total Cost: <b>${(cost.total - creditApplied).toFixed(6)} ${asset}</b>\n`
               : '') +
             `${e('chart')} Estimated Value: <b>${pricing.formatUSD(usdValue)}</b>\n` +
             `${e('naira')} Estimated Naira: <b>${pricing.formatNGN(ngnValue)}</b>\n\n` +
@@ -257,7 +264,7 @@ export function registerTextHandlers(bot: any): void {
             backKeyboard('main')
           );
           break;
-             }
+            }
                     // === DEPOSIT SESSION: AMOUNT (spec §11/§15) ===
         case 'deposit_amount': {
           const asset = ((session as any).asset || 'USDT') as string;
@@ -569,15 +576,18 @@ export function registerTextHandlers(bot: any): void {
       await clearUserSession(telegramId);
     }
   });
-
-  // === EXPIRY SELECTION ===
+    // === EXPIRY SELECTION ===
   bot.action(/giveaway:expiry:(\d+)/, async (ctx: Context) => {
+    // Answer FIRST — the summary below makes live price-API calls (USD/NGN)
+    // that can take seconds; without this the button spinner makes the bot
+    // feel frozen.
+    await ctx.answerCbQuery('Building summary…');
     const hours = parseInt((ctx as any).match[1]);
     const from = ctx.from!;
     const session = await getUserSession(from.id.toString());
 
     if (!session || session.state !== 'giveaway_multi_expiry') {
-      await ctx.answerCbQuery('Session expired. Start over.');
+      await editMainMessage(ctx, `${e('warning')} Session expired. Start over.`, backKeyboard('giveaway'));
       return;
     }
 
@@ -596,6 +606,10 @@ export function registerTextHandlers(bot: any): void {
     const usdValue = await pricing.convertToUSD(asset, amount);
     const ngnValue = await pricing.convertToNGN(asset, amount);
     const usdPerUser = await pricing.convertToUSD(asset, amountPerUser);
+    const me = await prisma.user.findUnique({ where: { telegramId: from.id.toString() } });
+    const { rewardsService } = await import('../../services/rewards');
+    const credit = me ? await rewardsService.getUnappliedCredit(me.id, asset) : 0;
+    const creditApplied = Math.min(credit, cost.platformFee);
 
     await editMainMessage(
       ctx,
@@ -606,8 +620,11 @@ export function registerTextHandlers(bot: any): void {
       `${e('star')} Reward Per User: <b>${amountPerUser.toFixed(6)} ${asset}</b>\n` +
       (cost.fee > 0
         ? `${e('card')} Platform Fee (1%): <b>${cost.platformFee} ${asset}</b>\n` +
+          (creditApplied > 0
+            ? `${e('star')} Reward credit applied: <b>-${creditApplied.toFixed(6)} ${asset}</b> off the platform fee\n`
+            : '') +
           `${e('fire')} Network Gas (${cost.gasUnits} slots: ${maxClaimers} claims + buffer): <b>≈$${cost.gasFee.toFixed(4)}</b>\n` +
-          `${e('money')} Total Cost: <b>${cost.total.toFixed(6)} ${asset}</b>\n`
+          `${e('money')} Total Cost: <b>${(cost.total - creditApplied).toFixed(6)} ${asset}</b>\n`
         : '') +
       `${e('chart')} Per User: <b>≈ ${pricing.formatUSD(usdPerUser)}</b>\n` +
       `${e('chart')} Total Value: <b>≈ ${pricing.formatUSD(usdValue)}</b>\n` +
@@ -619,9 +636,9 @@ export function registerTextHandlers(bot: any): void {
         'giveaway'
       )
     );
-    await ctx.answerCbQuery();
   });
-    // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
+
+  // === PAYOUT CONFIRMATION (address from session — 64-byte button limit) ===
   bot.action(/payout:confirm:(.+)/, async (ctx: Context) => {
     const claimId = (ctx as any).match[1];
     const from = ctx.from!;
