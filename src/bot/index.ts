@@ -12,7 +12,6 @@ import { registerAdminUpgrade } from '../admin/upgrade';
 import { registerBroadcastAdmin } from '../admin/broadcast';
 import { registerUserAdmin } from '../admin/users';
 import { broadcastService } from '../services/broadcast';
-import { depositMonitor } from '../services/deposit-monitor';
 import { depositSessionService } from '../services/deposit-session';
 import { treasuryMonitor } from '../services/treasury';
 import { claimExpiry } from '../services/claim-expiry';
@@ -78,31 +77,41 @@ async function startBot(): Promise<void> {
 
 startBot();
 
-// In-process background jobs
-// UPGRADE (spec §17/§19): legacy PER-USER deposit monitoring is OFF by
-// default. Only company-pool deposit sessions are monitored (2 light
-// sweeps/min, bounded by live session count — never by total user count).
-// Historical DepositMonitor rows remain untouched in the DB.
-// Set ENABLE_LEGACY_DEPOSIT_MONITOR=true ONLY for a transition period.
-if (config.ENABLE_LEGACY_DEPOSIT_MONITOR) {
-  depositMonitor.start();
-  logger.info('LEGACY per-user deposit monitoring ENABLED (transition mode — heavy RPC usage)');
-} else {
-  logger.info('Legacy per-user deposit monitoring DISABLED — company pool sessions only');
-}
+// ───────────────────────── In-process background jobs ─────────────────────────
+// RPC POLICY (UPGRADE): the ONLY recurring chain contact is the deposit
+// session's LIGHT monitor — and only while a session is live (auto-off at
+// its 30-minute expiry). Everything else is DB-only or user/job-triggered.
+
+// Deposit sessions: DB-only expiry sweeps + light monitoring of LIVE
+// sessions (1/min, bounded batch). Zero RPC when no session is active.
 depositSessionService.start();
+
+// Claim expiry: DB-only.
 claimExpiry.start();
+
+// Balance integrity: DB-only watchdog (audit rows, no mutation, debounced).
 balanceSync.start();
 
-// Treasury health: debounced Telegram alerts to admins (low BNB/USDT,
-// payout queue backlog, empty deposit pool).
-treasuryMonitor.start((message) => {
-  for (const adminId of config.ADMIN_TELEGRAM_IDS) {
-    bot.telegram.sendMessage(adminId, message, { parse_mode: 'HTML' }).catch((err) => {
-      logger.error(`Treasury alert to ${adminId} failed: ${(err as Error).message}`);
-    });
-  }
-});
+// Treasury health alerts: recurring RPC (payout-wallet gas + treasury USDT
+// every 5 min). OFF by default — enable with ENABLE_TREASURY_MONITOR=true
+// if you want low-balance alerts; monitoring is not required for operation.
+if (config.ENABLE_TREASURY_MONITOR) {
+  treasuryMonitor.start((message) => {
+    for (const adminId of config.ADMIN_TELEGRAM_IDS) {
+      bot.telegram.sendMessage(adminId, message, { parse_mode: 'HTML' }).catch((err) => {
+        logger.error(`Treasury alert to ${adminId} failed: ${(err as Error).message}`);
+      });
+    }
+  });
+} else {
+  logger.info('Treasury monitor DISABLED — no recurring RPC (enable with ENABLE_TREASURY_MONITOR=true if wanted)');
+}
+
+// NOTE: the legacy per-user depositMonitor is NOT started here at all.
+// services/deposit-monitor.ts and workers/deposit.ts are dead code kept
+// only for history — the DepositMonitor table remains in the DB for audit.
+// (If you kept the ENABLE_LEGACY_DEPOSIT_MONITOR gate instead, ensure it is
+//  false; deleting the import + gate entirely is the recommended final state.)
 
 async function shutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal}, shutting down...`);
