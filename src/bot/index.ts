@@ -146,6 +146,7 @@ setPayoutNotifier(({ userId, amount, asset, hash }) => {
     try {
       const u = await prisma.user.findUnique({ where: { id: userId } });
       if (!u?.chatId || !u.mainMessageId) return;
+
       const sess = await getUserSession(u.telegramId);
       if (sess?.state) return;
 
@@ -153,21 +154,59 @@ setPayoutNotifier(({ userId, amount, asset, hash }) => {
         `${e('party')} <b>REWARD PAID</b>\n\n` +
         `Your giveaway reward of <b>${amount} ${asset}</b> has been sent on-chain.\n\n` +
         `Tx: <code>${hash}</code>`;
+
       const reply_markup = {
-        inline_keyboard: [[{ text: '💼 Open Wallet', callback_data: 'wallet' }]],
+        inline_keyboard: [
+          [
+            {
+              text: '💼 Open Wallet',
+              callback_data: 'wallet',
+            },
+          ],
+          [
+            {
+              text: '📢 Join Veylo Channel',
+              url: 'https://t.me/VeyloNetwork',
+            },
+          ],
+        ],
       };
+
       const chatId = u.chatId;
       const msgId = parseInt(u.mainMessageId, 10);
+
       if (Number.isNaN(msgId)) return;
 
       try {
-        await bot.telegram.editMessageCaption(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
+        await bot.telegram.editMessageCaption(
+          chatId,
+          msgId,
+          undefined,
+          text,
+          {
+            parse_mode: 'HTML',
+            reply_markup,
+          }
+        );
       } catch {
         try {
-          await bot.telegram.editMessageText(chatId, msgId, undefined, text, { parse_mode: 'HTML', reply_markup });
-        } catch { /* main message gone — silent */ }
+          await bot.telegram.editMessageText(
+            chatId,
+            msgId,
+            undefined,
+            text,
+            {
+              parse_mode: 'HTML',
+              reply_markup,
+            }
+          );
+        } catch {
+          /* main message gone — silent */
+        }
       }
-    } catch { /* notifier is best-effort */ }
+    } catch {
+      /* notifier is best-effort */
+    }
   })();
 });
 
