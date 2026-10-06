@@ -55,9 +55,12 @@ const envSchema = z.object({
   DEPOSIT_FLAT_FEE_SMALL_USD: z.string().default('0.05').transform(Number),
   DEPOSIT_FLAT_FEE_TIER_USD: z.string().default('0.5').transform(Number),
 
-  // ── Central reward business rules (defaults only; the live values live
-  // in SystemConfig 'fee_config' and are editable by admins at runtime) ──
-  REWARD_CREATOR_PERCENT: z.string().default('1.0').transform(Number),
+  // ── Central reward business rules (defaults; admins can tune at runtime
+  // in Admin → Finance — the live values live in SystemConfig 'fee_config').
+  // CASHBACK: 0.5% of the giveaway amount, credited when it fully pays out.
+  // REFERRAL: 1% OF THE CASHBACK the referred creator earned (not of the
+  // giveaway amount). $2 giveaway → $0.01 cashback → referrer gets $0.0001.
+  REWARD_CREATOR_PERCENT: z.string().default('0.5').transform(Number),
   REWARD_REFERRAL_PERCENT: z.string().default('1.0').transform(Number),
 
   // ── Who signs giveaway payout transactions ──
@@ -139,4 +142,3 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
-  
