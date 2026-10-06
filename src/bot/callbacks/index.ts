@@ -530,27 +530,32 @@ export function registerCallbacks(bot: any): void {
     await editMainMessage(ctx, caption, keyboard);
   }));
                                     // === HELP ===
-  bot.action('help', guard(async (ctx: Context) => {
-    await ctx.answerCbQuery();
-    await editMainMessage(
-      ctx,
-      `${e('help')} <b>HELP CENTER</b>\n\n` +
-      `<b>Getting Started</b>\n` +
-      `• Your wallet is created automatically when you start the bot.\n` +
-      `• Deposit BNB or USDT (BEP20) to your wallet address.\n` +
-      `• Create giveaways to share crypto with your community.\n\n` +
-      `<b>Deposits</b>\n` +
-      `• Only send BEP20 tokens to your deposit address.\n` +
-      `• Deposits require blockchain confirmations.\n\n` +
-      `<b>Giveaways</b>\n` +
-      `• Create single or multiple claim giveaways.\n` +
-      `• A ${config.PLATFORM_FEE_PERCENT}% platform fee + network gas applies at creation.\n` +
-      `• Funds are locked until claimed or cancelled.\n\n` +
-      `<b>Support</b>\n` +
-      `For assistance, contact @VeyloSupport`,
-      backKeyboard('main')
-    );
-  }));
+bot.action('help', guard(async (ctx: Context) => {
+  await ctx.answerCbQuery();
+
+  await editMainMessage(
+    ctx,
+    `${e('help')} <b>HELP CENTER</b>\n\n` +
+    `<b>Getting Started</b>\n` +
+    `• Your wallet is created automatically when you start the bot.\n` +
+    `• Deposit BNB or USDT (BEP20) to your wallet address.\n` +
+    `• Create giveaways to share crypto with your community.\n\n` +
+
+    `<b>Deposits</b>\n` +
+    `• Only send BEP20 tokens to your deposit address.\n` +
+    `• Deposits require blockchain confirmations.\n\n` +
+
+    `<b>Giveaways</b>\n` +
+    `• Create single or multiple claim giveaways.\n` +
+    `• A ${config.PLATFORM_FEE_PERCENT}% platform fee + network gas applies at creation.\n` +
+    `• Funds are locked until claimed or cancelled.\n\n` +
+
+    `<b>Support</b>\n` +
+    `For assistance, <a href="https://orbit-talk-pro.lovable.app/veylo">Contact Support</a>`,
+
+    backKeyboard('main')
+  );
+}));
 
   // === CONFIRM/CREATE GIVEAWAY ===
   bot.action(/giveaway:confirm:(.+)/, guard(async (ctx: Context) => {
