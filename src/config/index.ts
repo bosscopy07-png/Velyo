@@ -79,6 +79,13 @@ const envSchema = z.object({
   // (~1/min). Monitoring stops automatically when the session expires.
   DEPOSIT_SESSION_TTL_MINUTES: z.string().default('30').transform(Number),
 
+  // ── Deposit treasury forwarding ──
+  // SINGLE-WALLET MODE (default 'false'): the deposit/pool address IS the
+  // treasury wallet, so the post-credit sweep is skipped entirely — no BNB
+  // per deposit, no pool-key decrypts, no gas reserves. Set 'true' only if
+  // pool and treasury are separate wallets again.
+  DEPOSIT_FORWARD_TO_TREASURY: z.string().default('false').transform((s) => s === 'true'),
+
   // ── Legacy per-user deposit monitoring ──
   // Kept only as a documented transition switch. The legacy monitor
   // (services/deposit-monitor.ts) is NOT started by bot/index.ts anymore.
@@ -142,3 +149,4 @@ export const GIVEAWAY_EXPIRY_OPTIONS = [
   { label: '7 Days', hours: 168 },
   { label: 'No Expiry', hours: null },
 ] as const;
+  
