@@ -249,15 +249,14 @@ const worker = new Worker<PayoutJobData>('payouts', async (job) => {
   connection: bullmqConnection,
   concurrency: config.QUEUE_CONCURRENCY,
 });
-                      // UPGRADE: cashback + referral settle at COMPLETION (not creation).
+  // UPGRADE: cashback + referral settle at COMPLETION (not creation).
 // When EVERY slot is PAID: mark COMPLETED (guarded — one worker wins), then
 // credit exactly once each:
-//   - CREATOR CASHBACK: creatorCashbackPercent (default 1%) of totalAmount
+//   - CREATOR CASHBACK: creatorCashbackPercent (default 0.5%) of totalAmount
 //     to the creator ("credited after it's all given out").
-//   - REFERRAL REWARD: referralRewardPercent (default 1%) of totalAmount to
-//     the user who referred the CREATOR (earliest giveaway-link attribution
-//     of that creator) — for the referred person CREATING and completing a
-//     giveaway, NOT for claiming.
+//   - REFERRAL REWARD: referralRewardPercent (default 1%) OF THE CASHBACK
+//     the referred creator earned — NOT a percentage of the giveaway amount.
+//     $2 giveaway → $0.01 cashback → referrer earns 1% × 0.01 = $0.0001.
 // Both idempotent via deterministic per-giveaway keys — retries never
 // double-pay. Cancelled/expired giveaways never reach COMPLETED.
 async function maybeCompleteGiveaway(giveawayId: string): Promise<void> {
@@ -295,7 +294,7 @@ async function maybeCompleteGiveaway(giveawayId: string): Promise<void> {
 
     const referrer = await attributionService.getReferrerOf(g.creatorId);
     if (referrer && referrer.id !== g.creatorId) {
-      const refReward = feeConfig.percentOf(total, fees.referralRewardPercent);
+      const refReward = feeConfig.percentOf(cashback, fees.referralRewardPercent);
       if (refReward > 0) {
         await rewardsService.creditReward({
           userId: referrer.id,
@@ -305,7 +304,7 @@ async function maybeCompleteGiveaway(giveawayId: string): Promise<void> {
           asset: g.asset,
           amount: refReward,
           idempotencyKey: hashIdempotencyKey('referral-reward', giveawayId),
-          metadata: { referredCreatorId: g.creatorId },
+          metadata: { referredCreatorId: g.creatorId, cashbackBasis: cashback },
         });
       }
     }
@@ -341,6 +340,7 @@ async function maybeReclaimGas(giveawayId: string): Promise<void> {
     logger.error(`Post-payout gas reclaim check failed: ${(err as Error).message}`);
   }
 }
+
 /**
  * Finalize a confirmed payout: guarded PAID transition, release the creator's
  * locked slice, record the reward tx, and link it to the claim via the
