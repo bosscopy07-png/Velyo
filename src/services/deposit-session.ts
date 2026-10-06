@@ -18,22 +18,20 @@ export { pickUniqueSuffix, computeExpectedAmount };
  *
  * A deposit is a TIME-BOXED session: DEPOSIT tap → session created (30-min
  * window, company pool address, expected amount = requested + unique 0.1
- * band component) → user sends funds → credit → funds forwarded to treasury.
+ * band component) → user sends funds → credit → (optional) treasury sweep.
  *
  * RPC PROFILE:
  *   - LIGHT: while a session is alive (AWAITING/DETECTED, not expired), a
  *     ~1/min background check watches ONLY that session's address. A few
- *     RPC calls per live session per minute — and it STOPS AUTOMATICALLY
- *     when the session expires (30 min) or credits. Zero RPC when no
- *     session is live.
+ *     RPC calls per live session per minute — auto-OFF at expiry/credit.
  *   - FULL: tapping "I HAVE DEPOSITED" performs an immediate full
- *     verification on demand (same detection path, no waiting).
- *   There is NO permanent per-user monitoring anywhere.
+ *     verification on demand.
  *
- * AMOUNT DESIGN: the fractional part is a SINGLE component in the
- * 0.1000–0.1999 band — simultaneously the unique identifier AND the
- * platform fee. $1 → "1.1234", $5 → "5.1568". The user is credited exactly
- * what they requested; the component stays platform-side.
+ * SINGLE-WALLET MODE (default, DEPOSIT_FORWARD_TO_TREASURY=false): the pool
+ * address IS the treasury/company wallet, so credited funds are already
+ * where they need to be — the sweep is skipped entirely. No BNB per
+ * deposit, no pool-key decrypts, no gas reserves. (Set the flag to true if
+ * pool and treasury are ever separated again.)
  */
 
 const SESSION_TTL_MS = config.DEPOSIT_SESSION_TTL_MINUTES * 60_000;
@@ -66,8 +64,6 @@ class DepositSessionService {
   /**
    * Creates a deposit session and assigns a company pool address
    * (least-recently-assigned ACTIVE wallet — deterministic, recorded).
-   * Starting this session is what turns ON its light background monitoring
-   * (the monitor sweep only looks at live sessions).
    */
   async createSession(userId: string, asset: AssetSymbol, requestedAmount: number) {
     if (!config.ENABLE_DEPOSITS) throw new Error('Deposits are temporarily disabled');
@@ -146,11 +142,9 @@ class DepositSessionService {
   }
 
   /**
-   * "I HAVE DEPOSITED" — the FULL on-demand verification. Runs the same
-   * detection path as the light monitor, immediately, because the user
-   * tapped. Idempotent and race-safe: the guarded status transition
-   * guarantees a single crediting path even if the tap and the light
-   * sweep run simultaneously.
+   * "I HAVE DEPOSITED" — the FULL on-demand verification. Idempotent and
+   * race-safe: the guarded status transition guarantees a single crediting
+   * path even if the tap and the light sweep run simultaneously.
    */
   async verifySession(sessionId: string, requesterUserId: string): Promise<VerifyResult> {
     const session = await prisma.depositSession.findUnique({
@@ -226,9 +220,8 @@ class DepositSessionService {
       logger.error(`processSession(${session.id}) error: ${(err as Error).message}`);
       return { status: 'error', reason: 'Verification unavailable right now — please try again in a minute' };
     }
-  }
-
-  /**
+                  }
+      /**
    * Find an inbound transfer to the session's assigned address within the
    * session window. USDT: real Transfer events (real txHash). BNB: balance
    * delta between two observations (company deposit wallets only receive
@@ -340,7 +333,7 @@ class DepositSessionService {
               asset: session.asset,
               amount: session.platformFee,
               feeWallet: config.PLATFORM_FEE_WALLET,
-              sweptAt: new Date(), // session fees are forwarded immediately (see forwardToTreasury)
+              sweptAt: new Date(), // single-wallet mode: fee is already in treasury
             },
           });
         }
@@ -369,18 +362,24 @@ class DepositSessionService {
     // Auto-edit the user's main message (bot/index.ts) — never a new message.
     this.notifier?.({ userId: session.userId, amount: session.requestedAmount, asset: session.asset });
 
-    // Forward to treasury fire-and-forget (spec §21) — the only other chain
-    // call, and only ever after a successful credit.
+    // Optional treasury sweep (single-wallet mode: instant no-op).
     void this.forwardToTreasury(session.id).catch((err) =>
       logger.error(`Treasury forward failed for session ${session.id}: ${(err as Error).message}`)
     );
 
     return { status: 'credited', amount: session.requestedAmount };
-    }
-          /**
-   * Forwards the received funds (minus a gas reserve for future forwards)
-   * from the company deposit address to the platform treasury. Never sends
-   * the full balance — the reserve stays behind as gas (spec §21).
+  }
+
+  /**
+   * SINGLE-WALLET MODE (default): the pool address IS the treasury, so
+   * credited funds are already where they need to be — close the session
+   * and return. Saves a BNB transfer per deposit and removes the entire
+   * bad-key / gas-reserve failure class.
+   *
+   * When DEPOSIT_FORWARD_TO_TREASURY=true (separate pool + treasury), sends
+   * the pool's balance minus a 2×-transfer gas reserve to the treasury —
+   * never the full balance (spec §21). A wallet whose stored key won't
+   * decrypt is disabled once (circuit breaker) instead of spamming retries.
    */
   async forwardToTreasury(sessionId: string): Promise<void> {
     const session = await prisma.depositSession.findUnique({
@@ -389,10 +388,16 @@ class DepositSessionService {
     });
     if (!session || session.forwardedAt || session.status !== 'CREDITED' || !session.txHash) return;
 
+    if (!config.DEPOSIT_FORWARD_TO_TREASURY) {
+      await prisma.depositSession.update({
+        where: { id: session.id },
+        data: { forwardedAt: new Date() },
+      });
+      return;
+    }
+
     // ── Circuit breaker: a wallet whose key won't decrypt can never
-    // forward — disable it once and stop retrying, instead of spamming the
-    // console every minute. The funds stay in the company address until an
-    // admin re-adds the correct key (Admin → Treasury → Deposit Pool). ──
+    // forward — disable it once and stop retrying. ──
     let signerKey: string;
     try {
       signerKey = decrypt(session.assignedWallet.encryptedPrivateKey);
@@ -403,7 +408,7 @@ class DepositSessionService {
       });
       await prisma.depositSession.updateMany({
         where: { assignedWalletId: session.assignedWalletId, status: 'CREDITED', forwardedAt: null },
-        data: { forwardedAt: new Date() }, // stop retrying — funds remain in the address
+        data: { forwardedAt: new Date() },
       });
       await prisma.auditLog.create({
         data: {
@@ -447,9 +452,8 @@ class DepositSessionService {
       data: { forwardedAt: new Date() },
     });
     logger.info(`Session ${session.id} forwarded ${Number(forwardable) / 10 ** decimals} ${asset} to treasury (tx ${hash})`);
-  }
-
-  /** Guarded expiry flip — safe to call concurrently and repeatedly. */
+                                                                       }
+        /** Guarded expiry flip — safe to call concurrently and repeatedly. */
   private async expireSession(sessionId: string): Promise<void> {
     await prisma.depositSession.updateMany({
       where: { id: sessionId, status: { in: ['AWAITING', 'DETECTED'] } },
@@ -459,12 +463,11 @@ class DepositSessionService {
 
   /**
    * Background crons:
-   *   - expireSweep (DB-only, 2×/min): flips expired sessions — this is what
-   *     turns the light monitoring OFF (expired sessions leave the live set).
-   *   - monitorSweep (every 60s): the LIGHT check over ONLY live sessions
-   *     (zero RPC when none are live), plus a bounded forward-retry for
-   *     credited-but-unforwarded sessions. The circuit breaker in
-   *     forwardToTreasury ensures a bad key silences itself after one hit.
+   *   - expireSweep (DB-only, 2×/min): flips expired sessions — auto-OFF
+   *     for the light monitor.
+   *   - monitorSweep (every 60s): LIGHT check over ONLY live sessions
+   *     (zero RPC when none are live) + a bounded forward-retry, which only
+   *     runs when forwarding is enabled.
    */
   start(): void {
     cron.schedule('20 * * * * *', () => void this.expireSweep());
@@ -506,21 +509,21 @@ class DepositSessionService {
         }
       }
 
-      // Forward retry: credited but not yet forwarded (e.g. a pool key an
-      // admin later fixed). Bounded — one attempt per tick. A bad key trips
-      // the circuit breaker on the first attempt and never reaches here
-      // again for that wallet.
-      const unforwarded = await prisma.depositSession.findMany({
-        where: { status: 'CREDITED', forwardedAt: null, txHash: { not: null } },
-        select: { id: true },
-        take: 3,
-      });
-      for (const u of unforwarded) {
-        try {
-          await this.forwardToTreasury(u.id);
-        } catch (err) {
-          // Transient RPC error etc. — retries next tick.
-          logger.warn(`Forward retry failed for ${u.id}: ${(err as Error).message}`);
+      // Forward retry: only meaningful when pool and treasury are separate
+      // wallets (forwarding enabled). Single-wallet mode skips this entirely.
+      if (config.DEPOSIT_FORWARD_TO_TREASURY) {
+        const unforwarded = await prisma.depositSession.findMany({
+          where: { status: 'CREDITED', forwardedAt: null, txHash: { not: null } },
+          select: { id: true },
+          take: 3,
+        });
+        for (const u of unforwarded) {
+          try {
+            await this.forwardToTreasury(u.id);
+          } catch (err) {
+            // Transient RPC error etc. — retries next tick.
+            logger.warn(`Forward retry failed for ${u.id}: ${(err as Error).message}`);
+          }
         }
       }
     } catch (err) {
