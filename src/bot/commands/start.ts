@@ -1,4 +1,4 @@
-import { Context } from 'telegraf';
+import { Context, Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { clearUserSession, setUserSession } from '../../services/redis';
 import { mainKeyboard, backKeyboard } from '../keyboards/main';
@@ -6,7 +6,7 @@ import { formatWelcomeMessage } from '../messages';
 import { editMainMessage, VEYLO_IMAGE } from '../utils/editMainMessage';
 import { logger } from '../../utils/logger';
 import { giveawayService } from '../../services/giveaway';
-import { e } from '../../utils/emoji';
+import { e, eb } from '../../utils/emoji';
 import { config } from '../../config';
 
 export async function handleStart(ctx: Context): Promise<void> {
@@ -111,6 +111,19 @@ async function deleteMainMessage(ctx: Context, user: { mainMessageId: string | n
   }
 }
 
+/**
+ * Dead-end keyboard for giveaway entry screens: a Join-our-Channel link
+ * (config.COMMUNITY_CHANNEL_URL) above the Back button, so users who hit a
+ * full/inactive/expired giveaway are funnelled to the community instead of
+ * just leaving.
+ */
+function giveawayDeadEndKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.url(`${eb('message')} Join our Channel`, config.COMMUNITY_CHANNEL_URL)],
+    [Markup.button.callback(`${eb('back')} Back`, 'main')],
+  ]);
+}
+
 /** Exported so the /claim command can reuse the exact same claim flow. */
 export async function handleGiveawayDeepLink(ctx: Context, userId: string, code: string): Promise<void> {
   try {
@@ -157,25 +170,33 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       await editMainMessage(
         ctx,
         `${e('warning')} <b>GIVEAWAY FULL</b>\n\nAll available spots have already been claimed.\n\nBetter luck next time.`,
-        backKeyboard('main')
+        giveawayDeadEndKeyboard()
       );
       return;
     }
 
     if (giveaway.status !== 'ACTIVE') {
-      await editMainMessage(ctx, `${e('warning')} This giveaway is no longer active.`, backKeyboard('main'));
+      await editMainMessage(
+        ctx,
+        `${e('warning')} This giveaway is no longer active.`,
+        giveawayDeadEndKeyboard()
+      );
       return;
     }
 
     if (giveaway.expiresAt && giveaway.expiresAt < new Date()) {
-      await editMainMessage(ctx, `${e('warning')} This giveaway has expired.`, backKeyboard('main'));
+      await editMainMessage(
+        ctx,
+        `${e('warning')} This giveaway has expired.`,
+        giveawayDeadEndKeyboard()
+      );
       return;
     }
 
     const result = await giveawayService.claimGiveaway(giveaway.id, userId);
 
     if (!result.success) {
-      await editMainMessage(ctx, `${e('warning')} ${result.reason}`, backKeyboard('main'));
+      await editMainMessage(ctx, `${e('warning')} ${result.reason}`, giveawayDeadEndKeyboard());
       return;
     }
 
