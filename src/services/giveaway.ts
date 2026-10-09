@@ -1,4 +1,3 @@
-
 import { prisma } from '../database';
 import { assertUserOperational } from './maintenance';
 import { redis, acquireLock, releaseLock } from './redis';
@@ -185,8 +184,7 @@ class GiveawayService {
       config.PAYOUT_ORIGIN === 'platform'
         ? null
         : await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
-
-    // Captured inside the transaction so the UI can disclose it (rewards
+        // Captured inside the transaction so the UI can disclose it (rewards
     // credit auto-discounts the platform fee).
     let appliedCredit = 0;
 
@@ -290,6 +288,8 @@ class GiveawayService {
       return g;
     });
 
+    // Immediately forward the full creation fee on-chain to the platform
+    // wallet — waits for the seed to MINE first (cross-wallet ordering).
     // NOTE: creator cashback settles at COMPLETION (workers/payout.
     // maybeCompleteGiveaway) — ONLY when EVERY claimant has been paid.
     // Created-then-cancelled giveaways never reach COMPLETED → no cashback.
@@ -315,8 +315,9 @@ class GiveawayService {
 
     logger.info(`Giveaway created: ${giveaway.id} by ${data.creatorId} (${data.totalAmount} ${data.asset}, fee ${preFee}, credit ${appliedCredit})`);
     return { giveawayId: giveaway.id, secureCode, amountPerUser, appliedCredit };
-}
-    /**
+  }
+
+  /**
    * Sends the creator's full creation fee (1% + gas charge) on-chain to the
    * platform fee wallet. Marks the giveaway's platformFee rows swept on
    * success; leaves them pending on failure (admin sweep is the fallback).
@@ -483,8 +484,8 @@ class GiveawayService {
     } catch (err) {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
     }
-        }
-                                                                                      async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+               }
+      async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
       await assertUserOperational(userId);
@@ -533,6 +534,42 @@ class GiveawayService {
       }
       if (giveaway.claimedCount >= giveaway.maxClaimers) {
         return { success: false, reason: 'Giveaway is full' };
+      }
+
+      // ── RE-LOCK REOPENED SLOTS (platform-mode escrow invariant) ──
+      // When a claim expires, its slot is refunded to the creator's
+      // AVAILABLE balance and the slot reopens. If someone now re-claims it,
+      // that share must be re-locked from available — otherwise the creator
+      // spends the refund AND treasury pays the new claimant (the platform
+      // pays twice for one slot, and lockedBalance drifts negative).
+      // Invariant: locked == (active unpaid slots) × amountPerUser.
+      // No-op for normal first-fills (creation locked the full total).
+      // Runs BEFORE the atomic reservation — a failed re-lock never
+      // consumes a slot. The per-giveaway Redis lock serializes claims.
+      const ACTIVE_UNPAID = ['RESERVED', 'ADDRESS_PENDING', 'ADDRESS_CONFIRMED', 'QUEUED', 'PROCESSING'];
+      const perUser = Number(giveaway.amountPerUser);
+      const activeUnpaid = giveaway.claims.filter((c) => ACTIVE_UNPAID.includes(c.status)).length;
+      const targetLocked = Number(((activeUnpaid + 1) * perUser).toFixed(8));
+      const bal = await prisma.balance.findUnique({
+        where: { userId_asset: { userId: giveaway.creatorId, asset: giveaway.asset } },
+      });
+      const lockedNow = Number(bal?.lockedBalance ?? 0);
+      const availableNow = Number(bal?.availableBalance ?? 0);
+      if (lockedNow < targetLocked - 1e-9) {
+        const shortfall = Number((targetLocked - lockedNow).toFixed(8));
+        if (availableNow < shortfall - 1e-9) {
+          // The creator already spent the refund — the reopened slot cannot
+          // be backed. Refuse without consuming the slot.
+          return { success: false, reason: 'This giveaway is being refreshed — please try again shortly' };
+        }
+        await prisma.balance.update({
+          where: { userId_asset: { userId: giveaway.creatorId, asset: giveaway.asset } },
+          data: {
+            availableBalance: { decrement: shortfall },
+            lockedBalance: { increment: shortfall },
+          },
+        });
+        logger.info(`Re-locked ${shortfall} ${giveaway.asset} for reopened slot on giveaway ${giveawayId}`);
       }
 
       const result = await prisma.$queryRaw<{ claimedCount: number }[]>`
@@ -646,7 +683,7 @@ class GiveawayService {
 
     await this.reclaimGas(giveawayId);
     return { success: true };
-  }
+        }
     async getGiveawayStats(giveawayId: string): Promise<{
     totalReward: number;
     totalSlots: number;
