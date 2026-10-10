@@ -145,7 +145,14 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
       where: { giveawayId_userId: { giveawayId: giveaway.id, userId } },
     });
 
-    if (existingClaim) {
+    // Expired claims (10-min address window): the slot was released and the
+    // share STAYS LOCKED. Remove the dead reservation — otherwise the
+    // unique(giveawayId, userId) constraint blocks the user from claiming
+    // the reopened slot — then fall through to a fresh claim below.
+    const isExpired = existingClaim?.status === 'FAILED' &&
+      String(existingClaim.failedReason ?? '').startsWith('Expired');
+
+    if (existingClaim && !isExpired) {
       if (existingClaim.status === 'PAID') {
         await editMainMessage(
           ctx,
@@ -156,14 +163,27 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         await editMainMessage(ctx, `${e('clock')} Your reward is being processed. Please wait.`, backKeyboard('main'));
       } else if (
         existingClaim.status === 'RESERVED' ||
-        existingClaim.status === 'ADDRESS_PENDING' ||
-        existingClaim.status === 'FAILED'
+        existingClaim.status === 'ADDRESS_PENDING'
       ) {
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
       } else {
         await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, backKeyboard('main'));
       }
       return;
+    }
+
+    if (existingClaim && isExpired) {
+      await prisma.giveawayClaim.delete({ where: { id: existingClaim.id } }).catch(() => {});
+      await prisma.auditLog.create({
+        data: {
+          action: 'EXPIRED_CLAIM_REMOVED',
+          entityType: 'giveaway_claim',
+          entityId: existingClaim.id,
+          newValue: { giveawayId: giveaway.id, reason: 'expired claim removed so the reopened slot can be re-claimed' },
+        },
+      });
+      await clearUserSession(ctx.from!.id.toString());
+      // fall through to the normal claim flow below
     }
 
     if (giveaway.status === 'FULL') {
@@ -252,5 +272,4 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
   );
-        }
-      
+}
