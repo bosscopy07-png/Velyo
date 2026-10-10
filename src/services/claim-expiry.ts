@@ -1,8 +1,24 @@
 import { prisma } from '../database';
 import { logger } from '../utils/logger';
+import { clearUserSession } from './redis';
 import cron from 'node-cron';
 
-/** Claims that don't submit an address within this window are expired */
+/**
+ * Claims that don't submit an address within this window are expired.
+ *
+ * UPGRADE (new model): expiring a claim releases the SLOT ONLY — the
+ * share stays LOCKED. It is released to the creator's spendable balance
+ * only when the GIVEAWAY itself ends (cancel → cancelGiveaway; link
+ * expiry → cleanup worker), via the canonical computeOutstandingEscrow.
+ *
+ * Why: refunding the share to spendable at claim-expiry created a
+ * refund → reopen → re-claim cycle that double-paid slots and drove
+ * lockedBalance negative. Keeping the share locked means a reopened slot
+ * needs NO balance movement when re-claimed, and the platform can never
+ * pay one slot twice. The claimant's input session is also cleared so
+ * the stale "send your address" prompt stops accepting input for the
+ * dead claim (the screen fixes itself on their next tap).
+ */
 const CLAIM_EXPIRY_MINUTES = 10;
 
 class ClaimExpiryService {
@@ -10,7 +26,7 @@ class ClaimExpiryService {
 
   start(): void {
     cron.schedule('* * * * *', () => void this.expireStaleClaims());
-    logger.info(`Claim expiry started (> ${CLAIM_EXPIRY_MINUTES} min = expired, refunded to creator)`);
+    logger.info(`Claim expiry started (> ${CLAIM_EXPIRY_MINUTES} min = expired, slot released, share stays locked)`);
   }
 
   private async expireStaleClaims(): Promise<void> {
@@ -42,18 +58,18 @@ class ClaimExpiryService {
 
   private async expireOne(claim: {
     id: string;
+    userId: string;
     giveawayId: string;
     giveaway: { creatorId: string; asset: string; amountPerUser: unknown };
   }): Promise<void> {
-    const share = Number(claim.giveaway.amountPerUser);
-
     await prisma.$transaction(async (tx) => {
       await tx.giveawayClaim.update({
         where: { id: claim.id },
         data: { status: 'FAILED', failedReason: `Expired — no address within ${CLAIM_EXPIRY_MINUTES} minutes` },
       });
 
-      // Release the slot (FULL → ACTIVE so someone else can claim)
+      // Release the slot (FULL → ACTIVE so someone else can claim).
+      // NO balance movement — the share stays locked until the giveaway ends.
       await tx.$queryRaw`
         UPDATE giveaways
         SET "claimedCount" = "claimedCount" - 1,
@@ -61,32 +77,18 @@ class ClaimExpiryService {
             "updatedAt" = NOW()
         WHERE id = ${claim.giveawayId} AND "claimedCount" > 0
       `;
-
-      if (share > 0) {
-        await tx.balance.update({
-          where: { userId_asset: { userId: claim.giveaway.creatorId, asset: claim.giveaway.asset } },
-          data: {
-            availableBalance: { increment: share },
-            lockedBalance: { decrement: share },
-          },
-        });
-        await tx.transaction.create({
-          data: {
-            userId: claim.giveaway.creatorId,
-            type: 'REFUND',
-            asset: claim.giveaway.asset,
-            amount: share,
-            fee: 0,
-            netAmount: share,
-            status: 'CONFIRMED',
-            idempotencyKey: `claim-expiry-${claim.id}`,
-            metadata: { claimId: claim.id, giveawayId: claim.giveawayId },
-          },
-        });
-      }
     });
 
-    logger.info(`Claim ${claim.id} expired — slot released, ${share} refunded to creator`);
+    // Kill the claimant's stale input session so the old "send your
+    // address" prompt no longer accepts input for this dead claim.
+    try {
+      const u = await prisma.user.findUnique({ where: { id: claim.userId }, select: { telegramId: true } });
+      if (u) await clearUserSession(u.telegramId);
+    } catch (err) {
+      logger.warn(`Could not clear session for expired claim ${claim.id}: ${(err as Error).message}`);
+    }
+
+    logger.info(`Claim ${claim.id} expired — slot released (share stays locked until giveaway ends)`);
   }
 }
 
