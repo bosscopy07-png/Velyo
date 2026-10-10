@@ -171,8 +171,7 @@ class GiveawayService {
         `and need ${preTotalCost.toFixed(6)} including fees. Deposit more ${data.asset} first.`
       );
     }
-
-    // ── SEED GAS FIRST ──────────────────────────────────────────────────
+        // ── SEED GAS FIRST ──────────────────────────────────────────────────
     // Fail fast: if the operator wallet can't fund the gas budget, we throw
     // BEFORE the giveaway exists — no locked funds, no unpayable giveaway.
     // (Old behavior: seed after creation, swallow failures, discover the
@@ -184,6 +183,7 @@ class GiveawayService {
       config.PAYOUT_ORIGIN === 'platform'
         ? null
         : await this.seedPayoutGas(data.creatorId, giveawayId, data.maxClaimers + GAS_BUFFER_UNITS);
+
     // Captured inside the transaction so the UI can disclose it (rewards
     // credit auto-discounts the platform fee).
     let appliedCredit = 0;
@@ -484,7 +484,7 @@ class GiveawayService {
     } catch (err) {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
     }
-                      }
+                   }
               async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
@@ -624,30 +624,50 @@ class GiveawayService {
     const { outstanding } = await computeOutstandingEscrow(giveawayId);
 
     if (outstanding > 0) {
-      await prisma.$transaction(async (tx) => {
-        await tx.balance.update({
-          where: { userId_asset: { userId: fresh.creatorId, asset: fresh.asset } },
-          data: {
-            availableBalance: { increment: outstanding },
-            lockedBalance: { decrement: outstanding },
-          },
+      // CAP: never refund more than the balance actually holds locked.
+      // Legacy giveaways whose escrow was released pre-fix (locked=0 with
+      // no REFUND row) would otherwise be paid out twice.
+      const bal = await prisma.balance.findUnique({
+        where: { userId_asset: { userId: fresh.creatorId, asset: fresh.asset } },
+      });
+      const refund = Math.min(outstanding, Math.max(0, Number(bal?.lockedBalance ?? 0)));
+
+      if (refund > 0) {
+        await prisma.$transaction(async (tx) => {
+          await tx.balance.update({
+            where: { userId_asset: { userId: fresh.creatorId, asset: fresh.asset } },
+            data: {
+              availableBalance: { increment: refund },
+              lockedBalance: { decrement: refund },
+            },
+          });
+
+          const { hashIdempotencyKey } = await import('../utils/encryption');
+          await tx.transaction.create({
+            data: {
+              userId: fresh.creatorId,
+              type: 'REFUND',
+              asset: fresh.asset,
+              amount: refund,
+              fee: 0,
+              netAmount: refund,
+              status: 'CONFIRMED',
+              idempotencyKey: hashIdempotencyKey('refund', giveawayId),
+              metadata: { giveawayId, kind: 'cancel' },
+            },
+          });
         });
 
-        const { hashIdempotencyKey } = await import('../utils/encryption');
-        await tx.transaction.create({
-          data: {
-            userId: fresh.creatorId,
-            type: 'REFUND',
-            asset: fresh.asset,
-            amount: outstanding,
-            fee: 0,
-            netAmount: outstanding,
-            status: 'CONFIRMED',
-            idempotencyKey: hashIdempotencyKey('refund', giveawayId),
-            metadata: { giveawayId, kind: 'cancel' },
-          },
-        });
-      });
+        if (refund < outstanding) {
+          logger.warn(
+            `Cancel ${giveawayId}: capped refund ${refund} < outstanding ${outstanding} — escrow was already released.`
+          );
+        }
+      } else {
+        logger.warn(
+          `Cancel ${giveawayId}: outstanding ${outstanding} but zero locked backing — no refund issued.`
+        );
+      }
     }
 
     await this.reclaimGas(giveawayId);
