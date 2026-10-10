@@ -1,98 +1,76 @@
 import { prisma } from '../database';
 import { logger } from '../utils/logger';
-import { computeOutstandingEscrow } from '../services/giveaway';
 import cron from 'node-cron';
 
 /**
- * ============================================================================
- * WHY THIS FILE CHANGED
- * ============================================================================
- * Two independent bugs, both fixed here:
+ * Periodic cleanup:
+ *   1. Expired giveaways → EXPIRED (and release the creator's escrow).
  *
- * 1. NO MUTEX. Every other cron in this codebase (claim-expiry.ts,
- *    deposit-monitor.ts, balance-sync.ts) guards against overlapping runs.
- *    This one didn't — an hourly job that runs long (slow DB, many expired
- *    giveaways) could still be running when the next hour's tick fires,
- *    and both instances would happily refund the same giveaway.
- *
- * 2. WRONG REFUND MATH. The old formula was:
- *
- *      refundAmount = totalAmount - claimedCount * amountPerUser
- *
- *    `claimedCount` is a live "currently occupied slots" counter — it's
- *    decremented the moment a claim expires (claim-expiry.ts) or its
- *    payout is permanently unwound (payout.ts), at which point THAT
- *    claim's share is ALSO independently refunded right then. By the
- *    time this hourly job ran, `claimedCount` no longer reflected those
- *    already-refunded slots, so this formula refunded the ENTIRE
- *    remaining pot again — a real double-refund with zero on-chain
- *    footprint (pure DB bookkeeping), showing up as `lockedBalance`
- *    going negative and `availableBalance` inflated by the same amount.
- *    This is exactly the shape phantom balances take here — invisible
- *    to `balance-sync.ts` because `available + locked` never changes,
- *    only the split between them does.
- *
- *    Fixed by using `computeOutstandingEscrow` — the same canonical
- *    calculation `cancelGiveaway` now uses — which derives "how much is
- *    still locked" from actual PAID claims and actual REFUND
- *    transactions already recorded, not from a counter that can drift.
- * ============================================================================
+ * Escrow release uses computeOutstandingEscrow — the ONE canonical
+ * calculation (see services/giveaway.ts). Giveaway-link expiry is now the
+ * ONLY moment unclaimed slot funds return to the creator's spendable
+ * balance (claim-level expiry no longer refunds; it just reopens the slot).
  */
 
-const CRON_SCHEDULE = '0 * * * *'; // every hour, on the hour
+const cronSchedules: string[] = [
+  '0 2 * * *',   // 02:00
+  '0 8 * * *',   // 08:00
+  '0 14 * * *',  // 14:00
+  '0 20 * * *',  // 20:00
+];
 
-class CleanupService {
-  private isRunning = false;
+function startCleanupWorker(): void {
+  cronSchedules.forEach((schedule) => {
+    cron.schedule(schedule, () => {
+      void expireGiveaways();
+    });
+  });
 
-  start(): void {
-    cron.schedule(CRON_SCHEDULE, () => void this.run());
-    logger.info('Cleanup worker started (expired-giveaway sweep, hourly, mutex-guarded)');
-  }
+  logger.info(`Cleanup worker started (${cronSchedules.length}×/day: ${cronSchedules.join(', ')})`);
+}
 
-  private async run(): Promise<void> {
-    if (this.isRunning) {
-      logger.warn('Cleanup: previous run still in progress, skipping this tick.');
-      return;
+async function expireGiveaways(): Promise<void> {
+  try {
+    // UPGRADE: FULL giveaways also expire — otherwise a full-but-expired
+    // giveaway would hold its escrow locked forever.
+    const expired = await prisma.giveaway.findMany({
+      where: { status: { in: ['ACTIVE', 'FULL'] }, expiresAt: { lt: new Date() } },
+      select: { id: true },
+    });
+
+    if (expired.length === 0) return;
+
+    logger.info(`Found ${expired.length} expired giveaway(s), processing...`);
+
+    for (const g of expired) {
+      await expireOneGiveaway(g.id);
     }
-    this.isRunning = true;
-
-    try {
-      logger.info('Running expired giveaway cleanup...');
-
-      const expired = await prisma.giveaway.findMany({
-        where: { status: 'ACTIVE', expiresAt: { lt: new Date() } },
-        select: { id: true },
-      });
-
-      for (const { id } of expired) {
-        try {
-          await this.expireOne(id);
-        } catch (err) {
-          logger.error(`Failed to expire giveaway ${id}:`, err);
-        }
-      }
-    } finally {
-      this.isRunning = false;
-    }
+  } catch (err) {
+    logger.error('Cleanup error:', err);
   }
+}
 
-  private async expireOne(giveawayId: string): Promise<void> {
+async function expireOneGiveaway(giveawayId: string): Promise<void> {
+  try {
+    const { computeOutstandingEscrow } = await import('../services/giveaway');
+
     // Atomic guarded transition — only one caller (this process, this tick,
-    // or any other instance running the same cron) ever moves a given
-    // giveaway out of ACTIVE. A second attempt sees count 0 and stops,
-    // instead of computing and applying a refund a second time.
+    // or a racing cancel) can move out of ACTIVE/FULL. A second attempt sees
+    // count 0 and stops, so no double refund.
     const transitioned = await prisma.giveaway.updateMany({
-      where: { id: giveawayId, status: 'ACTIVE' },
+      where: { id: giveawayId, status: { in: ['ACTIVE', 'FULL'] } },
       data: { status: 'EXPIRED' },
     });
 
     if (transitioned.count === 0) {
-      return; // already handled (expired, or cancelled, by another caller)
+      return;
     }
 
     const { giveaway, outstanding } = await computeOutstandingEscrow(giveawayId);
 
     if (outstanding > 0) {
+      const { hashIdempotencyKey } = await import('../utils/encryption');
+
       await prisma.$transaction(async (tx) => {
         await tx.balance.update({
           where: { userId_asset: { userId: giveaway.creatorId, asset: giveaway.asset } },
@@ -111,16 +89,24 @@ class CleanupService {
             fee: 0,
             netAmount: outstanding,
             status: 'CONFIRMED',
-            idempotencyKey: `refund|expired|${giveawayId}`,
-            metadata: { giveawayId, kind: 'expired' },
+            idempotencyKey: hashIdempotencyKey('refund', giveawayId),
+            metadata: { giveawayId, kind: 'giveaway_expiry' },
           },
         });
       });
+
+      logger.info(
+        `Giveaway ${giveawayId} expired: refunded ${outstanding} ${giveaway.asset} to creator ${giveaway.creatorId}`
+      );
     }
 
-    logger.info(`Expired giveaway processed: ${giveawayId} (${outstanding} refunded)`);
+    // Reclaim any leftover seeded gas (no-op in platform payout mode)
+    const { giveawayService } = await import('../services/giveaway');
+    await giveawayService.reclaimGas(giveawayId).catch(() => {});
+  } catch (err) {
+    logger.error(`Failed to expire giveaway ${giveawayId}:`, err);
   }
 }
 
-export const cleanupService = new CleanupService();
-cleanupService.start();
+startCleanupWorker();
+        
