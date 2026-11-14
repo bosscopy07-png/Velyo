@@ -1,7 +1,7 @@
 {
   "name": "veylo-wallet-bot",
   "version": "1.0.0",
-  "description": "VEYLO — Crypto at Speed. Telegram-based crypto wallet with giveaway system.",
+  "description": "VEYLO \u2014 Crypto at Speed. Telegram-based crypto wallet with giveaway system.",
   "main": "dist/bot/index.js",
   "scripts": {
     "build": "tsc",
@@ -14,7 +14,9 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "lint": "eslint src --ext .ts",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "web": "node dist/web/server.js",
+    "web:dev": "tsx src/web/server.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.15.0",
