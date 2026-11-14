@@ -13,6 +13,9 @@ export const mainKeyboard = (isAdmin = false) => {
       Markup.button.callback(`${eb('document')} History`, 'history'),
     ],
     [
+      Markup.button.callback(`${eb('gift')} Redeem Giveaway Code`, 'giveaway:redeemcode'),
+    ],
+    [
       Markup.button.callback(`${eb('person')} Account`, 'account'),
       Markup.button.callback(`${eb('help')} Help`, 'help'),
     ],
