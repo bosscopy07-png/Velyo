@@ -166,6 +166,8 @@ export async function handleGiveawayDeepLink(ctx: Context, userId: string, code:
         existingClaim.status === 'ADDRESS_PENDING'
       ) {
         await promptForAddress(ctx, giveaway.asset, existingClaim.id);
+      } else if (existingClaim.status === 'REJECTED') {
+        await editMainMessage(ctx, `${e('warning')} This claim could not be completed. You have already claimed this giveaway using this wallet address.`, backKeyboard('main'));
       } else {
         await editMainMessage(ctx, `${e('check')} You already secured a spot in this giveaway!`, backKeyboard('main'));
       }
@@ -272,4 +274,5 @@ async function promptForAddress(ctx: Context, asset: string, claimId: string): P
     `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
   );
-}
+                                                      }
+      
