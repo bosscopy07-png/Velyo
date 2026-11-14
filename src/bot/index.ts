@@ -11,6 +11,8 @@ import { registerAdminCommands } from '../admin/commands';
 import { registerAdminUpgrade } from '../admin/upgrade';
 import { registerBroadcastAdmin } from '../admin/broadcast';
 import { registerUserAdmin } from '../admin/users';
+import { registerGiveawayRedeem } from './giveaway-redeem';
+import { registerWebFlagsAdmin } from '../admin/web-flags';
 import { broadcastService } from '../services/broadcast';
 import { depositSessionService } from '../services/deposit-session';
 import { treasuryMonitor } from '../services/treasury';
@@ -32,6 +34,11 @@ const bot = new Telegraf(config.BOT_TOKEN, { handlerTimeout: 45000 });
 // Middleware
 bot.use(securityMiddleware);
 
+// VEYLO website code redemption + duplicate-wallet guard. Registered BEFORE the
+// commands/callbacks below so it can intercept /start redeem_*, the code text
+// step, and payout:confirm, then hand everything else on via next().
+registerGiveawayRedeem(bot);
+
 // Commands
 bot.command('start', handleStart);
 bot.command('claim', handleClaim);
@@ -44,6 +51,7 @@ registerAdminCommands(bot);
 registerAdminUpgrade(bot);
 registerBroadcastAdmin(bot);
 registerUserAdmin(bot);
+registerWebFlagsAdmin(bot);
 broadcastService.start(bot.telegram);
 
 // Error handling
@@ -232,4 +240,5 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
         
