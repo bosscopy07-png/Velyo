@@ -485,7 +485,7 @@ class GiveawayService {
       logger.error(`Gas reclaim failed for ${giveawayId}: ${(err as Error).message}`);
     }
                    }
-              async claimGiveaway(giveawayId: string, userId: string): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
+              async claimGiveaway(giveawayId: string, userId: string, opts?: { reservationId?: string }): Promise<{ success: boolean; reason?: string; claimOrder?: number }> {
     // Maintenance gate — before the claim lock and any claim/ledger write.
     try {
       await assertUserOperational(userId);
@@ -534,6 +534,21 @@ class GiveawayService {
       }
       if (giveaway.claimedCount >= giveaway.maxClaimers) {
         return { success: false, reason: 'Giveaway is full' };
+      }
+
+      // WEBSITE RESERVATIONS: slots held by live website claim codes are not
+      // available to other claimants. A redeeming code passes its own
+      // reservationId so it can use the slot it holds. Fail-open on error so
+      // the original claim flow can never be broken by the website tables
+      // (the atomic UPDATE below remains the hard capacity limit).
+      try {
+        const { countActiveReservations } = await import('../web/reservation-guard');
+        const held = await countActiveReservations(giveawayId, opts?.reservationId);
+        if (giveaway.claimedCount + held >= giveaway.maxClaimers) {
+          return { success: false, reason: 'Giveaway just filled up' };
+        }
+      } catch (err) {
+        logger.warn(`Reservation guard skipped for ${giveawayId}: ${(err as Error).message}`);
       }
 
       // NOTE: no re-lock needed on reopened slots — claim-expiry releases
