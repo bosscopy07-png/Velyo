@@ -299,4 +299,21 @@
     else notFoundView();
     if (location.hash) setTimeout(() => { const t = document.querySelector(location.hash); if (t) t.scrollIntoView(); }, 60);
     else window.scrollTo(0, 0);
-    app.focus({ preventScroll: tr
+    app.focus({ preventScroll: true });
+  }
+  document.addEventListener('click', (ev) => {
+    const a = ev.target.closest && ev.target.closest('a[data-link]');
+    if (!a || ev.metaKey || ev.ctrlKey || ev.shiftKey || a.target === '_blank') return;
+    const u = new URL(a.href, location.href); if (u.origin !== location.origin) return;
+    ev.preventDefault(); history.pushState({}, '', u.pathname + u.hash); route();
+  });
+  window.addEventListener('popstate', route);
+
+  // global links from server config
+  document.querySelectorAll('[data-bot]').forEach((a) => Object.assign(a, { href: BOOT.botUrl, target: '_blank' }));
+  document.querySelectorAll('[data-channel]').forEach((a) => Object.assign(a, { href: BOOT.channelUrl, target: '_blank' }));
+  document.querySelectorAll('[data-support]').forEach((a) => { if (BOOT.supportUrl) { a.href = BOOT.supportUrl; a.target = '_blank'; a.hidden = false; } });
+  document.getElementById('yr').textContent = new Date().getFullYear();
+  route();
+})();
+  
