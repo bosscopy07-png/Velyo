@@ -528,3 +528,134 @@ enum BroadcastStatus {
   INTERRUPTED
   RECALLED
 }
+// ─────────────────────────────── VEYLO WEBSITE: CLAIM CODES & ANTI-ABUSE ────
+// Additive only. Nothing above is modified. The wallet-credit RedeemCode /
+// CodeRedemption models are untouched and unrelated to these tables.
+// giveawayId columns are plain strings (no FK) so the existing Giveaway
+// model needs no back-relation; giveaways are never hard-deleted.
+
+enum ReservationStatus {
+  ACTIVE
+  CONVERTED
+  EXPIRED
+  RELEASED
+}
+
+enum WebCodeStatus {
+  ACTIVE
+  REDEEMED
+  EXPIRED
+  CANCELLED
+}
+
+enum DuplicateLevel {
+  CONFIRMED_DUPLICATE
+  STRONG_SUSPICIOUS
+  WEAK_SIGNAL
+}
+
+enum DuplicateReview {
+  NOT_REQUIRED
+  OPEN
+  DISMISSED
+  CONFIRMED
+}
+
+/// Public, non-guessable URL slug for a giveaway (keeps internal ids and the
+/// secret claim code out of public URLs).
+model GiveawayPublicLink {
+  id         String   @id @default(cuid())
+  giveawayId String   @unique
+  slug       String   @unique
+  createdAt  DateTime @default(now())
+
+  @@map("giveaway_public_links")
+}
+
+/// One temporary slot hold created from the website. NOT a claim.
+model GiveawayReservation {
+  id          String            @id @default(cuid())
+  giveawayId  String
+  status      ReservationStatus @default(ACTIVE)
+  expiresAt   DateTime
+  ipHash      String?
+  deviceHash  String?
+  uaHash      String?
+  claimId     String?
+  createdAt   DateTime          @default(now())
+  convertedAt DateTime?
+  releasedAt  DateTime?
+
+  code GiveawayWebCode?
+
+  @@index([giveawayId, status, expiresAt])
+  @@index([giveawayId, ipHash])
+  @@index([giveawayId, deviceHash])
+  @@index([status, expiresAt])
+  @@map("giveaway_reservations")
+}
+
+/// Website-generated giveaway claim code. Only the keyed hash is used for
+/// lookup; the encrypted copy exists solely so an ACTIVE code can be shown
+/// again to the same device (idempotent re-click) and is wiped on use/expiry.
+model GiveawayWebCode {
+  id             String              @id @default(cuid())
+  giveawayId     String
+  reservationId  String              @unique
+  reservation    GiveawayReservation @relation(fields: [reservationId], references: [id])
+  codeHash       String              @unique
+  codeCipher     String?
+  status         WebCodeStatus       @default(ACTIVE)
+  createdAt      DateTime            @default(now())
+  expiresAt      DateTime
+  redeemedAt     DateTime?
+  telegramUserId String?
+  claimId        String?
+  audit          Json?
+
+  @@index([giveawayId, status])
+  @@index([status, expiresAt])
+  @@map("giveaway_web_codes")
+}
+
+/// Atomic "this payout address is used in this giveaway" registry. The
+/// unique key is what makes concurrent duplicate-wallet attempts safe.
+model GiveawayWalletUse {
+  id            String   @id @default(cuid())
+  giveawayId    String
+  addressHash   String
+  maskedAddress String
+  claimId       String   @unique
+  telegramId    String
+  createdAt     DateTime @default(now())
+
+  @@unique([giveawayId, addressHash])
+  @@index([addressHash])
+  @@map("giveaway_wallet_uses")
+}
+
+/// Traceable evidence for every duplicate decision.
+model DuplicateEvidence {
+  id                 String          @id @default(cuid())
+  giveawayId         String
+  level              DuplicateLevel
+  signals            Json            // [{ type, detail }]
+  currentClaimId     String?
+  currentReservationId String?
+  previousClaimId    String?
+  previousClaimAt    DateTime?
+  walletHash         String?
+  maskedWallet       String?
+  relatedTelegramIds Json?           // admin-only
+  signalRefs         Json?           // short hash prefixes, never raw IPs
+  decision           String          // REJECTED | FLAGGED | RECORDED
+  reviewStatus       DuplicateReview @default(NOT_REQUIRED)
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  createdAt          DateTime        @default(now())
+
+  @@index([giveawayId, level])
+  @@index([reviewStatus, createdAt])
+  @@index([currentClaimId])
+  @@map("duplicate_evidence")
+}
