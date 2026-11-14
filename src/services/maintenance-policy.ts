@@ -30,10 +30,12 @@ export function isBlockedDuringMaintenance(input: MaintenanceCheckInput): boolea
 
       // /start — plain start is harmless; a giveaway deep link is a claim.
       if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
-        return /^\/start(?:@\w+)?\s+giveaway_/i.test(text);
+        return /^\/start(?:@\w+)?\s+(?:giveaway_|redeem_)/i.test(text);
       }
       // /claim CODE is a claim.
       if (/^\/claim(?:@\w+)?(?:\s|$)/i.test(text)) return true;
+      // Website giveaway-code redemption is a claim too.
+      if (/^\/redeemgiveaway(?:@\w+)?(?:\s|$)/i.test(text)) return true;
 
       // Anything else is free text. It only does something if the user is
       // mid-flow (giveaway wizard, redeem code, payout address...) — and every
