@@ -15,6 +15,19 @@ services:
     command: >
       sh -c "npx prisma migrate deploy && npm start"
 
+  web:
+    build: .
+    restart: always
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    command: npm run web
+
   worker-payout:
     build: .
     restart: always
@@ -80,4 +93,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  
