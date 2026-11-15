@@ -21,12 +21,21 @@ const PUBLIC_DIR = process.env.WEB_PUBLIC_DIR
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const DEVICE_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
+/** Real client IP. Uses X-Forwarded-For counted from the RIGHT by the number of trusted proxy hops. */
+function clientIp(req: Request): string | null {
+  const hops = webConfig().trustProxy;
+  const xff = String(req.get('x-forwarded-for') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  if (typeof hops === 'number' && hops > 0 && xff.length) return xff[Math.max(0, xff.length - hops)];
+  return req.socket.remoteAddress ?? null;
+}
+const isHttps = (req: Request) => req.get('x-forwarded-proto') === 'https' || req.secure;
+
 function signalsOf(req: Request): RequestSignals {
   const cfg = webConfig();
   const dev = String(req.get('x-veylo-device') ?? '');
   const ua = String(req.get('user-agent') ?? '');
   return {
-    ipHash: req.ip ? hashIp(cfg.hashSecret, req.ip) : null,
+    ipHash: clientIp(req) ? hashIp(cfg.hashSecret, clientIp(req)!) : null,
     deviceHash: DEVICE_RE.test(dev) ? hashDevice(cfg.hashSecret, dev) : null,
     uaHash: ua ? hashUa(cfg.hashSecret, ua) : null,
   };
@@ -48,11 +57,13 @@ function limit(name: string, max: (cfg: ReturnType<typeof webConfig>) => number,
   };
 }
 
-export function createApp() {
+/**
+ * All website routes as a Router, so they can be mounted on the bot's existing
+ * webhook server (same service, same URL) OR run standalone via createApp().
+ */
+export function createWebRouter(): express.Router {
   const cfg = webConfig();
-  const app = express();
-  app.set('trust proxy', cfg.trustProxy);
-  app.disable('x-powered-by');
+  const app = express.Router();
 
   // ── Security headers + (optional) CORS for a separately hosted frontend ──
   app.use((req, res, next) => {
@@ -66,7 +77,7 @@ export function createApp() {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    if (req.secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    if (isHttps(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     const origin = req.get('origin');
     if (origin && cfg.siteUrl && origin === cfg.siteUrl) {
       res.setHeader('Access-Control-Allow-Origin', origin);
@@ -82,7 +93,7 @@ export function createApp() {
 
   const api = express.Router();
   api.use(express.json({ limit: '2kb' }));
-  api.use(limit('api', (c) => c.rl.apiPerIpMinute, 60_000, (r) => (r.ip ? hashIp(cfg.hashSecret, r.ip) : null)));
+  api.use(limit('api', (c) => c.rl.apiPerIpMinute, 60_000, (r) => (clientIp(r) ? hashIp(cfg.hashSecret, clientIp(r)!) : null)));
   api.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
 
   api.get('/config', (_req, res) => {
@@ -120,7 +131,7 @@ export function createApp() {
   // The central feature: no account, no login, no Telegram needed.
   api.post(
     '/giveaways/:slug/claim-code',
-    limit('claim:ip', (c) => c.rl.claimPerIpHour, 3_600_000, (r) => (r.ip ? hashIp(cfg.hashSecret, r.ip) : null)),
+    limit('claim:ip', (c) => c.rl.claimPerIpHour, 3_600_000, (r) => (clientIp(r) ? hashIp(cfg.hashSecret, clientIp(r)!) : null)),
     limit('claim:dev', (c) => c.rl.claimPerDeviceHour, 3_600_000, (r) => {
       const d = String(r.get('x-veylo-device') ?? '');
       return DEVICE_RE.test(d) ? hashDevice(cfg.hashSecret, d) : null;
@@ -164,7 +175,7 @@ export function createApp() {
     }).replace(/</g, '\\u003c');
 
   async function page(req: Request, res: Response, meta?: { title: string; desc: string }) {
-    const base = cfg.siteUrl ?? `${req.protocol}://${req.get('host')}`;
+    const base = cfg.siteUrl ?? `${isHttps(req) ? 'https' : req.protocol}://${req.get('host')}`;
     const title = meta?.title ?? 'VEYLO — Discover Giveaways. Claim Rewards.';
     const desc = meta?.desc ?? 'Discover active giveaways, claim your code, and complete your reward through the VEYLO Telegram bot.';
     const html = shell()
@@ -200,14 +211,29 @@ export function createApp() {
   return app;
 }
 
-export function startWebServer(): void {
-  const cfg = webConfig();
-  const app = createApp();
+export function createApp() {
+  const app = express();
+  app.disable('x-powered-by');
+  app.use(createWebRouter());
+  return app;
+}
+
+let maintenanceStarted = false;
+/** Reservation expiry cleanup timer (idempotent; safe to call more than once). */
+export function startWebMaintenance(): void {
+  if (maintenanceStarted) return;
+  maintenanceStarted = true;
   const sweep = () => sweepExpired().catch((e) => logger.error(`[web] sweep failed: ${(e as Error).message}`));
   void sweep();
   setInterval(sweep, 60_000).unref();
+}
+
+export function startWebServer(): void {
+  const cfg = webConfig();
+  const app = createApp();
+  startWebMaintenance();
   app.listen(cfg.port, () => logger.info(`VEYLO website listening on :${cfg.port} (site ${cfg.siteUrl ?? 'url from request host'})`));
 }
 
 if (require.main === module) startWebServer();
-    
+  
