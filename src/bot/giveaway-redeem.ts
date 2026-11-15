@@ -37,7 +37,7 @@ async function promptForCode(ctx: Context): Promise<void> {
       `Send the claim code you generated on the VEYLO website.\n\n` +
       `${e('edit')} Example: <code>VEYLO-AB12-CD34-EF56</code>\n\n` +
       `<i>This is for website giveaway codes. Wallet-balance codes use the Wallet menu.</i>`,
-    backKeyboard('main')
+    backKeyboard('giveaway')
   );
 }
 
@@ -178,4 +178,4 @@ export function registerGiveawayRedeem(bot: any): void {
       return next();
     }
   });
-}
+                             }
