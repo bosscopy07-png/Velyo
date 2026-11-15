@@ -13,9 +13,6 @@ export const mainKeyboard = (isAdmin = false) => {
       Markup.button.callback(`${eb('document')} History`, 'history'),
     ],
     [
-      Markup.button.callback(`${eb('gift')} Redeem Giveaway Code`, 'giveaway:redeemcode'),
-    ],
-    [
       Markup.button.callback(`${eb('person')} Account`, 'account'),
       Markup.button.callback(`${eb('help')} Help`, 'help'),
     ],
@@ -47,6 +44,9 @@ export const depositKeyboard = (asset: string) => Markup.inlineKeyboard([
 ]);
 
 export const giveawayTypeKeyboard = Markup.inlineKeyboard([
+  [
+    Markup.button.callback(`${eb('gift')} Redeem Giveaway Code`, 'giveaway:redeemcode'),
+  ],
   [
     Markup.button.callback(`${eb('person')} Single Claim`, 'giveaway:single'),
     Markup.button.callback(`${eb('people')} Multiple Claim`, 'giveaway:multiple'),
