@@ -13,6 +13,7 @@ import { registerBroadcastAdmin } from '../admin/broadcast';
 import { registerUserAdmin } from '../admin/users';
 import { registerGiveawayRedeem } from './giveaway-redeem';
 import { registerWebFlagsAdmin } from '../admin/web-flags';
+import { registerAdminCodeCreate } from '../admin/code-create';
 import { broadcastService } from '../services/broadcast';
 import { depositSessionService } from '../services/deposit-session';
 import { treasuryMonitor } from '../services/treasury';
@@ -38,6 +39,8 @@ bot.use(securityMiddleware);
 // commands/callbacks below so it can intercept /start redeem_*, the code text
 // step, and payout:confirm, then hand everything else on via next().
 registerGiveawayRedeem(bot);
+// Fixes admin "Create Code" (wallet redeem codes): must precede registerAdminCommands.
+registerAdminCodeCreate(bot);
 
 // Commands
 bot.command('start', handleStart);
@@ -241,4 +244,4 @@ async function shutdown(signal: string): Promise<void> {
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
-        
+  
