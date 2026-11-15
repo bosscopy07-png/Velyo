@@ -1,3 +1,4 @@
+
 import { Context } from 'telegraf';
 import { Markup } from 'telegraf';
 import { prisma } from '../../database';
@@ -362,7 +363,7 @@ export function registerCallbacks(bot: any): void {
     await ctx.answerCbQuery();
     await editMainMessage(
       ctx,
-      `${e('gift')} <b>CREATE GIVEAWAY</b>\n\nChoose your giveaway type.`,
+      `${e('gift')} <b>GIVEAWAY</b>\n\nRedeem a giveaway code, or create your own giveaway.\n\n<b>Create a giveaway — choose a type:</b>`,
       giveawayTypeKeyboard
     );
   }));
@@ -585,6 +586,15 @@ bot.action('help', guard(async (ctx: Context) => {
 
       const amountPerUser = amount / maxClaimers;
 
+      // VEYLO website page for this giveaway (null when the website isn't configured).
+      let webUrl: string | null = null;
+      try {
+        const { webGiveawayUrl } = await import('../../web/link');
+        webUrl = await webGiveawayUrl(giveawayId);
+      } catch (err) {
+        logger.warn(`Website link unavailable: ${(err as Error).message}`);
+      }
+
       // Share URL opens Telegram's chat picker — the recipient gets the link
       // as a normal message, so tapping it opens the bot FRESH and the
       // ?start= payload is actually delivered.
@@ -596,9 +606,11 @@ bot.action('help', guard(async (ctx: Context) => {
         formatGiveawayCreatedMessage(asset, amount, maxClaimers, amountPerUser, secureCode) +
         (appliedCredit > 0
           ? `\n✨ Your rewards covered <b>${appliedCredit.toFixed(6)} ${asset}</b> of the platform fee.`
-          : ''),
+          : '') +
+        (webUrl ? `\n\n🌐 <b>Website link:</b>\n<code>${webUrl}</code>` : ''),
         Markup.inlineKeyboard([
           [Markup.button.url(`${eb('gift')} Share Giveaway`, shareUrl)],
+          ...(webUrl ? [[Markup.button.url('🌐 Open on Website', webUrl)]] : []),
           [Markup.button.callback(`${eb('copy')} Copy Link`, `giveaway:copy:${secureCode}`)],
           [Markup.button.callback(`${eb('chart')} View Stats`, `giveaway:stats:${giveawayId}`)],
           [Markup.button.callback(`${eb('cancel')} Cancel Giveaway`, `giveaway:cancel:${giveawayId}`)],
@@ -618,4 +630,5 @@ bot.action('help', guard(async (ctx: Context) => {
     await ctx.answerCbQuery(`Link: ${link}`, { show_alert: true });
   }));
           }
+
         
