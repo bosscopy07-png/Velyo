@@ -75,10 +75,27 @@ async function startBot(): Promise<void> {
       app.use(express.json());
       app.use(await bot.createWebhook({ domain: config.WEBHOOK_URL }));
 
+      // VEYLO website on the SAME server/URL as the bot (no second service needed).
+      // Isolated: a website problem can never stop the bot from starting.
+      if (process.env.WEB_IN_BOT !== 'false') {
+        try {
+          const web = await import('../web/server');
+          app.use(web.createWebRouter());
+          web.startWebMaintenance();
+          logger.info('VEYLO website mounted on the bot server');
+        } catch (err) {
+          logger.error(`Website failed to mount (bot continues): ${(err as Error).message}`);
+        }
+      }
+
       httpServer = app.listen(config.WEBHOOK_PORT, () => {
         logger.info(`Webhook server running on port ${config.WEBHOOK_PORT}`);
       });
     } else {
+      if (process.env.WEB_IN_BOT !== 'false') {
+        try { (await import('../web/server')).startWebServer(); }
+        catch (err) { logger.error(`Website failed to start (bot continues): ${(err as Error).message}`); }
+      }
       await bot.launch();
       pollingStarted = true;
       logger.info('Bot started in polling mode');
@@ -244,4 +261,4 @@ async function shutdown(signal: string): Promise<void> {
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
-  
+      
