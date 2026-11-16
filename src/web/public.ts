@@ -129,7 +129,7 @@ export async function getPublicGiveaway(slug: string): Promise<{ id: string; vie
   const id = await resolveSlug(slug);
   if (!id) return null;
   const row = (await prisma.giveaway.findFirst({
-    where: { id, ...scopeWhere(), status: { in: [...LISTABLE_DB_STATUSES] } },
+    where: { id, status: { in: [...LISTABLE_DB_STATUSES] } }, // reachable by its private link whatever the list scope
     select: {
       id: true, asset: true, totalAmount: true, amountPerUser: true, maxClaimers: true,
       claimedCount: true, status: true, expiresAt: true, createdAt: true,
@@ -141,29 +141,40 @@ export async function getPublicGiveaway(slug: string): Promise<{ id: string; vie
 
 export interface PlatformStats {
   activeGiveaways: number;
-  rewardsDelivered: number;
-  distributed: { asset: string; total: string; count: number }[];
+  /** null = hidden (below WEB_STATS_MIN_SHOW). Numbers are always real; nothing is inflated. */
+  giveawaysHosted: number | null;
+  rewardsDelivered: number | null;
+  distributed: { asset: string; total: string; count: number }[] | null;
 }
 
 let statsCache: { at: number; value: PlatformStats } | null = null;
 
-/** Real aggregates only. 30s micro-cache (display data — never used to authorise a claim). */
+/** Real aggregates only, cached (default 24h). Display data — never used to authorise a claim. */
 export async function platformStats(): Promise<PlatformStats> {
-  if (statsCache && Date.now() - statsCache.at < 30_000) return statsCache.value;
-  const [active, paid] = await Promise.all([
+  const cfg = webConfig();
+  if (statsCache && Date.now() - statsCache.at < cfg.stats.cacheMs) return statsCache.value;
+  const [active, hosted, paid] = await Promise.all([
     prisma.giveaway.count({
       where: { ...scopeWhere(), status: 'ACTIVE', OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     }),
+    prisma.giveaway.count({ where: { status: { in: [...LISTABLE_DB_STATUSES] } } }),
     prisma.$queryRaw<{ asset: string; count: number; total: string }[]>`
       SELECT g.asset, COUNT(*)::int AS count, SUM(g."amountPerUser")::text AS total
         FROM giveaway_claims c JOIN giveaways g ON g.id = c."giveawayId"
        WHERE c.status = 'PAID' GROUP BY g.asset ORDER BY g.asset`,
   ]);
+  const delivered = paid.reduce((n, r) => n + r.count, 0);
+  const show = (n: number) => (n >= cfg.stats.minShow ? n : null);
   const value: PlatformStats = {
     activeGiveaways: active,
-    rewardsDelivered: paid.reduce((n, r) => n + r.count, 0),
-    distributed: paid.map((r) => ({ asset: r.asset, count: r.count, total: trimDecimal(r.total) })),
+    giveawaysHosted: show(hosted),
+    rewardsDelivered: show(delivered),
+    distributed:
+      cfg.stats.showPayoutTotal && delivered >= cfg.stats.minShow
+        ? paid.map((r) => ({ asset: r.asset, count: r.count, total: trimDecimal(r.total) }))
+        : null,
   };
   statsCache = { at: Date.now(), value };
   return value;
-}
+        }
+    
