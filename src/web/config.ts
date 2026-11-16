@@ -18,7 +18,7 @@ const int = (d: number) =>
 const url = z.string().url().optional().or(z.literal('').transform(() => undefined));
 
 const schema = z.object({
-  WEB_PORT: int(8080),
+  WEB_PORT: int(Number(process.env.PORT) || 8080), // Render/Heroku-style hosts inject PORT
   PUBLIC_WEBSITE_URL: url,
   API_BASE_URL: z.string().optional().default(''), // '' = same origin
   TELEGRAM_BOT_URL: url,
@@ -29,7 +29,7 @@ const schema = z.object({
   TRUST_PROXY: z.string().optional().default('1'),
 
   RESERVATION_MINUTES: int(10),
-  WEB_LISTING_SCOPE: z.enum(['all', 'admins']).optional().default('all'),
+  WEB_LISTING_SCOPE: z.enum(['all', 'admins']).optional().default('admins'),
   WEB_CLAIM_ENABLED: bool(true),
 
   // Rate limits (fixed windows, Redis-backed)
@@ -37,6 +37,11 @@ const schema = z.object({
   WEB_RL_CLAIM_PER_DEVICE_HOUR: int(6),
   WEB_RL_API_PER_IP_MINUTE: int(120),
   WEB_MAX_RESERVATIONS_PER_DEVICE_DAY: int(3),
+
+  // Public statistics (real numbers only; these just control what is SHOWN)
+  WEB_STATS_CACHE_MINUTES: int(1440),
+  WEB_STATS_MIN_SHOW: int(25),
+  WEB_SHOW_PAYOUT_TOTAL: bool(false),
 
   // Anti-abuse
   DUPLICATE_WALLET_ENFORCEMENT: bool(true),
@@ -74,6 +79,7 @@ function build() {
       apiPerIpMinute: e.WEB_RL_API_PER_IP_MINUTE,
       maxReservationsPerDeviceDay: e.WEB_MAX_RESERVATIONS_PER_DEVICE_DAY,
     },
+    stats: { cacheMs: e.WEB_STATS_CACHE_MINUTES * 60_000, minShow: e.WEB_STATS_MIN_SHOW, showPayoutTotal: e.WEB_SHOW_PAYOUT_TOTAL },
     duplicateWalletEnforcement: e.DUPLICATE_WALLET_ENFORCEMENT,
     codeFailLimit: e.WEB_CODE_FAIL_LIMIT,
     codeFailWindowMs: e.WEB_CODE_FAIL_WINDOW_MINUTES * 60_000,
