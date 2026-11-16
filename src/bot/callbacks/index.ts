@@ -1,9 +1,9 @@
-
 import { Context } from 'telegraf';
 import { Markup } from 'telegraf';
 import { prisma } from '../../database';
 import { walletService } from '../../services/wallet';
 import { giveawayService } from '../../services/giveaway';
+import { expiresAtFromHours } from '../../utils/expiry';
 import { redis, setUserSession } from '../../services/redis';
 import { config } from '../../config';
 import { e, eb } from '../../utils/emoji';
@@ -484,7 +484,7 @@ export function registerCallbacks(bot: any): void {
   }));
 
   // === ACCOUNT ===
-  bot.action('account', guard(async (ctx: Context) => {
+bot.action('account', guard(async (ctx: Context) => {
     await ctx.answerCbQuery();
     const from = ctx.from!;
     const user = await prisma.user.findUnique({
@@ -581,7 +581,7 @@ bot.action('help', guard(async (ctx: Context) => {
         asset: asset as any,
         totalAmount: amount,
         maxClaimers,
-        expiresAt: expiryHours ? new Date(Date.now() + parseInt(expiryHours, 10) * 3600000) : undefined,
+        expiresAt: expiresAtFromHours(expiryHours),
       });
 
       const amountPerUser = amount / maxClaimers;
@@ -631,4 +631,3 @@ bot.action('help', guard(async (ctx: Context) => {
   }));
           }
 
-        
