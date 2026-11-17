@@ -1,7 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkRateLimit } from '../services/redis';
+import { checkRateLimit, redis, trackGiveawayView } from '../services/redis';
 import { logger } from '../utils/logger';
 import { webConfig } from './config';
 import { hashAddress, hashDevice, hashIp, hashUa, maskAddress } from './lib/codes';
@@ -10,6 +10,7 @@ import { getPublicGiveaway, listPublicGiveaways, platformStats, resolveSlug } fr
 import { looksLikeEvmAddress } from './lib/address';
 import { staticHandler, sendHtml } from './static';
 import { codeStatus } from './status';
+import { giveawayService } from '../services/giveaway';
 import { reserveSlot, sweepExpired, type RequestSignals } from './reservations';
 
 /**
@@ -132,6 +133,22 @@ export function createWebRouter(): express.Router {
     } catch (err) { logger.error(`[web] detail: ${(err as Error).message}`); res.status(500).json({ error: 'SERVER_ERROR' }); }
   });
 
+  // Counts a website visit in the SAME "Link Opens" counter the bot's giveaway statistics already show.
+  // Deduplicated per visitor per hour so refreshing or polling never inflates it.
+  api.post('/giveaways/:slug/view', async (req, res) => {
+    try {
+      const id = await resolveSlug(req.params.slug);
+      if (!id) return res.status(404).json({ error: 'NOT_FOUND' });
+      const who = signalsOf(req);
+      const visitor = who.deviceHash ?? who.ipHash;
+      if (visitor && (await redis.set(`giveaway:viewseen:${id}:${visitor}`, '1', 'EX', 3600, 'NX')) === 'OK') await trackGiveawayView(id);
+      res.json({ ok: true });
+    } catch (err) {
+      logger.warn(`[web] view tracking skipped: ${(err as Error).message}`);
+      res.json({ ok: true }); // analytics must never produce a user-facing error
+    }
+  });
+
   // The central feature: no account, no login, no Telegram needed — but the visitor
   // must enter the BEP20 wallet that will receive the reward before a code is issued.
   api.post(
@@ -149,6 +166,8 @@ export function createWebRouter(): express.Router {
         if (!id) return res.status(404).json({ error: 'NOT_FOUND' });
         const result = await reserveSlot(id, signalsOf(req), { addressHash: hashAddress(cfg.hashSecret, address), maskedAddress: maskAddress(address) });
         if (result.ok) {
+          // A freshly issued code counts as a claim attempt in the bot's giveaway statistics.
+          if (!result.reused) giveawayService.trackAttempt(id).catch((e) => logger.warn(`[web] attempt tracking skipped: ${(e as Error).message}`));
           const code = result.code;
           return res.json({
             code,
@@ -265,4 +284,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-                        
+    
