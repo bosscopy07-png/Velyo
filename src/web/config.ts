@@ -35,8 +35,11 @@ const schema = z.object({
   // Rate limits (fixed windows, Redis-backed)
   WEB_RL_CLAIM_PER_IP_HOUR: int(20),
   WEB_RL_CLAIM_PER_DEVICE_HOUR: int(6),
-  WEB_RL_API_PER_IP_MINUTE: int(120),
+  WEB_RL_API_PER_IP_MINUTE: int(300),
   WEB_MAX_RESERVATIONS_PER_DEVICE_DAY: int(3),
+  // Max codes (active or redeemed) one network/IP may hold per giveaway. 0 = off.
+  // Mobile carriers share IPs between many people, so keep this >= 2.
+  WEB_MAX_CODES_PER_IP_PER_GIVEAWAY: int(2),
 
   // Public statistics (real numbers only; these just control what is SHOWN)
   WEB_STATS_CACHE_MINUTES: int(1440),
@@ -78,6 +81,7 @@ function build() {
       claimPerDeviceHour: e.WEB_RL_CLAIM_PER_DEVICE_HOUR,
       apiPerIpMinute: e.WEB_RL_API_PER_IP_MINUTE,
       maxReservationsPerDeviceDay: e.WEB_MAX_RESERVATIONS_PER_DEVICE_DAY,
+      maxCodesPerIpPerGiveaway: e.WEB_MAX_CODES_PER_IP_PER_GIVEAWAY,
     },
     stats: { cacheMs: e.WEB_STATS_CACHE_MINUTES * 60_000, minShow: e.WEB_STATS_MIN_SHOW, showPayoutTotal: e.WEB_SHOW_PAYOUT_TOTAL },
     duplicateWalletEnforcement: e.DUPLICATE_WALLET_ENFORCEMENT,
