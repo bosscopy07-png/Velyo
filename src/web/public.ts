@@ -27,7 +27,7 @@ export interface PublicGiveaway {
 }
 
 /** NGN per 1 unit of asset. Pricing is itself cached 10 min in Redis; this adds a 5-min local cache + 2s timeout. */
-async function ngnPerUnit(asset: string): Promise<number | null> {
+export async function ngnPerUnit(asset: string): Promise<number | null> {
   return memo(`ngn:${asset}`, 300_000, async () => {
     try {
       const { pricing } = await import('../services/pricing');
@@ -212,5 +212,5 @@ export async function platformStats(): Promise<PlatformStats> {
   };
   statsCache = { at: Date.now(), value };
   return value;
-  }
-    
+      }
+  
