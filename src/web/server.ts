@@ -4,8 +4,11 @@ import path from 'node:path';
 import { checkRateLimit } from '../services/redis';
 import { logger } from '../utils/logger';
 import { webConfig } from './config';
-import { hashDevice, hashIp, hashUa } from './lib/codes';
-import { getPublicGiveaway, listPublicGiveaways, platformStats } from './public';
+import { hashAddress, hashDevice, hashIp, hashUa, maskAddress } from './lib/codes';
+import { ethers } from 'ethers';
+import { getPublicGiveaway, listPublicGiveaways, platformStats, resolveSlug } from './public';
+import { looksLikeEvmAddress } from './lib/address';
+import { staticHandler, sendHtml } from './static';
 import { reserveSlot, sweepExpired, type RequestSignals } from './reservations';
 
 /**
@@ -128,7 +131,8 @@ export function createWebRouter(): express.Router {
     } catch (err) { logger.error(`[web] detail: ${(err as Error).message}`); res.status(500).json({ error: 'SERVER_ERROR' }); }
   });
 
-  // The central feature: no account, no login, no Telegram needed.
+  // The central feature: no account, no login, no Telegram needed — but the visitor
+  // must enter the BEP20 wallet that will receive the reward before a code is issued.
   api.post(
     '/giveaways/:slug/claim-code',
     limit('claim:ip', (c) => c.rl.claimPerIpHour, 3_600_000, (r) => (clientIp(r) ? hashIp(cfg.hashSecret, clientIp(r)!) : null)),
@@ -138,10 +142,11 @@ export function createWebRouter(): express.Router {
     }),
     async (req, res) => {
       try {
-        // Fresh read every time — availability is NEVER taken from a cache or the client.
-        const g = await getPublicGiveaway(req.params.slug);
-        if (!g) return res.status(404).json({ error: 'NOT_FOUND' });
-        const result = await reserveSlot(g.id, signalsOf(req));
+        const address = String(req.body?.address ?? '').trim();
+        if (!looksLikeEvmAddress(address) || !ethers.isAddress(address)) return res.status(400).json({ error: 'INVALID_ADDRESS' });
+        const id = await resolveSlug(req.params.slug); // id lookup only; status/capacity are decided fresh inside reserveSlot
+        if (!id) return res.status(404).json({ error: 'NOT_FOUND' });
+        const result = await reserveSlot(id, signalsOf(req), { addressHash: hashAddress(cfg.hashSecret, address), maskedAddress: maskAddress(address) });
         if (result.ok) {
           const code = result.code;
           return res.json({
@@ -149,11 +154,15 @@ export function createWebRouter(): express.Router {
             expiresAt: result.expiresAt.toISOString(),
             reservationMinutes: cfg.reservationMinutes,
             botLink: `${cfg.botUrl}?start=redeem_${code}`,
+            maskedAddress: result.maskedAddress,
             reused: result.reused,
           });
         }
-        const map = { FULL: 409, EXPIRED: 410, NOT_ACTIVE: 409, NOT_FOUND: 404, BUSY: 503, DEVICE_LIMIT: 429, DISABLED: 503 } as const;
-        res.status(map[result.error]).json({ error: result.error });
+        const map = {
+          FULL: 409, EXPIRED: 410, NOT_ACTIVE: 409, NOT_FOUND: 404, BUSY: 503, DEVICE_LIMIT: 429, DISABLED: 503,
+          ADDRESS_USED: 409, ALREADY_CLAIMED: 409, IP_LIMIT: 429,
+        } as const;
+        res.status(map[result.error]).json({ error: result.error, mayReopen: result.mayReopen ?? false });
       } catch (err) {
         logger.error(`[web] claim-code: ${(err as Error).message}`);
         res.status(500).json({ error: 'SERVER_ERROR' }); // never leak internals
@@ -165,9 +174,10 @@ export function createWebRouter(): express.Router {
   app.use('/api/v1', api);
 
   // ── Static site + SPA shell (with per-giveaway share metadata) ──
-  app.use(express.static(PUBLIC_DIR, { index: false, maxAge: '1h' }));
+  app.use(staticHandler(PUBLIC_DIR));
 
-  const shell = () => fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  const shellHtml = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8'); // read once, not per request
+  const shell = () => shellHtml;
   const boot = () =>
     JSON.stringify({
       botUrl: cfg.botUrl, channelUrl: cfg.channelUrl, supportUrl: cfg.supportUrl ?? null,
@@ -178,14 +188,14 @@ export function createWebRouter(): express.Router {
     const base = cfg.siteUrl ?? `${isHttps(req) ? 'https' : req.protocol}://${req.get('host')}`;
     const title = meta?.title ?? 'VEYLO — Discover Giveaways. Claim Rewards.';
     const desc = meta?.desc ?? 'Discover active giveaways, claim your code, and complete your reward through the VEYLO Telegram bot.';
-    const html = shell()
-      .replace(/\{\{TITLE\}\}/g, esc(title))
-      .replace(/\{\{DESC\}\}/g, esc(desc))
-      .replace(/\{\{URL\}\}/g, esc(base + req.path))
-      .replace(/\{\{BASE\}\}/g, esc(base))
-      .replace('{{BOOT}}', boot());
-    res.setHeader('Cache-Control', 'no-cache');
-    res.type('html').send(html);
+    sendHtml(req, res, `${base}|${req.path}|${title}|${desc}`, () =>
+      shell()
+        .replace(/\{\{TITLE\}\}/g, esc(title))
+        .replace(/\{\{DESC\}\}/g, esc(desc))
+        .replace(/\{\{URL\}\}/g, esc(base + req.path))
+        .replace(/\{\{BASE\}\}/g, esc(base))
+        .replace('{{BOOT}}', boot())
+    );
   }
 
   app.get('/g/:slug', async (req, res) => {
@@ -236,4 +246,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-  
+    
