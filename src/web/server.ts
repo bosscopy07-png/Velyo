@@ -9,6 +9,7 @@ import { ethers } from 'ethers';
 import { getPublicGiveaway, listPublicGiveaways, platformStats, resolveSlug } from './public';
 import { looksLikeEvmAddress } from './lib/address';
 import { staticHandler, sendHtml } from './static';
+import { codeStatus } from './status';
 import { reserveSlot, sweepExpired, type RequestSignals } from './reservations';
 
 /**
@@ -170,6 +171,24 @@ export function createWebRouter(): express.Router {
     }
   );
 
+  // Status of a code the visitor already holds (shows the payout receipt after redemption).
+  api.post(
+    '/code-status',
+    limit('status:ip', () => 2000, 3_600_000, (r) => (clientIp(r) ? hashIp(cfg.hashSecret, clientIp(r)!) : null)),
+    limit('status:dev', () => 600, 3_600_000, (r) => {
+      const d = String(r.get('x-veylo-device') ?? '');
+      return DEVICE_RE.test(d) ? hashDevice(cfg.hashSecret, d) : null;
+    }),
+    async (req, res) => {
+      try {
+        res.json(await codeStatus(String(req.body?.code ?? '').slice(0, 64)));
+      } catch (err) {
+        logger.error(`[web] code-status: ${(err as Error).message}`);
+        res.status(500).json({ error: 'SERVER_ERROR' });
+      }
+    }
+  );
+
   api.use((_req, res) => res.status(404).json({ error: 'NOT_FOUND' }));
   app.use('/api/v1', api);
 
@@ -246,4 +265,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-    
+                        
