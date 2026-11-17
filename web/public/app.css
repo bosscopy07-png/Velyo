@@ -221,4 +221,82 @@ div.gcard{display:flex;flex-direction:column;padding:22px;cursor:default}
 .receipt b{font-size:22px;letter-spacing:-.02em}
 .receipt code{display:block;font:500 13.5px var(--mono);word-break:break-all;color:var(--tx)}
 .spin--lt{border-color:rgba(234,238,251,.25);border-top-color:var(--c)}
-       
+
+/* ═════════ PREMIUM LAYER ═════════ */
+@property --ang{syntax:"<angle>";inherits:false;initial-value:0deg}
+.grad{background:linear-gradient(100deg,#8B6CFF 0%,#4F8CFF 35%,#22D3EE 60%,#8B6CFF 100%);background-size:220% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shimmer 7s linear infinite}
+@keyframes shimmer{to{background-position:-220% 0}}
+
+/* aurora orbs behind the hero */
+.hero{position:relative;isolation:isolate}
+.hero::before,.hero::after{content:"";position:absolute;z-index:-1;border-radius:50%;filter:blur(70px);pointer-events:none}
+.hero::before{width:420px;height:420px;left:-120px;top:-40px;background:rgba(124,92,255,.28);animation:drift 14s ease-in-out infinite alternate}
+.hero::after{width:360px;height:360px;right:-80px;top:120px;background:rgba(34,211,238,.18);animation:drift 18s ease-in-out infinite alternate-reverse}
+@keyframes drift{to{transform:translate3d(60px,40px,0) scale(1.12)}}
+
+/* primary button sheen */
+.btn--primary{position:relative;overflow:hidden}
+.btn--primary::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.45) 48%,transparent 66%);transform:translateX(-120%);transition:transform .8s var(--ease)}
+.btn--primary:hover::after{transform:translateX(120%)}
+
+/* cursor spotlight on glass cards */
+.glass{--mx:50%;--my:0%}
+.glass::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:0;transition:opacity .3s;background:radial-gradient(420px circle at var(--mx) var(--my),rgba(139,108,255,.16),transparent 55%)}
+.glass:hover::after{opacity:1}
+.gcard{transition:transform .3s var(--ease),box-shadow .3s}
+.gcard:hover{transform:translateY(-3px);box-shadow:0 26px 50px -30px rgba(124,92,255,.6)}
+
+/* featured card: rotating light border */
+.dash{overflow:hidden}
+.dash.glow::before{padding:1.5px;background:conic-gradient(from var(--ang),transparent 0 62%,rgba(139,108,255,.95) 78%,rgba(34,211,238,.95) 90%,transparent 100%);animation:spin 6s linear infinite}
+@keyframes spin{to{--ang:360deg}}
+
+/* scroll reveal (only hides when JS is running) */
+.js .rv{opacity:0;transform:translateY(22px);transition:opacity .7s var(--ease),transform .7s var(--ease)}
+.js .rv.in{opacity:1;transform:none}
+
+/* feature grid */
+.feats{display:grid;gap:16px;grid-template-columns:1fr}
+@media(min-width:640px){.feats{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:980px){.feats{grid-template-columns:repeat(3,1fr)}}
+.feat{padding:26px}
+.feat .ico{margin-bottom:16px}
+.feat h3{font-size:18px;margin-bottom:8px}
+.feat p{color:var(--mut);font-size:15px}
+
+/* create & earn */
+.earn{position:relative;overflow:hidden;border-radius:28px;padding:36px 26px;border:1px solid var(--line2);background:radial-gradient(700px 320px at 0 0,rgba(124,92,255,.32),transparent 60%),radial-gradient(520px 300px at 100% 100%,rgba(34,211,238,.2),transparent 60%),linear-gradient(180deg,var(--surf),var(--bg2))}
+.earn__grid{display:grid;gap:34px;align-items:center}
+@media(min-width:900px){.earn{padding:52px 48px}.earn__grid{grid-template-columns:1.2fr .8fr}}
+.earn h2{font-size:clamp(28px,5.5vw,46px);margin:14px 0}
+.earn p.lead{color:var(--mut);max-width:560px}
+.earn ul{list-style:none;padding:0;display:grid;gap:12px;margin:24px 0 28px}
+.earn li{display:flex;gap:12px;align-items:flex-start;color:var(--tx);font-size:15.5px}
+.earn li .ic{color:var(--c);margin-top:3px}
+.earn li span{color:var(--mut)}
+.orbit{position:relative;width:min(300px,78vw);aspect-ratio:1;margin:auto}
+.orbit::before,.orbit::after{content:"";position:absolute;inset:0;border-radius:50%;border:1px dashed rgba(161,139,255,.35);animation:rot 28s linear infinite}
+.orbit::after{inset:14%;border-color:rgba(34,211,238,.3);animation-direction:reverse;animation-duration:20s}
+.orbit__core{position:absolute;inset:30%;display:grid;place-items:center;border-radius:50%;background:var(--grad);color:#05071A;box-shadow:0 0 70px -6px rgba(124,92,255,.8)}
+.orbit__core .ic{width:42px;height:42px}
+.bub{position:absolute;display:grid;place-items:center;width:50px;height:50px;border-radius:16px;background:rgba(14,21,48,.9);border:1px solid var(--line2);color:var(--v2);animation:floaty 5s ease-in-out infinite}
+.bub:nth-child(2){top:2%;left:50%;margin-left:-25px}
+.bub:nth-child(3){bottom:12%;left:2%;animation-delay:-1.6s;color:var(--c)}
+.bub:nth-child(4){bottom:12%;right:2%;animation-delay:-3.2s;color:var(--ok)}
+@keyframes floaty{50%{transform:translateY(-9px)}}
+.mini{display:flex;flex-wrap:wrap;gap:10px}
+.mini span{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:99px;border:1px solid var(--line);background:rgba(6,9,20,.5);color:var(--mut);font-size:13.5px}
+.mini b{color:var(--tx)}
+
+/* nicer nav brand + pills */
+.brand img{filter:drop-shadow(0 0 14px rgba(124,92,255,.55))}
+.pill--ACTIVE::before{animation:pulse 2s infinite}
+.stat b{background:linear-gradient(180deg,#fff,#B7C3FF);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* footer upgrade */
+.foot{position:relative}
+.foot::before{content:"";position:absolute;left:0;right:0;top:-1px;height:1px;background:linear-gradient(90deg,transparent,rgba(139,108,255,.7),rgba(34,211,238,.7),transparent)}
+@media(prefers-reduced-motion:reduce){.hero::before,.hero::after,.grad,.dash.glow::before,.orbit::before,.orbit::after,.bub{animation:none!important}.js .rv{opacity:1;transform:none}}
+main{overflow-x:clip}
+html{overflow-x:clip}
+                                      
