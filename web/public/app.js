@@ -50,7 +50,7 @@
     const d = deviceId(); if (d) headers['X-Veylo-Device'] = d;
     const res = await fetch(API + path, { ...opts, headers });
     let body = null; try { body = await res.json(); } catch { /* non-JSON */ }
-    if (!res.ok) throw Object.assign(new Error('api'), { status: res.status, code: body && body.error });
+    if (!res.ok) throw Object.assign(new Error('api'), { status: res.status, code: body && body.error, data: body });
     return body;
   }
 
@@ -65,6 +65,8 @@
   const expiryText = (g) => (g.expiresAt ? left(new Date(g.expiresAt) - Date.now()) : 'No expiry');
   const mmss = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
   const pct = (g) => Math.min(100, Math.round(((g.maxClaimers - g.availableSlots) / Math.max(1, g.maxClaimers)) * 100));
+  const ngn = (n) => (n == null ? '' : '≈ ₦' + Number(n).toLocaleString('en-NG'));
+  const ADDR = /^0x[0-9a-fA-F]{40}$/;
   const open = (g) => g.status === 'ACTIVE' || g.status === 'ALMOST_FULL';
 
   // ── partners (links come ONLY from server configuration) ──
@@ -88,14 +90,15 @@
     return h('div', { class: 'ring' }, svg, h('div', { class: 'ring__c' }, h('b', { text: String(g.availableSlots) }), h('span', { text: 'slots left' })));
   }
 
+  // Display-only: giveaways are claimed ONLY through their own link, never from a list.
   function giveawayCard(g) {
-    return h('a', { class: 'glass gcard' + (open(g) ? '' : ' gcard--off'), href: '/g/' + g.slug, 'data-link': true },
+    return h('div', { class: 'glass gcard' + (open(g) ? '' : ' gcard--off') },
       h('div', { class: 'gcard__top' }, h('div', { class: 'ico' }, ic('gift')), pill(g.status)),
       h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })),
-      h('h3', { text: 'per participant · ' + g.title }),
+      h('h3', { text: ['per claim', ngn(g.amountPerUserNgn)].filter(Boolean).join(' · ') }),
       h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: `width:${pct(g)}%` })),
       h('div', { class: 'gcard__foot' },
-        h('span', {}, ic('users'), `${g.availableSlots} of ${g.maxClaimers} left`),
+        h('span', {}, ic('users'), `${g.availableSlots} available · ${g.claimedCount} claimed`),
         h('span', {}, ic('clock'), expiryText(g))));
   }
 
@@ -123,15 +126,15 @@
           ...[['gift', 'Pick a giveaway', 'Live slots and rewards, straight from VEYLO.'], ['copy', 'Copy your code', 'One tap — no account, no wallet, no login.'], ['send', 'Redeem in the bot', 'Confirm your address and get paid via Telegram.']]
             .map(([i, t, d]) => h('div', { class: 'tile', style: 'display:flex;gap:14px;align-items:center;padding:14px' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, h('b', { text: t }), h('span', { text: d }))))));
     }
-    return h('a', { class: 'glass dash', href: '/g/' + g.slug, 'data-link': true, style: 'display:block' },
+    return h('div', { class: 'glass dash' },
       h('div', { class: 'dash__bar' }, h('span', { class: 'eyebrow live', text: 'Featured giveaway' }), pill(g.status)),
       h('div', { class: 'dash__main' }, ring(g),
-        h('div', {}, h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })), h('div', { class: 'meta', text: 'per participant' }))),
+        h('div', {}, h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })), h('div', { class: 'meta', text: ['per claim', ngn(g.amountPerUserNgn)].filter(Boolean).join(' · ') }))),
       h('div', { class: 'tiles' },
-        h('div', { class: 'tile' }, h('span', { text: 'Pool' }), h('b', { text: `${g.totalAmount} ${g.asset}` })),
-        h('div', { class: 'tile' }, h('span', { text: 'Participants' }), h('b', { text: String(g.maxClaimers) })),
+        h('div', { class: 'tile' }, h('span', { text: 'Available' }), h('b', { text: String(g.availableSlots) })),
+        h('div', { class: 'tile' }, h('span', { text: 'Claimed' }), h('b', { text: String(g.claimedCount) })),
         h('div', { class: 'tile' }, h('span', { text: 'Ends' }), h('b', { text: expiryText(g) }))),
-      h('div', { class: 'links' }, h('span', { class: 'btn btn--primary btn--block' }, 'Claim Reward', ic('arrow'))));
+      h('div', { class: 'note' }, ic('lock'), h('span', { text: "Claims open only through the giveaway's own link, shared by its host or in the official channel." })));
   }
 
   // ── pages ──
@@ -197,7 +200,7 @@
     [['all', 'All'], ['active', 'Active'], ['ended', 'Ended']].forEach(([m, l]) => chips.append(h('button', { class: 'chip', type: 'button', 'data-m': m, 'aria-pressed': String(m === mode), text: l, onclick: () => { mode = m; render(); } })));
     app.replaceChildren(h('div', { class: 'view' }, h('section', {}, h('div', { class: 'wrap' },
       h('div', { class: 'row-h' }, h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow live', text: 'Giveaways' }), h('h2', { text: 'Discover giveaways' }),
-        h('p', { text: 'Live data straight from VEYLO. Slot counts and status update as people claim.' })), chips), grid))));
+        h('p', { text: 'Live data straight from VEYLO. To claim, open the giveaway link shared by its host or in the official channel.' })), chips), grid))));
     document.title = 'Giveaways — VEYLO';
     grid.replaceChildren(h('div', { class: 'skel' }));
     api('/giveaways?status=all&limit=30').then((r) => { all = r.giveaways; if (!all.some(open)) mode = 'all'; render(); })
@@ -220,7 +223,7 @@
   }
 
   const stepper = (n) => h('div', { class: 'stepper', 'aria-label': 'Progress' },
-    ...[['Claim', 1], ['Copy', 2], ['Redeem', 3]].flatMap(([l, i], k) => [
+    ...[['Wallet', 1], ['Code', 2], ['Redeem', 3]].flatMap(([l, i], k) => [
       k ? h('i') : null,
       h('span', { class: i < n ? 'done' : i === n ? 'on' : '' }, h('b', { text: i < n ? '✓' : String(i) }), l)]));
 
@@ -232,7 +235,7 @@
     document.title = `${g.title} — VEYLO`;
 
     const vals = {};
-    const fact = (key, label, val) => { const b = h('b', { text: val }); vals[key] = b; return h('div', { class: 'fact' }, h('span', { text: label }), b); };
+    const fact = (key, label, val, sub) => { const b = h('b', { text: val }); vals[key] = b; return h('div', { class: 'fact' }, h('span', { text: label }), b, sub ? h('em', { class: 'ngn', text: sub }) : null); };
     const barFill = h('i'); let pillNode = pill(g.status);
     const slotsL = h('span'), slotsR = h('span');
     const panel = h('div', { class: 'glass panel sticky' });
@@ -242,8 +245,8 @@
       h('h1', { text: g.title }),
       h('p', { class: 'sub', text: 'Claim a code here, then redeem it in the VEYLO Telegram bot to receive your reward.' }),
       h('div', { class: 'facts' },
-        fact('amt', 'Reward per participant', `${g.amountPerUser} ${g.asset}`), fact('pool', 'Total reward pool', `${g.totalAmount} ${g.asset}`),
-        fact('exp', 'Time remaining', ''), fact('avail', 'Available slots', ''), fact('claimed', 'Claimed slots', ''), fact('max', 'Maximum participants', String(g.maxClaimers))),
+        fact('amt', 'Reward per claim', `${g.amountPerUser} ${g.asset}`, ngn(g.amountPerUserNgn)), fact('pool', 'Total reward pool', `${g.totalAmount} ${g.asset}`, ngn(g.totalAmountNgn)),
+        fact('exp', 'Time remaining', ''), fact('avail', 'Available slots', ''), fact('claimed', 'Claimed slots', ''), fact('max', 'Total slots', String(g.maxClaimers))),
       h('div', { class: 'slots' }, slotsL, slotsR), h('div', { class: 'bar', 'aria-hidden': 'true' }, barFill),
       h('div', { class: 'links' }, chanBtn('Official channel', 'btn btn--sm'), supBtn('Support', 'btn btn--sm btn--ghost')));
 
@@ -257,14 +260,13 @@
 
     const ended = () => g.status === 'EXPIRED' || g.status === 'CANCELLED';
 
-    function outcome(title, text) {
-      const others = h('div');
+    function outcome(title, text, again) {
       panel.replaceChildren(h('div', { class: 'pop' },
         h('h2', { text: title }), h('p', { class: 'sub', text }),
-        h('div', { class: 'links' }, h('a', { class: 'btn btn--primary', href: '/giveaways', 'data-link': true }, 'Explore Giveaways', ic('arrow')), chanBtn(), supBtn()),
-        h('div', { class: 'note' }, ic('gift'), h('span', {}, h('b', { text: 'Want to create your own giveaway? ' }), 'Launch your giveaway and distribute rewards with Veylo. ', h('a', { class: 'grad', ...ext(BOOT.botUrl), text: 'Open the VEYLO Telegram bot →' }))),
-        h('h3', { text: 'Other giveaways', style: 'margin:24px 0 14px' }), others));
-      fillGiveaways(others, { limit: 2, exclude: slug, status: 'open' }).then(() => { others.className = others.className.replace('grid--3', '') ; });
+        h('div', { class: 'links' },
+          again ? h('button', { class: 'btn btn--primary', type: 'button', onclick: async () => { await refresh(); decide(); } }, ic('clock'), 'Check again') : null,
+          h('a', { class: again ? 'btn' : 'btn btn--primary', href: '/giveaways', 'data-link': true }, 'Explore Giveaways', ic('arrow')), chanBtn(), supBtn()),
+        h('div', { class: 'note' }, ic('gift'), h('span', {}, h('b', { text: 'Want to create your own giveaway? ' }), 'Launch your giveaway and distribute rewards with Veylo. ', h('a', { class: 'grad', ...ext(BOOT.botUrl), text: 'Open the VEYLO Telegram bot →' })))));
     }
 
     function showSuccess(c) {
@@ -284,7 +286,7 @@
         h('div', { class: 'stack' }, copyBtn, h('a', { class: 'btn btn--block', ...ext(c.botLink || BOOT.botUrl) }, ic('send'), 'Open VEYLO Bot')),
         h('ol', { class: 'how' }, h('li', { text: 'Copy your code.' }),
           h('li', { text: 'Tap Open VEYLO Bot — your code is passed along. Or open Giveaway → “Redeem Giveaway Code” in the bot and paste it.' }),
-          h('li', { text: 'Confirm your wallet address and receive your reward.' })),
+          h('li', { text: 'Confirm the same wallet address' + (c.maskedAddress ? ` (${c.maskedAddress})` : '') + ' and receive your reward.' })),
         h('p', { class: 'fine', text: 'Single-use and tied to this giveaway only. Never share it.' }), h('div', { class: 'links' }, supBtn('Need help?', 'btn btn--sm btn--ghost'))));
       const tick = () => {
         const rem = expiredAt - Date.now(); timer.textContent = mmss(rem);
@@ -295,36 +297,47 @@
 
     function showClaim(notice) {
       let busy = false; const errBox = h('div', { class: 'err', hidden: true, role: 'alert' });
-      const btn = h('button', { class: 'btn btn--primary btn--block', type: 'button' }, ic('gift'), 'Claim Reward');
+      const input = h('input', { class: 'field', type: 'text', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', maxlength: '42', placeholder: '0x… your BEP20 wallet address', 'aria-label': 'Your BEP20 wallet address' });
+      const btn = h('button', { class: 'btn btn--primary btn--block', type: 'button', disabled: true }, ic('gift'), 'Generate Claim Code');
+      const ok = () => ADDR.test(input.value.trim());
+      input.addEventListener('input', () => { btn.disabled = busy || !ok(); errBox.hidden = true; });
       btn.addEventListener('click', async () => {
-        if (busy) return; busy = true; btn.disabled = true; errBox.hidden = true;
+        if (busy || !ok()) return; busy = true; btn.disabled = true; errBox.hidden = true;
         btn.replaceChildren(h('span', { class: 'spin' }), 'Reserving your spot…');
         try {
-          const r = await api(`/giveaways/${encodeURIComponent(slug)}/claim-code`, { method: 'POST', body: '{}' });
+          const r = await api(`/giveaways/${encodeURIComponent(slug)}/claim-code`, { method: 'POST', body: JSON.stringify({ address: input.value.trim() }) });
           store.set('veylo_code_' + slug, r); showSuccess(r); refresh();
         } catch (e) {
-          busy = false; btn.disabled = false; btn.replaceChildren(ic('gift'), 'Claim Reward');
-          if (e.code === 'FULL') { await refresh(); return outcomeFull(); }
+          busy = false; btn.disabled = !ok(); btn.replaceChildren(ic('gift'), 'Generate Claim Code');
+          if (e.code === 'FULL') { await refresh(); return outcomeFull(e.data && e.data.mayReopen); }
           if (e.code === 'EXPIRED') { await refresh(); return outcomeEnded(); }
           errBox.textContent = ({
+            INVALID_ADDRESS: 'That doesn’t look like a valid BEP20 wallet address. Please copy it again from your wallet app.',
             NOT_ACTIVE: 'This giveaway is no longer accepting claims.', RATE_LIMITED: 'Too many requests. Please wait a little and try again.',
-            DEVICE_LIMIT: 'You have requested several codes for this giveaway. Please use your existing code or try again later.',
-            BUSY: 'Lots of people are claiming right now. Please tap Claim Reward again.', DISABLED: 'Claims are temporarily unavailable.',
+            DEVICE_LIMIT: 'This device already has a code for this giveaway. Use that code, or try again after it expires.',
+            IP_LIMIT: 'The maximum number of claims from this network has been reached for this giveaway.',
+            ADDRESS_USED: 'A code for this wallet is already active. Please use the device where you created it.',
+            ALREADY_CLAIMED: 'This wallet or device has already claimed this giveaway. Each person can claim once.',
+            BUSY: 'Lots of people are claiming right now. Please tap Generate Claim Code again.', DISABLED: 'Claims are temporarily unavailable.',
           })[e.code] || 'Something went wrong. Please try again.';
           errBox.hidden = false;
         }
       });
       panel.replaceChildren(h('div', { class: 'pop' }, stepper(1), h('h2', { text: 'Claim your reward' }),
-        h('p', { class: 'sub', text: notice || `Reserve a spot and get a single-use code valid for ${BOOT.reservationMinutes} minutes. No sign-up needed.` }),
-        btn, errBox, h('p', { class: 'fine', text: 'Your code is redeemed in the VEYLO Telegram bot, where you confirm your wallet address.' }),
+        h('p', { class: 'sub', text: notice || 'Enter the wallet address that will receive your reward. Your claim code is generated right after.' }),
+        h('label', { class: 'lbl', text: 'BEP20 wallet address (BNB Smart Chain)' }), input,
+        h('p', { class: 'fine', text: 'Open your wallet app, copy your BEP20 address and paste it here. Your reward is sent to this exact address — double-check it. You’ll use the same address in the bot.' }),
+        btn, errBox,
         h('div', { class: 'links' }, botBtn('Open VEYLO Bot', 'btn btn--sm'), supBtn('Support', 'btn btn--sm btn--ghost'))));
     }
 
-    const outcomeFull = () => outcome('This giveaway is full', "This giveaway has filled all available slots. Don't miss the next opportunity. Explore other giveaways or create your own with Veylo.");
+    const outcomeFull = (reopen) => (reopen
+      ? outcome('Just missed it — every spot is taken', "You were a moment too late: all spots are currently claimed. Codes that aren't redeemed within " + BOOT.reservationMinutes + " minutes expire and the spot opens up again, so it's worth checking back shortly.", true)
+      : outcome('This giveaway is full', "This giveaway has filled all available slots. Don't miss the next opportunity. Explore other giveaways or create your own with Veylo."));
     const outcomeEnded = () => outcome(g.status === 'CANCELLED' ? 'This giveaway was cancelled' : 'This giveaway has expired', 'Claims are closed for this giveaway. Explore other active giveaways or follow the channel for the next one.');
 
     function decide() {
-      if (g.status === 'FULL') return outcomeFull();
+      if (g.status === 'FULL') return outcomeFull(g.reopenPossible);
       if (ended()) return outcomeEnded();
       const saved = store.get('veylo_code_' + slug);
       if (saved && new Date(saved.expiresAt) > Date.now()) return showSuccess(saved);
@@ -341,9 +354,10 @@
     decide();
     timers.push(setInterval(() => { vals.exp.textContent = expiryText(g); }, 1000));
     timers.push(setInterval(async () => {
+      if (document.hidden) return; // idle tabs don't poll
       const changed = await refresh();
       if (changed && !document.querySelector('#code')) decide();
-    }, 20000));
+    }, 25000 + Math.floor(Math.random() * 10000))); // jitter spreads load
   }
 
   // ── router ──
@@ -374,4 +388,4 @@
   document.getElementById('yr').textContent = new Date().getFullYear();
   route();
 })();
-        
+            
