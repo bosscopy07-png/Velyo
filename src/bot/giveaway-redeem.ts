@@ -3,6 +3,8 @@ import { prisma } from '../database';
 import { getUserSession, setUserSession, clearUserSession } from '../services/redis';
 import { redeemWebCode, type RedeemResult } from '../web/redeem';
 import { registerPayoutAddress } from '../web/antiabuse';
+import { webConfig } from '../web/config';
+import { hashAddress } from '../web/lib/codes';
 import { handleStart } from './commands/start';
 import { backKeyboard } from './keyboards/main';
 import { editMainMessage } from './utils/editMainMessage';
@@ -41,13 +43,14 @@ async function promptForCode(ctx: Context): Promise<void> {
   );
 }
 
-async function promptForAddress(ctx: Context, asset: string, claimId: string): Promise<void> {
+async function promptForAddress(ctx: Context, asset: string, claimId: string, masked?: string | null): Promise<void> {
   await setUserSession(ctx.from!.id.toString(), { state: 'awaiting_payout_address', claimId, asset });
   await editMainMessage(
     ctx,
     `${e('party')} <b>CODE VERIFIED — SPOT SECURED!</b>\n\n` +
       `Reward: <b>${asset}</b> payout pending.\n\n` +
       `${e('deposit')} <b>SEND YOUR ${asset} BEP20 WALLET ADDRESS</b>\n\n` +
+      (masked ? `🔒 Use the same wallet you entered on the website: <code>${masked}</code>\n\n` : '') +
       `Type or paste the address below.\n\n` +
       `⚠️ Must support BNB Smart Chain (BEP20)`,
     backKeyboard('main')
@@ -70,11 +73,11 @@ const FAIL_COPY: Record<string, string> = {
 async function render(ctx: Context, result: RedeemResult): Promise<void> {
   const tg = ctx.from!.id.toString();
   if (result.ok) {
-    await promptForAddress(ctx, result.asset, result.claimId);
+    await promptForAddress(ctx, result.asset, result.claimId, result.maskedAddress);
     return;
   }
   if (result.code === 'ALREADY_CLAIMED' && result.resumable && result.claimId && result.asset) {
-    await promptForAddress(ctx, result.asset, result.claimId);
+    await promptForAddress(ctx, result.asset, result.claimId, result.maskedAddress);
     return;
   }
   if (result.code === 'INVALID') {
@@ -158,6 +161,19 @@ export function registerGiveawayRedeem(bot: any): void {
       const claim = await prisma.giveawayClaim.findUnique({ where: { id: claimId }, select: { status: true, userId: true } });
       if (!claim || claim.status !== 'RESERVED') return next();
 
+      // The wallet typed on the website is bound to the code: the payout address must match it.
+      const booked = await prisma.giveawayReservation.findFirst({ where: { claimId }, select: { addressHash: true, maskedAddress: true } });
+      if (booked?.addressHash && hashAddress(webConfig().hashSecret, address) !== booked.addressHash) {
+        await ctx.answerCbQuery('Wallet does not match the website', { show_alert: true });
+        await setUserSession(ctx.from!.id.toString(), { state: 'awaiting_payout_address', claimId, asset: (session as any).asset });
+        await editMainMessage(
+          ctx,
+          `${e('warning')} <b>WALLET DOES NOT MATCH</b>\n\nThis claim code was created for the wallet you entered on the website${booked.maskedAddress ? `: <code>${booked.maskedAddress}</code>` : ''}.\n\nSend that same address to continue.`,
+          backKeyboard('main')
+        );
+        return;
+      }
+
       const decision = await registerPayoutAddress({ claimId, address });
       if (decision.outcome !== 'DUPLICATE') return next();
 
@@ -178,4 +194,4 @@ export function registerGiveawayRedeem(bot: any): void {
       return next();
     }
   });
-                             }
+                                           }
