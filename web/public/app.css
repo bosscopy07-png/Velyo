@@ -214,4 +214,11 @@ div.gcard{display:flex;flex-direction:column;padding:22px;cursor:default}
 .lbl{display:block;font-size:13px;font-weight:600;color:var(--mut);margin-bottom:8px}
 .panel .field+.fine{margin:10px 0 16px}
 .ngn{display:block;font-style:normal;font-size:12.5px;color:var(--c);margin-top:2px}
-      
+
+.receipt{display:grid;gap:10px;margin:18px 0}
+.receipt>div{padding:14px 16px;border-radius:var(--r2);background:rgba(6,9,20,.55);border:1px solid var(--line)}
+.receipt span{display:block;font-size:12.5px;color:var(--mut);margin-bottom:4px}
+.receipt b{font-size:22px;letter-spacing:-.02em}
+.receipt code{display:block;font:500 13.5px var(--mono);word-break:break-all;color:var(--tx)}
+.spin--lt{border-color:rgba(234,238,251,.25);border-top-color:var(--c)}
+       
