@@ -659,3 +659,28 @@ model DuplicateEvidence {
   @@index([currentClaimId])
   @@map("duplicate_evidence")
 }
+/// One temporary slot hold created from the website. NOT a claim.
+model GiveawayReservation {
+  id            String            @id @default(cuid())
+  giveawayId    String
+  status        ReservationStatus @default(ACTIVE)
+  expiresAt     DateTime
+  ipHash        String?
+  deviceHash    String?
+  uaHash        String?
+  addressHash   String?
+  maskedAddress String?
+  claimId       String?
+  createdAt     DateTime          @default(now())
+  convertedAt   DateTime?
+  releasedAt    DateTime?
+
+  code GiveawayWebCode?
+
+  @@index([giveawayId, status, expiresAt])
+  @@index([giveawayId, ipHash])
+  @@index([giveawayId, deviceHash])
+  @@index([giveawayId, addressHash])
+  @@index([status, expiresAt])
+  @@map("giveaway_reservations")
+}
