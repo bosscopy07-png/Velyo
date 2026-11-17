@@ -4,6 +4,7 @@
   const API = (BOOT.apiBase || '') + '/api/v1';
   const app = document.getElementById('app');
   const NS = 'http://www.w3.org/2000/svg';
+  document.documentElement.classList.add('js');
 
   // ── tiny DOM helpers (text always via textContent → no HTML injection) ──
   function h(tag, attrs, ...kids) {
@@ -127,7 +128,7 @@
           ...[['gift', 'Pick a giveaway', 'Live slots and rewards, straight from VEYLO.'], ['copy', 'Copy your code', 'One tap — no account, no wallet, no login.'], ['send', 'Redeem in the bot', 'Confirm your address and get paid via Telegram.']]
             .map(([i, t, d]) => h('div', { class: 'tile', style: 'display:flex;gap:14px;align-items:center;padding:14px' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, h('b', { text: t }), h('span', { text: d }))))));
     }
-    return h('div', { class: 'glass dash' },
+    return h('div', { class: 'glass dash glow' },
       h('div', { class: 'dash__bar' }, h('span', { class: 'eyebrow live', text: 'Featured giveaway' }), pill(g.status)),
       h('div', { class: 'dash__main' }, ring(g),
         h('div', {}, h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })), h('div', { class: 'meta', text: ['per claim', ngn(g.amountPerUserNgn)].filter(Boolean).join(' · ') }))),
@@ -166,6 +167,30 @@
               ['send', 'Redeem it in the VEYLO Telegram bot', 'Paste the code in the bot, confirm your wallet address, and receive your reward.']]
             .map(([i, t, d]) => h('div', { class: 'glass step' }, h('div', { class: 'ico' }, ic(i)), h('h3', { text: t }), h('p', { class: 'meta', text: d })))),
         h('div', { class: 'note' }, ic('shield'), h('span', { text: 'Rewards are claimed and paid out entirely inside the official VEYLO Telegram bot. The website only gives you a code — it never asks for your wallet, keys or login.' })))),
+      h('section', {}, h('div', { class: 'wrap' },
+        h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'Why VEYLO' }), h('h2', {}, 'Built for ', h('span', { class: 'grad', text: 'fair, fast' }), ' giveaways'),
+          h('p', { text: 'Every detail is designed so rewards reach real people — quickly, safely and transparently.' })),
+        h('div', { class: 'feats' },
+          ...[['zap', 'Claim in seconds', 'No sign-up. Enter your wallet and get a single-use claim code instantly.'],
+              ['shield', 'Fair by design', 'One claim per wallet in each giveaway. Duplicate attempts are blocked automatically.'],
+              ['lock', 'Single-use codes', 'Every code belongs to one giveaway and can’t be reused or transferred.'],
+              ['send', 'Paid by the official bot', 'Redeem in Telegram and your reward is sent straight to your wallet.'],
+              ['trend', 'Verifiable receipts', 'See the amount, wallet and transaction hash for every payout.'],
+              ['users', 'Light and fast', 'Pages are lightweight and load quickly even on slow mobile networks.']]
+            .map(([i, t, d]) => h('div', { class: 'glass feat' }, h('div', { class: 'ico' }, ic(i)), h('h3', { text: t }), h('p', { text: d })))))),
+      h('section', {}, h('div', { class: 'wrap' }, h('div', { class: 'earn' }, h('div', { class: 'earn__grid' },
+        h('div', {},
+          h('span', { class: 'eyebrow live', text: 'For hosts & communities' }),
+          h('h2', {}, 'Host your own giveaway. ', h('span', { class: 'grad', text: 'Grow with VEYLO.' })),
+          h('p', { class: 'lead', text: 'Create a giveaway in the VEYLO bot, share one link, and let your community claim in seconds. When people who joined through your giveaway go on to host their own, you earn referral rewards.' }),
+          h('ul', {},
+            ...[['Launch in under a minute', 'Set the amount, winners and time right inside Telegram.'],
+                ['Share one link', 'It opens a clean claim page for your community — no sign-ups.'],
+                ['Earn referral rewards', 'Grow your network and earn as your referrals host giveaways.']]
+              .map(([t, d]) => h('li', {}, ic('check'), h('div', {}, h('b', { text: t + ' ' }), h('span', { text: d }))))),
+          h('div', { class: 'hero__cta' }, botBtn('Create a Giveaway'), h('a', { class: 'btn', href: '#how', 'data-link': true }, 'See how it works'))),
+        h('div', { class: 'orbit', 'aria-hidden': 'true' }, h('div', { class: 'orbit__core' }, ic('gift')),
+          h('div', { class: 'bub' }, ic('users')), h('div', { class: 'bub' }, ic('trend')), h('div', { class: 'bub' }, ic('zap'))))))),
       h('section', {}, h('div', { class: 'wrap promo' },
         h('div', { class: 'glass' }, h('div', { class: 'ico' }, ic('send')), h('h3', { text: 'The VEYLO Telegram bot' }),
           h('p', { text: 'Redeem codes, confirm your wallet address and receive rewards — fast, inside Telegram.' }), botBtn('Open VEYLO Bot')),
@@ -185,7 +210,7 @@
       if (s.rewardsDelivered != null) t.push(['users', String(s.rewardsDelivered), 'Rewards delivered']);
       if (s.distributed) t.push(['zap', s.distributed.map((d) => `${d.total} ${d.asset}`).join(' · '), 'Total paid out']);
       if (!t.length) return;
-      stats.replaceChildren(...t.map(([i, v, l]) => h('div', { class: 'glass stat' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, h('b', { text: v }), h('span', { text: l })))));
+      stats.replaceChildren(...t.map(([i, v, l]) => { const b = h('b', { text: v }); if (/^\d+$/.test(v)) countUp(b, Number(v)); return h('div', { class: 'glass stat' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, b, h('span', { text: l }))); }));
       stats.hidden = false;
     }).catch(() => {});
   }
@@ -234,6 +259,9 @@
     try { g = (await api('/giveaways/' + encodeURIComponent(slug))).giveaway; }
     catch (e) { return notFoundView(e.status === 404 ? 'Giveaway not found' : 'Something went wrong'); }
     document.title = `${g.title} — VEYLO`;
+    try { // count this visit once per browser session (the server also de-duplicates per hour)
+      if (!sessionStorage.getItem('veylo_v_' + slug)) { sessionStorage.setItem('veylo_v_' + slug, '1'); api('/giveaways/' + encodeURIComponent(slug) + '/view', { method: 'POST', body: '{}' }).catch(() => {}); }
+    } catch { /* ignore */ }
 
     const vals = {};
     const fact = (key, label, val, sub) => { const b = h('b', { text: val }); vals[key] = b; return h('div', { class: 'fact' }, h('span', { text: label }), b, sub ? h('em', { class: 'ngn', text: sub }) : null); };
@@ -415,6 +443,26 @@
     }, 25000 + Math.floor(Math.random() * 10000))); // jitter spreads load
   }
 
+  // ── polish: scroll reveal, count-up numbers, card spotlight ──
+  const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let io = null;
+  function reveal() {
+    const els = [...document.querySelectorAll('.view .wrap > *, .gcard, .step, .stat, .feat, .earn')].filter((el) => !el.classList.contains('rv'));
+    if (!('IntersectionObserver' in window) || reduce) { els.forEach((el) => el.classList.add('rv', 'in')); return; }
+    io = io || new IntersectionObserver((entries) => entries.forEach((en) => { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } }), { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    els.forEach((el, i) => { el.classList.add('rv'); el.style.transitionDelay = Math.min(i % 6, 5) * 70 + 'ms'; io.observe(el); });
+  }
+  function countUp(el, target) {
+    if (reduce || !Number.isFinite(target) || target < 2) { el.textContent = String(target); return; }
+    const t0 = performance.now(), D = 1100;
+    const step = (t) => { const k = Math.min(1, (t - t0) / D); el.textContent = String(Math.round(target * (1 - Math.pow(1 - k, 3)))); if (k < 1) requestAnimationFrame(step); };
+    requestAnimationFrame(step);
+  }
+  document.addEventListener('pointermove', (ev) => {
+    const c = ev.target.closest && ev.target.closest('.glass'); if (!c) return;
+    const r = c.getBoundingClientRect(); c.style.setProperty('--mx', ev.clientX - r.left + 'px'); c.style.setProperty('--my', ev.clientY - r.top + 'px');
+  }, { passive: true });
+
   // ── router ──
   function route() {
     clearTimers();
@@ -428,6 +476,8 @@
     if (location.hash) setTimeout(() => { const t = document.querySelector(location.hash); if (t) t.scrollIntoView(); }, 60);
     else window.scrollTo(0, 0);
     app.focus({ preventScroll: true });
+    requestAnimationFrame(() => requestAnimationFrame(reveal));
+    setTimeout(reveal, 900); // pick up content that renders after data loads
   }
   document.addEventListener('click', (ev) => {
     const a = ev.target.closest && ev.target.closest('a[data-link]');
@@ -443,4 +493,4 @@
   document.getElementById('yr').textContent = new Date().getFullYear();
   route();
 })();
-                              
+        
