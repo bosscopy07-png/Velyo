@@ -67,6 +67,7 @@
   const pct = (g) => Math.min(100, Math.round(((g.maxClaimers - g.availableSlots) / Math.max(1, g.maxClaimers)) * 100));
   const ngn = (n) => (n == null ? '' : '≈ ₦' + Number(n).toLocaleString('en-NG'));
   const ADDR = /^0x[0-9a-fA-F]{40}$/;
+  const short = (t) => (t && t.length > 20 ? t.slice(0, 10) + '…' + t.slice(-8) : t || '');
   const open = (g) => g.status === 'ACTIVE' || g.status === 'ALMOST_FULL';
 
   // ── partners (links come ONLY from server configuration) ──
@@ -293,6 +294,53 @@
         if (rem <= 0) { store.del('veylo_code_' + slug); showClaim('Your code expired. You can generate a new one if slots are still available.'); }
       };
       tick(); timers.push(setInterval(tick, 1000));
+      timers.push(setInterval(async () => {
+        if (document.hidden) return;
+        try {
+          const st = await api('/code-status', { method: 'POST', body: JSON.stringify({ code: c.code }) });
+          if (st.state === 'REDEEMED') { clearTimers(); showRedeemed(c, st); }
+        } catch { /* keep showing the code */ }
+      }, 8000));
+    }
+
+    // After the code was redeemed in the bot: progress → receipt (amount, wallet, transaction hash).
+    function showRedeemed(c, st) {
+      const paid = st.progress === 'PAID';
+      const body = [stepper(paid ? 4 : 3)];
+      if (paid) {
+        const hashOk = /^0x[0-9a-fA-F]{64}$/.test(st.txHash || '');
+        body.push(h('div', { class: 'tick' }, ic('check')), h('h2', { text: 'Reward received!' }),
+          h('p', { class: 'sub', text: 'Your reward has been sent. Here is your payment receipt.' }),
+          h('div', { class: 'receipt' },
+            h('div', {}, h('span', { text: 'Amount paid' }), h('b', { text: `${st.amount} ${st.asset}` }), st.amountNgn ? h('em', { class: 'ngn', text: ngn(st.amountNgn) }) : null),
+            h('div', {}, h('span', { text: 'Paid to wallet' }), h('code', { text: st.wallet || c.maskedAddress || '' })),
+            hashOk ? h('div', {}, h('span', { text: 'Transaction hash' }), h('code', { text: st.txHash })) : null),
+          h('div', { class: 'stack' },
+            hashOk ? h('button', { class: 'btn btn--primary btn--block', type: 'button', onclick: async (ev) => { const b = ev.currentTarget; const ok = await copyText(st.txHash); b.replaceChildren(ic(ok ? 'check' : 'copy'), ok ? 'Copied!' : 'Press and hold the hash'); setTimeout(() => b.replaceChildren(ic('copy'), 'Copy transaction hash'), 2200); } }, ic('copy'), 'Copy transaction hash') : null,
+            hashOk ? h('a', { class: 'btn btn--block', ...ext('https://bscscan.com/tx/' + st.txHash) }, ic('arrow'), 'View on BscScan') : null,
+            h('a', { class: 'btn btn--block', href: '/giveaways', 'data-link': true }, 'Explore Giveaways')),
+          h('div', { class: 'links' }, chanBtn('Official channel', 'btn btn--sm'), supBtn('Support', 'btn btn--sm btn--ghost')));
+      } else if (st.progress === 'FAILED') {
+        body.push(h('h2', { text: 'This claim couldn’t be completed' }),
+          h('p', { class: 'sub', text: 'Something stopped this claim from being paid. Please contact support so we can help.' }),
+          h('div', { class: 'links' }, supBtn('Contact Support', 'btn btn--primary'), botBtn('Open VEYLO Bot', 'btn')));
+      } else {
+        const proc = st.progress === 'PROCESSING';
+        body.push(h('h2', { text: proc ? 'Payment in progress…' : 'Code redeemed — one last step' }),
+          h('p', { class: 'sub', text: proc ? 'Your payout is being processed. This page updates automatically.' : 'Open the VEYLO bot and confirm your wallet address to receive your reward.' }),
+          proc ? h('div', { class: 'timer' }, h('span', { class: 'spin spin--lt' }), 'Processing') : null,
+          h('div', { class: 'stack' }, botBtn('Open VEYLO Bot', 'btn btn--primary btn--block')));
+      }
+      panel.replaceChildren(h('div', { class: 'pop' }, ...body));
+      if (!paid && st.progress !== 'FAILED') {
+        timers.push(setInterval(async () => {
+          if (document.hidden) return;
+          try {
+            const next = await api('/code-status', { method: 'POST', body: JSON.stringify({ code: c.code }) });
+            if (next.state === 'REDEEMED' && next.progress !== st.progress) { clearTimers(); showRedeemed(c, next); }
+          } catch { /* retry next tick */ }
+        }, 8000));
+      }
     }
 
     function showClaim(notice) {
@@ -340,8 +388,15 @@
       if (g.status === 'FULL') return outcomeFull(g.reopenPossible);
       if (ended()) return outcomeEnded();
       const saved = store.get('veylo_code_' + slug);
-      if (saved && new Date(saved.expiresAt) > Date.now()) return showSuccess(saved);
-      store.del('veylo_code_' + slug); showClaim();
+      if (!saved) return showClaim();
+      return api('/code-status', { method: 'POST', body: JSON.stringify({ code: saved.code }) }).then((st) => {
+        if (st.state === 'ACTIVE') return showSuccess({ ...saved, expiresAt: st.expiresAt });
+        if (st.state === 'REDEEMED') return showRedeemed(saved, st);
+        store.del('veylo_code_' + slug); return showClaim(st.state === 'EXPIRED' ? 'Your previous code expired. Enter your wallet address to get a new one.' : undefined);
+      }).catch(() => {
+        if (new Date(saved.expiresAt) > Date.now()) return showSuccess(saved); // offline: fall back to the local copy
+        store.del('veylo_code_' + slug); return showClaim();
+      });
     }
 
     async function refresh() {
@@ -356,7 +411,7 @@
     timers.push(setInterval(async () => {
       if (document.hidden) return; // idle tabs don't poll
       const changed = await refresh();
-      if (changed && !document.querySelector('#code')) decide();
+      if (changed && !document.querySelector('#code') && !document.querySelector('.receipt')) decide();
     }, 25000 + Math.floor(Math.random() * 10000))); // jitter spreads load
   }
 
@@ -388,4 +443,4 @@
   document.getElementById('yr').textContent = new Date().getFullYear();
   route();
 })();
-            
+                              
