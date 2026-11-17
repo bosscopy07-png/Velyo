@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../database';
 import { webConfig } from './config';
+import { memo } from './cache';
 import { derivePublicStatus, LISTABLE_DB_STATUSES, type PublicStatus } from './lib/public-status';
 
 export interface PublicGiveaway {
@@ -18,6 +19,27 @@ export interface PublicGiveaway {
   claimable: boolean;
   expiresAt: string | null;
   createdAt: string;
+  /** Naira equivalents (null when no live rate is available — then the UI simply hides them). */
+  amountPerUserNgn: number | null;
+  totalAmountNgn: number | null;
+  /** FULL but unredeemed codes may expire and reopen slots. */
+  reopenPossible: boolean;
+}
+
+/** NGN per 1 unit of asset. Pricing is itself cached 10 min in Redis; this adds a 5-min local cache + 2s timeout. */
+async function ngnPerUnit(asset: string): Promise<number | null> {
+  return memo(`ngn:${asset}`, 300_000, async () => {
+    try {
+      const { pricing } = await import('../services/pricing');
+      const v = await Promise.race([
+        pricing.convertToNGN(asset, 1),
+        new Promise<number>((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
+      ]);
+      return Number.isFinite(v) && v > 0 ? v : null;
+    } catch {
+      return null;
+    }
+  });
 }
 
 const SLUG_ALPHABET = 'abcdefghjkmnpqrstvwxyz23456789';
@@ -70,8 +92,11 @@ async function heldByGiveaway(ids: string[]): Promise<Map<string, number>> {
 
 async function toPublic(rows: Row[]): Promise<PublicGiveaway[]> {
   const held = await heldByGiveaway(rows.map((r) => r.id));
+  const rates = new Map<string, number | null>();
+  for (const a of new Set(rows.map((r) => r.asset))) rates.set(a, await ngnPerUnit(a));
   return Promise.all(
     rows.map(async (r) => {
+      const rate = rates.get(r.asset) ?? null;
       const st = derivePublicStatus({
         status: r.status, expiresAt: r.expiresAt, maxClaimers: r.maxClaimers,
         claimedCount: r.claimedCount, activeReservations: held.get(r.id) ?? 0,
@@ -92,6 +117,9 @@ async function toPublic(rows: Row[]): Promise<PublicGiveaway[]> {
         claimable: st.claimable,
         expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
         createdAt: r.createdAt.toISOString(),
+        amountPerUserNgn: rate ? Math.round(Number(r.amountPerUser) * rate) : null,
+        totalAmountNgn: rate ? Math.round(Number(r.totalAmount) * rate) : null,
+        reopenPossible: (held.get(r.id) ?? 0) > 0,
       };
     })
   );
@@ -104,7 +132,11 @@ function scopeWhere(): Prisma.GiveawayWhereInput {
 
 const PRIORITY: Record<PublicStatus, number> = { ACTIVE: 0, ALMOST_FULL: 0, FULL: 1, EXPIRED: 2, CANCELLED: 3 };
 
-export async function listPublicGiveaways(opts: { onlyOpen: boolean; limit: number }): Promise<PublicGiveaway[]> {
+export function listPublicGiveaways(opts: { onlyOpen: boolean; limit: number }): Promise<PublicGiveaway[]> {
+  return memo(`list:${opts.onlyOpen}:${opts.limit}`, 3000, () => listPublicRaw(opts));
+}
+
+async function listPublicRaw(opts: { onlyOpen: boolean; limit: number }): Promise<PublicGiveaway[]> {
   const recent = new Date(Date.now() - 7 * 24 * 3600_000);
   const rows = (await prisma.giveaway.findMany({
     where: {
@@ -125,7 +157,11 @@ export async function listPublicGiveaways(opts: { onlyOpen: boolean; limit: numb
   return list.slice(0, opts.limit);
 }
 
-export async function getPublicGiveaway(slug: string): Promise<{ id: string; view: PublicGiveaway } | null> {
+export function getPublicGiveaway(slug: string): Promise<{ id: string; view: PublicGiveaway } | null> {
+  return memo(`gw:${slug}`, 2000, () => getPublicRaw(slug));
+}
+
+async function getPublicRaw(slug: string): Promise<{ id: string; view: PublicGiveaway } | null> {
   const id = await resolveSlug(slug);
   if (!id) return null;
   const row = (await prisma.giveaway.findFirst({
@@ -176,5 +212,5 @@ export async function platformStats(): Promise<PlatformStats> {
   };
   statsCache = { at: Date.now(), value };
   return value;
-        }
+  }
     
