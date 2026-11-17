@@ -102,8 +102,7 @@ section{padding:60px 0}
 .grid{display:grid;gap:18px;grid-template-columns:1fr}
 @media(min-width:640px){.grid{grid-template-columns:repeat(2,1fr)}}
 @media(min-width:980px){.grid--3{grid-template-columns:repeat(3,1fr)}}
-a.gcard{display:flex;flex-direction:column;padding:22px;transition:transform .3s var(--ease),border-color .3s,box-shadow .3s}
-a.gcard:hover{transform:translateY(-4px);border-color:var(--line2);box-shadow:0 24px 50px -24px rgba(124,92,255,.55)}
+div.gcard{display:flex;flex-direction:column;padding:22px;cursor:default}
 .gcard__top{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .gcard .amt{margin:20px 0 4px}
 .gcard h3{font-size:15px;font-weight:600;color:var(--mut);letter-spacing:0}
@@ -208,3 +207,11 @@ a.gcard:hover{transform:translateY(-4px);border-color:var(--line2);box-shadow:0 
 
 .view{animation:pop .5s var(--ease)}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+.field{width:100%;min-height:52px;padding:0 16px;border-radius:14px;border:1px solid var(--line2);background:rgba(4,6,14,.7);color:var(--tx);font:500 15px var(--mono);outline:none;transition:border-color .2s,box-shadow .2s}
+.field::placeholder{color:var(--dim)}
+.field:focus{border-color:var(--v2);box-shadow:0 0 0 3px rgba(124,92,255,.22)}
+.lbl{display:block;font-size:13px;font-weight:600;color:var(--mut);margin-bottom:8px}
+.panel .field+.fine{margin:10px 0 16px}
+.ngn{display:block;font-style:normal;font-size:12.5px;color:var(--c);margin-top:2px}
+      
