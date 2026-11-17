@@ -10,8 +10,8 @@ export type RedeemFailure =
   | 'BLOCKED' | 'BUSY' | 'RATE_LIMITED' | 'MAINTENANCE' | 'ERROR';
 
 export type RedeemResult =
-  | { ok: true; claimId: string; giveawayId: string; asset: string; amountPerUser: string; resumed: boolean }
-  | { ok: false; code: RedeemFailure; claimId?: string; asset?: string; resumable?: boolean };
+  | { ok: true; claimId: string; giveawayId: string; asset: string; amountPerUser: string; resumed: boolean; maskedAddress: string | null }
+  | { ok: false; code: RedeemFailure; claimId?: string; asset?: string; resumable?: boolean; maskedAddress?: string | null };
 
 const failKey = (tg: string) => `webcode:fail:${tg}`;
 
@@ -92,7 +92,8 @@ export async function redeemWebCode(input: { rawCode: string; userId: string; te
           newValue: { giveawayId: giveaway.id, via: 'web_code' } },
       });
     } else if (existing.status === 'RESERVED' || existing.status === 'ADDRESS_PENDING') {
-      return { ok: false, code: 'ALREADY_CLAIMED', resumable: true, claimId: existing.id, asset: giveaway.asset };
+      const prior = await prisma.giveawayReservation.findFirst({ where: { claimId: existing.id }, select: { maskedAddress: true } });
+      return { ok: false, code: 'ALREADY_CLAIMED', resumable: true, claimId: existing.id, asset: giveaway.asset, maskedAddress: prior?.maskedAddress ?? null };
     } else {
       return { ok: false, code: 'ALREADY_CLAIMED' };
     }
@@ -157,6 +158,6 @@ export async function redeemWebCode(input: { rawCode: string; userId: string; te
     logger.error(`[web] attribution failed (non-fatal): ${(err as Error).message}`);
   }
 
-  return { ok: true, claimId: claim.id, giveawayId: giveaway.id, asset: giveaway.asset, amountPerUser: giveaway.amountPerUser.toString(), resumed: mine };
-     }
-     
+  return { ok: true, claimId: claim.id, giveawayId: giveaway.id, asset: giveaway.asset, amountPerUser: giveaway.amountPerUser.toString(), resumed: mine, maskedAddress: code.reservation.maskedAddress ?? null };
+  }
+  
