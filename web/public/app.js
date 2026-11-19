@@ -78,111 +78,57 @@
   const timers = [];
   const clearTimers = () => { while (timers.length) clearInterval(timers.pop()); };
 
-  // ── components ──
-  function ring(g) {
-    const C = 2 * Math.PI * 46;
-    const val = h('circle', {}); const trk = h('circle', {});
-    const svg = document.createElementNS(NS, 'svg'); svg.setAttribute('viewBox', '0 0 110 110');
-    svg.innerHTML = '<defs><linearGradient id="rg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8B6CFF"/><stop offset="1" stop-color="#22D3EE"/></linearGradient></defs>';
-    const mk = (cls) => { const c = document.createElementNS(NS, 'circle'); c.setAttribute('class', cls); c.setAttribute('cx', '55'); c.setAttribute('cy', '55'); c.setAttribute('r', '46'); return c; };
-    const t = mk('trk'), v = mk('val'); svg.append(t, v);
-    v.style.strokeDasharray = `0 ${C}`;
-    requestAnimationFrame(() => requestAnimationFrame(() => { v.style.strokeDasharray = `${(C * pct(g)) / 100} ${C}`; }));
-    void val; void trk;
-    return h('div', { class: 'ring' }, svg, h('div', { class: 'ring__c' }, h('b', { text: String(g.availableSlots) }), h('span', { text: 'slots left' })));
-  }
-
-  // Display-only: giveaways are claimed ONLY through their own link, never from a list.
-  function giveawayCard(g) {
-    return h('div', { class: 'glass gcard' + (open(g) ? '' : ' gcard--off') },
-      h('div', { class: 'gcard__top' }, h('div', { class: 'ico' }, ic('gift')), pill(g.status)),
-      h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })),
-      h('h3', { text: ['per claim', ngn(g.amountPerUserNgn)].filter(Boolean).join(' · ') }),
-      h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: `width:${pct(g)}%` })),
-      h('div', { class: 'gcard__foot' },
-        h('span', {}, ic('users'), `${g.availableSlots} available · ${g.claimedCount} claimed`),
-        h('span', {}, ic('clock'), expiryText(g))));
-  }
-
-  const emptyState = (title, msg) => h('div', { class: 'empty' }, h('h3', { text: title }), h('p', { text: msg }),
-    h('div', { class: 'links cen' }, chanBtn('Get notified in the channel')));
-
-  async function fillGiveaways(target, { limit, exclude, status } = {}) {
-    target.className = '';
-    target.replaceChildren(h('div', { class: 'skel' }));
-    try {
-      const { giveaways } = await api(`/giveaways?limit=${limit || 12}${status ? '&status=' + status : ''}`);
-      const list = giveaways.filter((g) => g.slug !== exclude);
-      if (!list.length) { target.replaceChildren(emptyState('No active giveaways right now', 'New giveaways are announced in the official channel first.')); return list; }
-      target.className = 'grid grid--3'; target.replaceChildren(...list.map(giveawayCard)); return list;
-    } catch {
-      target.replaceChildren(h('div', { class: 'empty' }, h('p', { text: "We couldn't load giveaways. Please refresh in a moment." }))); return [];
-    }
-  }
-
-  function featuredCard(g) {
-    if (!g) {
-      return h('div', { class: 'glass dash' },
-        h('div', { class: 'dash__bar' }, h('div', { class: 'dots' }, h('i'), h('i'), h('i')), h('span', { text: 'How a claim works' })),
-        h('div', { class: 'stack' },
-          ...[['gift', 'Pick a giveaway', 'Live slots and rewards, straight from VEYLO.'], ['copy', 'Copy your code', 'One tap — no account, no wallet, no login.'], ['send', 'Redeem in the bot', 'Confirm your address and get paid via Telegram.']]
-            .map(([i, t, d]) => h('div', { class: 'tile', style: 'display:flex;gap:14px;align-items:center;padding:14px' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, h('b', { text: t }), h('span', { text: d }))))));
-    }
-    return h('div', { class: 'glass dash glow' },
-      h('div', { class: 'dash__bar' }, h('span', { class: 'eyebrow live', text: 'Featured giveaway' }), pill(g.status)),
-      h('div', { class: 'dash__main' }, ring(g),
-        h('div', {}, h('div', { class: 'amt' }, g.amountPerUser, h('small', { text: g.asset })), h('div', { class: 'meta', text: ['per claim', ngn(g.amountPerUserNgn)].filter(Boolean).join(' · ') }))),
-      h('div', { class: 'tiles' },
-        h('div', { class: 'tile' }, h('span', { text: 'Available' }), h('b', { text: String(g.availableSlots) })),
-        h('div', { class: 'tile' }, h('span', { text: 'Claimed' }), h('b', { text: String(g.claimedCount) })),
-        h('div', { class: 'tile' }, h('span', { text: 'Ends' }), h('b', { text: expiryText(g) }))),
-      h('div', { class: 'note' }, ic('lock'), h('span', { text: "Claims open only through the giveaway's own link, shared by its host or in the official channel." })));
-  }
-
   // ── pages ──
   function homeView() {
     const stats = h('div', { class: 'stats', hidden: true });
-    const feat = h('div', {}, h('div', { class: 'skel', style: 'height:330px' }));
-    const preview = h('div');
     const view = h('div', { class: 'view' },
       h('section', { class: 'hero' }, h('div', { class: 'wrap' },
         h('div', { class: 'hero__grid' },
           h('div', {},
-            h('span', { class: 'eyebrow live', text: 'Giveaways · Rewards · Telegram' }),
-            h('h1', {}, 'Discover Giveaways. Claim Rewards. Experience ', h('span', { class: 'grad', text: 'VEYLO.' })),
-            h('p', { class: 'lead', text: 'Your destination for exciting giveaways and seamless reward distribution. Discover opportunities, claim your code, and complete your reward through the Veylo Telegram bot.' }),
-            h('div', { class: 'hero__cta' }, h('a', { class: 'btn btn--primary', href: '/giveaways', 'data-link': true }, 'Explore Giveaways', ic('arrow')), botBtn('Open VEYLO Bot', 'btn')),
-            h('div', { class: 'trust' }, h('span', {}, ic('zap'), 'No sign-up'), h('span', {}, ic('lock'), 'Single-use codes'), h('span', {}, ic('shield'), 'Paid via the official bot'))),
-          feat),
+            h('span', { class: 'eyebrow live', text: 'Telegram giveaway platform' }),
+            h('h1', {}, 'Create a giveaway. Share the link. ', h('span', { class: 'grad', text: 'Reward your community.' })),
+            h('p', { class: 'lead', text: 'VEYLO is a Telegram giveaway platform. Deposit USDT or BNB, create a giveaway in seconds, and share your link — your community claims and gets paid straight to their wallets.' }),
+            h('div', { class: 'hero__cta' }, botBtn('Create a Giveaway'), chanBtn('Join the Channel')),
+            h('div', { class: 'trust' }, h('span', {}, ic('zap'), 'Create it all in Telegram'), h('span', {}, ic('send'), 'One link to share'), h('span', {}, ic('shield'), 'Paid straight to wallets'))),
+          h('div', { class: 'glass dash glow' },
+            h('div', { class: 'dash__bar' }, h('span', { class: 'eyebrow live', text: 'How a giveaway works' }), h('div', { class: 'dots' }, h('i'), h('i'), h('i'))),
+            h('div', { class: 'stack' },
+              ...[['trend', 'Deposit', 'Add USDT or BNB to your VEYLO wallet in the bot.'], ['gift', 'Create', 'Set the amount, number of winners and how long it runs.'], ['send', 'Share', 'Post your link anywhere. People claim and get paid.']]
+                .map(([i, t, d], k) => h('div', { class: 'tile flowrow' }, h('div', { class: 'ico' }, ic(i)), h('div', {}, h('b', { text: `${k + 1}. ${t}` }), h('span', { text: d }))))),
+            h('div', { class: 'note' }, ic('lock'), h('span', { text: 'Got a giveaway link? Open the link your host shared to claim — there is nothing to browse here.' })))),
         stats)),
-      h('section', {}, h('div', { class: 'wrap' },
-        h('div', { class: 'row-h' }, h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'Live now' }), h('h2', { text: 'Active giveaways' })),
-          h('a', { class: 'btn btn--sm', href: '/giveaways', 'data-link': true }, 'View all', ic('arrow'))),
-        preview)),
       h('section', { id: 'how' }, h('div', { class: 'wrap' },
-        h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'How it works' }), h('h2', { text: 'Three steps to your reward' })),
-        h('div', { class: 'steps' },
-          ...[['gift', 'Discover an active giveaway', 'Browse live giveaways with real reward amounts and slot counts.'],
-              ['copy', 'Generate and copy your claim code', 'No sign-up. Tap Claim Reward and a secure, single-use code is reserved for you.'],
-              ['send', 'Redeem it in the VEYLO Telegram bot', 'Paste the code in the bot, confirm your wallet address, and receive your reward.']]
-            .map(([i, t, d]) => h('div', { class: 'glass step' }, h('div', { class: 'ico' }, ic(i)), h('h3', { text: t }), h('p', { class: 'meta', text: d })))),
-        h('div', { class: 'note' }, ic('shield'), h('span', { text: 'Rewards are claimed and paid out entirely inside the official VEYLO Telegram bot. The website only gives you a code — it never asks for your wallet, keys or login.' })))),
+        h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'How it works' }), h('h2', { text: 'From deposit to payout in four steps' }),
+          h('p', { text: 'Everything is done in the official VEYLO Telegram bot. This website is simply the claim page that opens from a giveaway link.' })),
+        h('div', { class: 'steps steps--4' },
+          ...[['trend', 'Deposit', 'Add USDT or BNB to your VEYLO wallet inside the Telegram bot.'],
+              ['gift', 'Create', 'Choose the reward, how many people can claim, and how long it runs.'],
+              ['send', 'Share', 'Copy your giveaway link and post it in your group, channel or chats.'],
+              ['check', 'Get claimed', 'Your community claims and is paid to their own wallets. You follow it all in your stats.']]
+            .map(([i, t, d]) => h('div', { class: 'glass step' }, h('div', { class: 'ico' }, ic(i)), h('h3', { text: t }), h('p', { class: 'meta', text: d })))))),
+      h('section', { id: 'claim' }, h('div', { class: 'wrap' }, h('div', { class: 'glass claimbox' },
+        h('div', {}, h('span', { class: 'eyebrow', text: 'Received a giveaway link?' }), h('h2', { text: 'Claiming takes under a minute' }),
+          h('ol', { class: 'how' },
+            h('li', { text: 'Open the giveaway link your host shared with you.' }),
+            h('li', { text: 'Enter your BEP20 wallet address to get a single-use claim code.' }),
+            h('li', { text: 'Redeem the code in the VEYLO bot and receive your reward.' }))),
+        h('div', { class: 'stack' }, botBtn('Open VEYLO Bot'), chanBtn('Official channel', 'btn'))))),
       h('section', {}, h('div', { class: 'wrap' },
-        h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'Why VEYLO' }), h('h2', {}, 'Built for ', h('span', { class: 'grad', text: 'fair, fast' }), ' giveaways'),
-          h('p', { text: 'Every detail is designed so rewards reach real people — quickly, safely and transparently.' })),
+        h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow', text: 'Why VEYLO' }), h('h2', {}, 'Built for hosts who want ', h('span', { class: 'grad', text: 'fair, fast' }), ' giveaways'),
+          h('p', { text: 'Every detail is designed so your rewards reach real people — quickly, safely and transparently.' })),
         h('div', { class: 'feats' },
-          ...[['zap', 'Claim in seconds', 'No sign-up. Enter your wallet and get a single-use claim code instantly.'],
+          ...[['zap', 'Set up in seconds', 'Deposit, create and share without ever leaving Telegram.'],
               ['shield', 'Fair by design', 'One claim per wallet in each giveaway. Duplicate attempts are blocked automatically.'],
-              ['lock', 'Single-use codes', 'Every code belongs to one giveaway and can’t be reused or transferred.'],
-              ['send', 'Paid by the official bot', 'Redeem in Telegram and your reward is sent straight to your wallet.'],
-              ['trend', 'Verifiable receipts', 'See the amount, wallet and transaction hash for every payout.'],
-              ['users', 'Light and fast', 'Pages are lightweight and load quickly even on slow mobile networks.']]
+              ['lock', 'Single-use codes', 'Every claim code belongs to one giveaway and can’t be reused or transferred.'],
+              ['send', 'Automatic payouts', 'Rewards go straight to each claimer’s wallet, with a receipt showing the transaction hash.'],
+              ['trend', 'Live statistics', 'Track link opens, claim attempts, payouts and spots remaining for every giveaway.'],
+              ['users', 'Earn as you grow', 'Earn referral rewards when people you bring go on to host giveaways of their own.']]
             .map(([i, t, d]) => h('div', { class: 'glass feat' }, h('div', { class: 'ico' }, ic(i)), h('h3', { text: t }), h('p', { text: d })))))),
       h('section', {}, h('div', { class: 'wrap' }, h('div', { class: 'earn' }, h('div', { class: 'earn__grid' },
         h('div', {},
-          h('span', { class: 'eyebrow live', text: 'For hosts & communities' }),
-          h('h2', {}, 'Host your own giveaway. ', h('span', { class: 'grad', text: 'Grow with VEYLO.' })),
-          h('p', { class: 'lead', text: 'Create a giveaway in the VEYLO bot, share one link, and let your community claim in seconds. When people who joined through your giveaway go on to host their own, you earn referral rewards.' }),
+          h('span', { class: 'eyebrow live', text: 'Earn with VEYLO' }),
+          h('h2', {}, 'Create giveaways. ', h('span', { class: 'grad', text: 'Earn as you grow.' })),
+          h('p', { class: 'lead', text: 'Launch a giveaway in the VEYLO bot, share one link, and let your community claim in seconds. When people who joined through your giveaway go on to host their own, you earn referral rewards.' }),
           h('ul', {},
             ...[['Launch in under a minute', 'Set the amount, winners and time right inside Telegram.'],
                 ['Share one link', 'It opens a clean claim page for your community — no sign-ups.'],
@@ -193,19 +139,17 @@
           h('div', { class: 'bub' }, ic('users')), h('div', { class: 'bub' }, ic('trend')), h('div', { class: 'bub' }, ic('zap'))))))),
       h('section', {}, h('div', { class: 'wrap promo' },
         h('div', { class: 'glass' }, h('div', { class: 'ico' }, ic('send')), h('h3', { text: 'The VEYLO Telegram bot' }),
-          h('p', { text: 'Redeem codes, confirm your wallet address and receive rewards — fast, inside Telegram.' }), botBtn('Open VEYLO Bot')),
+          h('p', { text: 'Deposit, create giveaways, redeem codes and track everything — all inside Telegram.' }), botBtn('Open VEYLO Bot')),
         h('div', { class: 'glass' }, h('div', { class: 'ico' }, ic('bell')), h('h3', { text: 'Official channel' }),
-          h('p', { text: 'Stay connected with Veylo. Get the latest giveaway announcements, exclusive rewards, updates, and new opportunities through our official Telegram channel.' }), chanBtn()))),
+          h('p', { text: 'Stay connected with VEYLO. Get updates, new features and announcements through our official Telegram channel.' }), chanBtn()))),
       h('section', {}, h('div', { class: 'wrap' }, h('div', { class: 'cta' },
-        h('h2', { text: 'Want to create your own giveaway?' }), h('p', { text: 'Launch your giveaway and distribute rewards with Veylo.' }), botBtn('Open VEYLO Bot')))),
+        h('h2', { text: 'Ready to create your first giveaway?' }), h('p', { text: 'Open the VEYLO bot, deposit, and launch your giveaway in minutes.' }), botBtn('Create a Giveaway')))),
       BOOT.supportUrl ? h('section', {}, h('div', { class: 'wrap' }, h('div', { class: 'glass help' },
-        h('div', {}, h('h3', { text: 'Need help?' }), h('p', { class: 'meta', text: 'Questions about a code or a reward? Our support team is here.' })), supBtn('Contact Support', 'btn')))) : null);
-    document.title = 'VEYLO — Discover Giveaways. Claim Rewards.';
+        h('div', {}, h('h3', { text: 'Need help?' }), h('p', { class: 'meta', text: 'Questions about a giveaway, a code or a payout? Our support team is here.' })), supBtn('Contact Support', 'btn')))) : null);
+    document.title = 'VEYLO — Create Giveaways. Share the Link. Reward Your Community.';
     app.replaceChildren(view);
-    fillGiveaways(preview, { limit: 3 }).then((list) => { feat.replaceChildren(featuredCard(list.find(open) || null)); });
     api('/stats').then((s) => {
       const t = [];
-      if (s.activeGiveaways > 0) t.push(['gift', String(s.activeGiveaways), 'Active giveaways']);
       if (s.giveawaysHosted != null) t.push(['trend', String(s.giveawaysHosted), 'Giveaways hosted']);
       if (s.rewardsDelivered != null) t.push(['users', String(s.rewardsDelivered), 'Rewards delivered']);
       if (s.distributed) t.push(['zap', s.distributed.map((d) => `${d.total} ${d.asset}`).join(' · '), 'Total paid out']);
@@ -215,28 +159,10 @@
     }).catch(() => {});
   }
 
-  function listView() {
-    const grid = h('div'); const chips = h('div', { class: 'chips' }); let all = [], mode = 'all';
-    const render = () => {
-      const list = all.filter((g) => (mode === 'all' ? true : mode === 'active' ? open(g) : !open(g)));
-      grid.className = list.length ? 'grid grid--3' : '';
-      grid.replaceChildren(...(list.length ? list.map(giveawayCard) : [emptyState(mode === 'ended' ? 'Nothing here yet' : 'No giveaways in this view', 'New giveaways are announced in the official channel first.')]));
-      [...chips.children].forEach((c) => c.setAttribute('aria-pressed', String(c.dataset.m === mode)));
-    };
-    [['all', 'All'], ['active', 'Active'], ['ended', 'Ended']].forEach(([m, l]) => chips.append(h('button', { class: 'chip', type: 'button', 'data-m': m, 'aria-pressed': String(m === mode), text: l, onclick: () => { mode = m; render(); } })));
-    app.replaceChildren(h('div', { class: 'view' }, h('section', {}, h('div', { class: 'wrap' },
-      h('div', { class: 'row-h' }, h('div', { class: 'sec-h' }, h('span', { class: 'eyebrow live', text: 'Giveaways' }), h('h2', { text: 'Discover giveaways' }),
-        h('p', { text: 'Live data straight from VEYLO. To claim, open the giveaway link shared by its host or in the official channel.' })), chips), grid))));
-    document.title = 'Giveaways — VEYLO';
-    grid.replaceChildren(h('div', { class: 'skel' }));
-    api('/giveaways?status=all&limit=30').then((r) => { all = r.giveaways; if (!all.some(open)) mode = 'all'; render(); })
-      .catch(() => grid.replaceChildren(h('div', { class: 'empty' }, h('p', { text: "We couldn't load giveaways. Please refresh in a moment." }))));
-  }
-
   function notFoundView(msg) {
     app.replaceChildren(h('div', { class: 'view' }, h('section', {}, h('div', { class: 'wrap' }, h('div', { class: 'empty' },
       h('h3', { text: msg || 'Page not found' }), h('p', { text: 'The link may be wrong or the giveaway is no longer available.' }),
-      h('div', { class: 'links cen' }, h('a', { class: 'btn btn--primary', href: '/giveaways', 'data-link': true }, 'Explore Giveaways'), supBtn()))))));
+      h('div', { class: 'links cen' }, h('a', { class: 'btn btn--primary', href: '/', 'data-link': true }, 'Go to VEYLO'), supBtn()))))));
     document.title = 'Not found — VEYLO';
   }
 
@@ -253,7 +179,8 @@
       k ? h('i') : null,
       h('span', { class: i < n ? 'done' : i === n ? 'on' : '' }, h('b', { text: i < n ? '✓' : String(i) }), l)]));
 
-  async function detailView(slug) {
+  
+async function detailView(slug) {
     app.replaceChildren(h('div', { class: 'wrap' }, h('div', { class: 'skel', style: 'margin-top:40px;height:340px' })));
     let g;
     try { g = (await api('/giveaways/' + encodeURIComponent(slug))).giveaway; }
@@ -294,7 +221,7 @@
         h('h2', { text: title }), h('p', { class: 'sub', text }),
         h('div', { class: 'links' },
           again ? h('button', { class: 'btn btn--primary', type: 'button', onclick: async () => { await refresh(); decide(); } }, ic('clock'), 'Check again') : null,
-          h('a', { class: again ? 'btn' : 'btn btn--primary', href: '/giveaways', 'data-link': true }, 'Explore Giveaways', ic('arrow')), chanBtn(), supBtn()),
+          botBtn('Create your own giveaway', again ? 'btn' : 'btn btn--primary'), chanBtn(), supBtn()),
         h('div', { class: 'note' }, ic('gift'), h('span', {}, h('b', { text: 'Want to create your own giveaway? ' }), 'Launch your giveaway and distribute rewards with Veylo. ', h('a', { class: 'grad', ...ext(BOOT.botUrl), text: 'Open the VEYLO Telegram bot →' })))));
     }
 
@@ -346,7 +273,7 @@
           h('div', { class: 'stack' },
             hashOk ? h('button', { class: 'btn btn--primary btn--block', type: 'button', onclick: async (ev) => { const b = ev.currentTarget; const ok = await copyText(st.txHash); b.replaceChildren(ic(ok ? 'check' : 'copy'), ok ? 'Copied!' : 'Press and hold the hash'); setTimeout(() => b.replaceChildren(ic('copy'), 'Copy transaction hash'), 2200); } }, ic('copy'), 'Copy transaction hash') : null,
             hashOk ? h('a', { class: 'btn btn--block', ...ext('https://bscscan.com/tx/' + st.txHash) }, ic('arrow'), 'View on BscScan') : null,
-            h('a', { class: 'btn btn--block', href: '/giveaways', 'data-link': true }, 'Explore Giveaways')),
+            botBtn('Create your own giveaway', 'btn btn--block')),
           h('div', { class: 'links' }, chanBtn('Official channel', 'btn btn--sm'), supBtn('Support', 'btn btn--sm btn--ghost')));
       } else if (st.progress === 'FAILED') {
         body.push(h('h2', { text: 'This claim couldn’t be completed' }),
@@ -409,8 +336,8 @@
 
     const outcomeFull = (reopen) => (reopen
       ? outcome('Just missed it — every spot is taken', "You were a moment too late: all spots are currently claimed. Codes that aren't redeemed within " + BOOT.reservationMinutes + " minutes expire and the spot opens up again, so it's worth checking back shortly.", true)
-      : outcome('This giveaway is full', "This giveaway has filled all available slots. Don't miss the next opportunity. Explore other giveaways or create your own with Veylo."));
-    const outcomeEnded = () => outcome(g.status === 'CANCELLED' ? 'This giveaway was cancelled' : 'This giveaway has expired', 'Claims are closed for this giveaway. Explore other active giveaways or follow the channel for the next one.');
+      : outcome('This giveaway is full', "This giveaway has filled all available slots. Don't miss the next one — follow the official channel, or create your own giveaway with VEYLO."));
+    const outcomeEnded = () => outcome(g.status === 'CANCELLED' ? 'This giveaway was cancelled' : 'This giveaway has expired', 'Claims are closed for this giveaway. Follow the official channel to catch the next one, or create your own in the VEYLO bot.');
 
     function decide() {
       if (g.status === 'FULL') return outcomeFull(g.reopenPossible);
@@ -433,7 +360,7 @@
     }
 
     app.replaceChildren(h('div', { class: 'view' }, h('div', { class: 'wrap' },
-      h('a', { class: 'crumb', href: '/giveaways', 'data-link': true }, '← All giveaways'), h('div', { class: 'detail' }, overview, panel))));
+      h('a', { class: 'crumb', href: '/', 'data-link': true }, '← VEYLO'), h('div', { class: 'detail' }, overview, panel))));
     decide();
     timers.push(setInterval(() => { vals.exp.textContent = expiryText(g); }, 1000));
     timers.push(setInterval(async () => {
@@ -468,9 +395,9 @@
     clearTimers();
     const p = location.pathname.replace(/\/+$/, '') || '/';
     let m;
-    document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', p === '/' + a.dataset.nav || p.startsWith('/g/')));
+    
     if (p === '/') homeView();
-    else if (p === '/giveaways') listView();
+    else if (p === '/giveaways') { history.replaceState({}, '', '/'); homeView(); }
     else if ((m = p.match(/^\/g\/([a-z0-9]{6,32})$/))) detailView(m[1]);
     else notFoundView();
     if (location.hash) setTimeout(() => { const t = document.querySelector(location.hash); if (t) t.scrollIntoView(); }, 60);
@@ -493,4 +420,4 @@
   document.getElementById('yr').textContent = new Date().getFullYear();
   route();
 })();
-        
+            
