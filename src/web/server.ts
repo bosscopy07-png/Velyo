@@ -6,7 +6,7 @@ import { logger } from '../utils/logger';
 import { webConfig } from './config';
 import { hashAddress, hashDevice, hashIp, hashUa, maskAddress } from './lib/codes';
 import { ethers } from 'ethers';
-import { getPublicGiveaway, listPublicGiveaways, platformStats, resolveSlug } from './public';
+import { getPublicGiveaway, platformStats, resolveSlug } from './public';
 import { looksLikeEvmAddress } from './lib/address';
 import { staticHandler, sendHtml } from './static';
 import { codeStatus } from './status';
@@ -117,14 +117,6 @@ export function createWebRouter(): express.Router {
     catch (err) { logger.error(`[web] stats: ${(err as Error).message}`); res.status(500).json({ error: 'SERVER_ERROR' }); }
   });
 
-  api.get('/giveaways', async (req, res) => {
-    try {
-      const onlyOpen = req.query.status !== 'all';
-      const limitN = Math.min(30, Math.max(1, Number(req.query.limit) || 12));
-      res.json({ giveaways: await listPublicGiveaways({ onlyOpen, limit: limitN }) });
-    } catch (err) { logger.error(`[web] list: ${(err as Error).message}`); res.status(500).json({ error: 'SERVER_ERROR' }); }
-  });
-
   api.get('/giveaways/:slug', async (req, res) => {
     try {
       const g = await getPublicGiveaway(req.params.slug);
@@ -224,8 +216,8 @@ export function createWebRouter(): express.Router {
 
   async function page(req: Request, res: Response, meta?: { title: string; desc: string }) {
     const base = cfg.siteUrl ?? `${isHttps(req) ? 'https' : req.protocol}://${req.get('host')}`;
-    const title = meta?.title ?? 'VEYLO — Discover Giveaways. Claim Rewards.';
-    const desc = meta?.desc ?? 'Discover active giveaways, claim your code, and complete your reward through the VEYLO Telegram bot.';
+    const title = meta?.title ?? 'VEYLO — Create Giveaways. Share the Link. Reward Your Community.';
+    const desc = meta?.desc ?? 'VEYLO is a Telegram giveaway platform: deposit USDT or BNB, create a giveaway, share your link, and your community claims their rewards.';
     sendHtml(req, res, `${base}|${req.path}|${title}|${desc}`, () =>
       shell()
         .replace(/\{\{TITLE\}\}/g, esc(title))
@@ -249,7 +241,8 @@ export function createWebRouter(): express.Router {
     } catch (err) { logger.error(`[web] share meta: ${(err as Error).message}`); }
     return page(req, res);
   });
-  app.get(['/', '/giveaways'], (req, res) => page(req, res));
+  app.get('/giveaways', (_req, res) => res.redirect(301, '/')); // there is no public giveaway directory
+  app.get('/', (req, res) => page(req, res));
   app.use((req, res) => {
     if (!req.accepts('html')) return res.status(404).end();
     res.status(404);
@@ -284,4 +277,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-    
+                       
