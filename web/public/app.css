@@ -263,7 +263,6 @@ div.gcard{display:flex;flex-direction:column;padding:22px;cursor:default}
 .feat .ico{margin-bottom:16px}
 .feat h3{font-size:18px;margin-bottom:8px}
 .feat p{color:var(--mut);font-size:15px}
-
 /* create & earn */
 .earn{position:relative;overflow:hidden;border-radius:28px;padding:36px 26px;border:1px solid var(--line2);background:radial-gradient(700px 320px at 0 0,rgba(124,92,255,.32),transparent 60%),radial-gradient(520px 300px at 100% 100%,rgba(34,211,238,.2),transparent 60%),linear-gradient(180deg,var(--surf),var(--bg2))}
 .earn__grid{display:grid;gap:34px;align-items:center}
@@ -299,4 +298,14 @@ div.gcard{display:flex;flex-direction:column;padding:22px;cursor:default}
 @media(prefers-reduced-motion:reduce){.hero::before,.hero::after,.grad,.dash.glow::before,.orbit::before,.orbit::after,.bub{animation:none!important}.js .rv{opacity:1;transform:none}}
 main{overflow-x:clip}
 html{overflow-x:clip}
-                                      
+
+.steps--4{grid-template-columns:1fr}
+@media(min-width:640px){.steps--4{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:1000px){.steps--4{grid-template-columns:repeat(4,1fr)}}
+.flowrow{display:flex;gap:14px;align-items:center;padding:14px}
+.flowrow b{display:block;font-size:16px}
+.flowrow span{font-size:13.5px;color:var(--mut)}
+.dash .stack{gap:10px}
+.claimbox{display:grid;gap:24px;padding:30px;align-items:center}
+@media(min-width:860px){.claimbox{grid-template-columns:1.3fr .7fr;padding:40px}}
+.claimbox h2{font-size:clamp(24px,4.5vw,34px);margin:10px 0 14px}
