@@ -10,6 +10,7 @@ import { getPublicGiveaway, platformStats, resolveSlug } from './public';
 import { looksLikeEvmAddress } from './lib/address';
 import { staticHandler, sendHtml } from './static';
 import { codeStatus } from './status';
+import { recordRequest, SLOW_MS } from './health';
 import { giveawayService } from '../services/giveaway';
 import { reserveSlot, sweepExpired, type RequestSignals } from './reservations';
 
@@ -91,6 +92,17 @@ export function createWebRouter(): express.Router {
       res.setHeader('Vary', 'Origin');
     }
     if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+
+  // Request timing: feeds /sitehealth and logs slow requests so an outage leaves evidence.
+  app.use((req, res, next) => {
+    const t0 = performance.now();
+    res.on('finish', () => {
+      const ms = performance.now() - t0;
+      recordRequest(ms, res.statusCode);
+      if (ms > SLOW_MS) logger.warn(`[web] slow request ${req.method} ${req.path} took ${Math.round(ms)}ms (status ${res.statusCode})`);
+    });
     next();
   });
 
@@ -277,4 +289,3 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-                       
