@@ -42,6 +42,10 @@ bot.use(securityMiddleware);
 registerGiveawayRedeem(bot);
 // Fixes admin "Create Code" (wallet redeem codes): must precede registerAdminCommands.
 registerAdminCodeCreate(bot);
+// Admin slash-commands MUST be registered before registerTextHandlers below: that handler
+// deletes and swallows any text without an active step, so later commands never run.
+registerWebFlagsAdmin(bot);
+registerSiteHealth(bot);
 
 // Commands
 bot.command('start', handleStart);
@@ -55,8 +59,6 @@ registerAdminCommands(bot);
 registerAdminUpgrade(bot);
 registerBroadcastAdmin(bot);
 registerUserAdmin(bot);
-registerWebFlagsAdmin(bot);
-registerSiteHealth(bot);
 broadcastService.start(bot.telegram);
 
 // Error handling
@@ -263,3 +265,4 @@ async function shutdown(signal: string): Promise<void> {
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
+                        
