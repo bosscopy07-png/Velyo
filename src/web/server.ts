@@ -4,7 +4,7 @@ import path from 'node:path';
 import { checkRateLimit, redis, trackGiveawayView } from '../services/redis';
 import { logger } from '../utils/logger';
 import { webConfig } from './config';
-import { hashAddress, hashDevice, hashIp, hashUa, maskAddress } from './lib/codes';
+import { hashAddress, hashDevice, hashIp, hashUa, maskAddress, safeEqual } from './lib/codes';
 import { ethers } from 'ethers';
 import { getPublicGiveaway, platformStats, resolveSlug } from './public';
 import { looksLikeEvmAddress } from './lib/address';
@@ -28,7 +28,18 @@ const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 const DEVICE_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 /** Real client IP. Uses X-Forwarded-For counted from the RIGHT by the number of trusted proxy hops. */
+/** True only for requests carrying the secret LOADTEST_SECRET (admin traffic test). Off unless that env var is set. */
+function isLoadTest(req: Request): boolean {
+  const secret = webConfig().loadTestSecret;
+  const given = String(req.get('x-veylo-loadtest') ?? '');
+  return !!secret && given.length === secret.length && safeEqual(given, secret);
+}
+
 function clientIp(req: Request): string | null {
+  if (isLoadTest(req)) { // each simulated visitor presents its own virtual IP
+    const v = String(req.get('x-veylo-test-ip') ?? '');
+    if (/^[0-9a-f:.]{3,45}$/i.test(v)) return v;
+  }
   const hops = webConfig().trustProxy;
   const xff = String(req.get('x-forwarded-for') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
   if (typeof hops === 'number' && hops > 0 && xff.length) return xff[Math.max(0, xff.length - hops)];
@@ -145,7 +156,7 @@ export function createWebRouter(): express.Router {
       if (!id) return res.status(404).json({ error: 'NOT_FOUND' });
       const who = signalsOf(req);
       const visitor = who.deviceHash ?? who.ipHash;
-      if (visitor && (await redis.set(`giveaway:viewseen:${id}:${visitor}`, '1', 'EX', 3600, 'NX')) === 'OK') await trackGiveawayView(id);
+      if (!isLoadTest(req) && visitor && (await redis.set(`giveaway:viewseen:${id}:${visitor}`, '1', 'EX', 3600, 'NX')) === 'OK') await trackGiveawayView(id);
       res.json({ ok: true });
     } catch (err) {
       logger.warn(`[web] view tracking skipped: ${(err as Error).message}`);
@@ -171,7 +182,7 @@ export function createWebRouter(): express.Router {
         const result = await reserveSlot(id, signalsOf(req), { addressHash: hashAddress(cfg.hashSecret, address), maskedAddress: maskAddress(address) });
         if (result.ok) {
           // A freshly issued code counts as a claim attempt in the bot's giveaway statistics.
-          if (!result.reused) giveawayService.trackAttempt(id).catch((e) => logger.warn(`[web] attempt tracking skipped: ${(e as Error).message}`));
+          if (!result.reused && !isLoadTest(req)) giveawayService.trackAttempt(id).catch((e) => logger.warn(`[web] attempt tracking skipped: ${(e as Error).message}`));
           const code = result.code;
           return res.json({
             code,
@@ -289,3 +300,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
+    
