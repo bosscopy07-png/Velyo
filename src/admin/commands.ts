@@ -62,6 +62,7 @@ const adminPanelKeyboard = Markup.inlineKeyboard([
   ],
   [
     Markup.button.callback(`${eb('lock')} Recover Key`, 'admin:findkey'),
+    Markup.button.callback(`${eb('chart')} Traffic Test`, 'admin:loadtest'),
   ],
   [Markup.button.callback(`${eb('back')} Back`, 'main')],
 ]);
@@ -527,8 +528,8 @@ async function renderUsersPage(ctx: Context, page: number): Promise<void> {
   text += `${e('money')} $${Number(usdtSum._sum.availableBalance || 0).toFixed(2)} USDT\n`;
   text += `${e('coin')} ${Number(bnbSum._sum.availableBalance || 0).toFixed(4)} BNB`;
 
-    // One tappable button per user → full profile (2 per row keeps it compact)
-  const userButtons = users.map((u) =>
+    // One tappable button per user → full profi
+const userButtons = users.map((u) =>
     Markup.button.callback(
       `${u.username ? '@' + u.username : u.firstName || u.telegramId}`.slice(0, 24),
       `admin:user:${u.id}`
