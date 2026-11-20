@@ -14,6 +14,7 @@ import { registerUserAdmin } from '../admin/users';
 import { registerGiveawayRedeem } from './giveaway-redeem';
 import { registerWebFlagsAdmin } from '../admin/web-flags';
 import { registerAdminCodeCreate } from '../admin/code-create';
+import { registerSiteHealth } from '../admin/site-health';
 import { broadcastService } from '../services/broadcast';
 import { depositSessionService } from '../services/deposit-session';
 import { treasuryMonitor } from '../services/treasury';
@@ -55,6 +56,7 @@ registerAdminUpgrade(bot);
 registerBroadcastAdmin(bot);
 registerUserAdmin(bot);
 registerWebFlagsAdmin(bot);
+registerSiteHealth(bot);
 broadcastService.start(bot.telegram);
 
 // Error handling
@@ -261,4 +263,3 @@ async function shutdown(signal: string): Promise<void> {
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
-      
