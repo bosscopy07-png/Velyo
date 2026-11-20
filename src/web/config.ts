@@ -46,6 +46,9 @@ const schema = z.object({
   WEB_STATS_MIN_SHOW: int(25),
   WEB_SHOW_PAYOUT_TOTAL: bool(false),
 
+  // Admin traffic-test tool (disabled unless a long secret is set)
+  LOADTEST_SECRET: z.string().min(24).optional().or(z.literal('').transform(() => undefined)),
+
   // Anti-abuse
   DUPLICATE_WALLET_ENFORCEMENT: bool(true),
   WEB_CODE_FAIL_LIMIT: int(8),
@@ -84,6 +87,7 @@ function build() {
       maxCodesPerIpPerGiveaway: e.WEB_MAX_CODES_PER_IP_PER_GIVEAWAY,
     },
     stats: { cacheMs: e.WEB_STATS_CACHE_MINUTES * 60_000, minShow: e.WEB_STATS_MIN_SHOW, showPayoutTotal: e.WEB_SHOW_PAYOUT_TOTAL },
+    loadTestSecret: e.LOADTEST_SECRET,
     duplicateWalletEnforcement: e.DUPLICATE_WALLET_ENFORCEMENT,
     codeFailLimit: e.WEB_CODE_FAIL_LIMIT,
     codeFailWindowMs: e.WEB_CODE_FAIL_WINDOW_MINUTES * 60_000,
