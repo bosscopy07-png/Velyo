@@ -14,6 +14,11 @@ export interface LoadTestOptions {
   secret: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Max simultaneous HTTP connections the simulator opens (protects the server it runs inside). */
+  concurrency?: number;
+  /** Stop the test if this process's memory passes this many MB. */
+  memoryGuardMb?: number;
+  rssMb?: () => number;
 }
 
 export interface EndpointStats { count: number; statuses: Record<string, number>; p50: number; p95: number; p99: number; max: number }
@@ -34,6 +39,15 @@ const pct = (sorted: number[], p: number) => (sorted.length ? sorted[Math.min(so
 export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   const f = o.fetchImpl ?? fetch;
   const timeoutMs = o.timeoutMs ?? 20_000;
+  const cap = o.concurrency ?? 150;
+  const rssMb = o.rssMb ?? (() => process.memoryUsage().rss / 1048576);
+  const guardMb = o.memoryGuardMb ?? 400;
+  let aborted: number | null = null;
+  let active = 0, peak = 0;
+  const waiters: (() => void)[] = [];
+  const guard = setInterval(() => { const m = rssMb(); if (aborted === null && m > guardMb) aborted = Math.round(m); }, 100);
+  const take = async () => { if (active >= cap) await new Promise<void>((r) => waiters.push(r)); active++; peak = Math.max(peak, active); };
+  const give = () => { active--; waiters.shift()?.(); };
   const lat: Record<string, number[]> = {};
   const statuses: Record<string, Record<string, number>> = {};
   const errors = new Map<string, number>();
@@ -41,6 +55,8 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   const note = (m: string) => errors.set(m, (errors.get(m) ?? 0) + 1);
 
   async function call(name: string, path: string, headers: Record<string, string>, method = 'GET', body?: unknown) {
+    await take();
+    if (aborted !== null) { give(); return { status: 0, json: null }; }
     const t0 = performance.now();
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -62,6 +78,7 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
       return { status: 0, json: null };
     } finally {
       clearTimeout(timer);
+      give();
     }
   }
 
@@ -105,6 +122,7 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   const verifiedActive = verified.filter((v) => v.json?.state === 'ACTIVE').length;
   const fin = await call('giveaway', `/api/v1/giveaways/${o.slug}`, users[0].headers);
   const finalAvail: number | null = fin.json?.giveaway ? Number(fin.json.giveaway.availableSlots) : null;
+  clearInterval(guard);
   const durationMs = Math.round(performance.now() - started);
 
   const endpoints: Record<string, EndpointStats> = {};
@@ -124,7 +142,8 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   }
   const hardErrors = claim.serverErrors + claim.networkErrors + Object.entries(statuses).reduce((n, [k, v]) => n + (k === 'claim' ? 0 : (v['network'] ?? 0)), 0);
   add('No crashes or timeouts', hardErrors === 0 && !([...errors.keys()].some((k) => /HTTP 5|timeout|ECONN/.test(k))) ? 'pass' : 'fail', hardErrors === 0 && errors.size === 0 ? 'zero errors' : `${errors.size} kinds of error (see below)`);
-  add('Busy replies', claim.busy === 0 ? 'pass' : 'warn', claim.busy === 0 ? 'none' : `${claim.busy} visitors were told "busy, try again"`);
+  if (aborted !== null) add('Test ran to the end', 'fail', `Stopped early: server memory reached ${aborted} MB. Use fewer visitors, or a bigger server.`);
+  add('No "busy" replies', claim.busy === 0 ? 'pass' : 'fail', claim.busy === 0 ? 'none' : `${claim.busy} visitors were told "busy, try again" — this should never happen`);
   add('Rate limiter did not interfere', claim.rateLimited === 0 ? 'pass' : 'warn', claim.rateLimited === 0 ? 'none blocked' : `${claim.rateLimited} test visitors were rate-limited (results may be less reliable)`);
   if (issued.length) add('Issued codes are valid', verifiedActive === issued.length ? 'pass' : 'fail', `${verifiedActive}/${issued.length} verified ACTIVE`);
   const page = endpoints.page, cl = endpoints.claim;
@@ -156,4 +175,5 @@ export function formatLoadTest(r: LoadTestReport): string {
     '',
     r.errorSamples.length ? '<b>Errors seen:</b>\n' + r.errorSamples.map((e) => `• ${e.message} ×${e.count}`).join('\n') : 'No errors were seen.',
   ].filter((x) => x !== null).join('\n');
-}
+                                                }
+                                                
