@@ -165,35 +165,42 @@ async function authoritative(giveawayId: string, sig: RequestSignals, who: Claim
       const code = generateClaimCode();
       try {
         return await prisma.$transaction(async (tx): Promise<ReserveResult> => {
-          const rows = await tx.$queryRaw<{ status: string; claimedCount: number; maxClaimers: number; expired: boolean; held: number; fromIp: number }[]>`
+          // Statement 1: take the row lock. (Only the lock + the giveaway's own columns here.)
+          const rows = await tx.$queryRaw<{ status: string; claimedCount: number; maxClaimers: number; expired: boolean }[]>`
             SELECT g.status::text AS status, g."claimedCount", g."maxClaimers",
-                   (g."expiresAt" IS NOT NULL AND g."expiresAt" <= ${NOW_UTC}) AS expired,
-                   (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = g.id AND r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})::int AS held,
-                   (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = g.id AND r."ipHash" = ${sig.ipHash ?? ''}
-                       AND (r.status = 'CONVERTED' OR (r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})))::int AS "fromIp"
-              FROM giveaways g WHERE g.id = ${giveawayId} FOR UPDATE OF g`;
+                   (g."expiresAt" IS NOT NULL AND g."expiresAt" <= ${NOW_UTC}) AS expired
+              FROM giveaways g WHERE g.id = ${giveawayId} FOR UPDATE`;
           const g = rows[0];
           if (!g) return { ok: false, error: 'NOT_FOUND' };
           if (g.status === 'FULL') return { ok: false, error: 'FULL', mayReopen: false };
           if (g.status !== 'ACTIVE') return { ok: false, error: g.status === 'EXPIRED' ? 'EXPIRED' : 'NOT_ACTIVE' };
           if (g.expired) return { ok: false, error: 'EXPIRED' };
-          if (g.claimedCount + g.held >= g.maxClaimers) return { ok: false, error: 'FULL', mayReopen: g.held > 0 };
+
+          // Statement 2: counts + duplicate lookup. This MUST be a separate statement AFTER the lock: in READ COMMITTED
+          // a statement keeps the snapshot it started with, so counting inside the locking statement could miss a
+          // reservation another transaction committed while we waited for the lock.
+          const st = (await tx.$queryRaw<{ held: number; fromIp: number; dupeId: string | null }[]>`
+            SELECT
+              (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = ${giveawayId} AND r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})::int AS held,
+              (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = ${giveawayId} AND r."ipHash" = ${sig.ipHash ?? ''}
+                  AND (r.status = 'CONVERTED' OR (r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})))::int AS "fromIp",
+              (SELECT r.id FROM giveaway_reservations r WHERE r."giveawayId" = ${giveawayId} AND r."addressHash" = ${who.addressHash}
+                  AND (r.status = 'CONVERTED' OR (r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})) LIMIT 1) AS "dupeId"`)[0];
 
           // Authoritative uniqueness (two simultaneous requests for the same wallet can both pass the early check).
-          const dupe = await tx.giveawayReservation.findFirst({
-            where: { giveawayId, addressHash: who.addressHash, OR: [{ status: 'CONVERTED' }, { status: 'ACTIVE', expiresAt: { gt: new Date() } }] },
-            include: { code: true },
-          });
-          if (dupe) {
-            if (dupe.status === 'ACTIVE' && dupe.code?.status === 'ACTIVE' && dupe.code.codeCipher) {
+          if (st.dupeId) {
+            const dupe = await tx.giveawayReservation.findUnique({ where: { id: st.dupeId }, include: { code: true } });
+            if (dupe && dupe.status === 'ACTIVE' && dupe.code?.status === 'ACTIVE' && dupe.code.codeCipher) {
               const again = openCode(cfg.codeSecret, dupe.code.codeCipher);
               if (again) return { ok: true, code: again, expiresAt: dupe.expiresAt, reused: true, maskedAddress: who.maskedAddress };
             }
             return { ok: false, error: 'ALREADY_CLAIMED' };
           }
 
+          if (g.claimedCount + st.held >= g.maxClaimers) return { ok: false, error: 'FULL', mayReopen: st.held > 0 };
+
           const cap = cfg.rl.maxCodesPerIpPerGiveaway;
-          if (cap > 0 && sig.ipHash && g.fromIp >= cap) return { ok: false, error: 'IP_LIMIT' };
+          if (cap > 0 && sig.ipHash && st.fromIp >= cap) return { ok: false, error: 'IP_LIMIT' };
 
           const expiresAt = new Date(Date.now() + cfg.reservationMinutes * 60_000);
           await tx.giveawayReservation.create({
@@ -236,5 +243,4 @@ export async function sweepExpired(): Promise<{ codes: number; reservations: num
     logger.info(`[web] expiry sweep: ${codes.count} code(s), ${reservations.count} reservation(s) released`);
   }
   return { codes: codes.count, reservations: reservations.count };
-        }
-                                         
+}
