@@ -4,6 +4,7 @@ import { acquireLock, releaseLock } from '../services/redis';
 import { logger } from '../utils/logger';
 import { webConfig } from './config';
 import { generateClaimCode, hashCode, openCode, sealCode } from './lib/codes';
+import { ClaimGate } from './lib/gate';
 
 export interface RequestSignals {
   ipHash: string | null;
@@ -26,14 +27,30 @@ export type ReserveResult =
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DEAD_CLAIM = ['FAILED', 'REJECTED'];
+const NOW_UTC = Prisma.sql`(NOW() AT TIME ZONE 'UTC')`;
 
-/**
- * Fast-path for "giveaway is full". Set ONLY after an authoritative in-transaction
- * check, for a few seconds. It can only ever REJECT sooner — it never authorises
- * anything — so when 1,000 people hit a full giveaway they don't queue on the lock.
- */
-const fullFlag = new Map<string, { until: number; mayReopen: boolean }>();
-const FULL_FLAG_MS = 3000;
+/** One admission gate per giveaway (see lib/gate.ts). */
+const gates = new Map<string, ClaimGate>();
+function gateFor(giveawayId: string): ClaimGate {
+  let g = gates.get(giveawayId);
+  if (!g) {
+    if (gates.size > 500) gates.clear();
+    g = new ClaimGate(async () => {
+      const rows = await prisma.$queryRaw<{ remaining: number; held: number; active: boolean }[]>`
+        SELECT GREATEST(0, g."maxClaimers" - g."claimedCount" - h.held)::int AS remaining, h.held::int AS held,
+               (g.status = 'ACTIVE' AND (g."expiresAt" IS NULL OR g."expiresAt" > ${NOW_UTC})) AS active
+          FROM giveaways g,
+               LATERAL (SELECT count(*) AS held FROM giveaway_reservations r
+                         WHERE r."giveawayId" = g.id AND r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC}) h
+         WHERE g.id = ${giveawayId}`;
+      const r = rows[0];
+      // Ended / missing giveaways: admit everyone so the authoritative step answers with the exact reason.
+      return !r || !r.active ? { remaining: 1_000_000, held: 0 } : { remaining: r.remaining, held: r.held };
+    });
+    gates.set(giveawayId, g);
+  }
+  return g;
+}
 
 async function recordBlock(
   giveawayId: string, level: 'CONFIRMED_DUPLICATE' | 'WEAK_SIGNAL', type: string, sig: RequestSignals, who: Claimer, detail: Record<string, unknown>
@@ -60,23 +77,28 @@ async function recordBlock(
  * Atomically reserve ONE slot for ONE wallet address and mint a claim code.
  *
  * One slot per wallet address per giveaway; one code per browser; a configurable
- * cap per network/IP. Capacity is decided inside a DB transaction that holds a
- * row lock on the giveaway (plus the same Redis lock claimGiveaway uses), from
- * fresh rows only — never from the client, a cache, or a stale read.
+ * cap per network/IP. Layers:
+ *  A. ONE indexed query for anything this wallet/browser already holds here (idempotent re-show, duplicates);
+ *  B. an in-memory admission gate: only as many requests as there are free slots go further, the
+ *     rest get an instant "full" (so 1,000 visitors never queue on a 20-slot giveaway);
+ *  C. admitted requests run one at a time (FIFO) through the authoritative section: Redis lock shared with
+ *     claimGiveaway + a DB transaction holding a row lock, deciding capacity from FRESH rows only.
+ * Only C can approve a slot, so nothing above it can cause over-issuing.
  */
 export async function reserveSlot(giveawayId: string, sig: RequestSignals, who: Claimer): Promise<ReserveResult> {
   const cfg = webConfig();
   if (!cfg.claimEnabled) return { ok: false, error: 'DISABLED' };
   const now = new Date();
 
-  // 1. Idempotent: this wallet (any browser) or this browser already holds a live code.
-  const live = await prisma.giveawayReservation.findFirst({
-    where: {
-      giveawayId, status: 'ACTIVE', expiresAt: { gt: now },
-      OR: [{ addressHash: who.addressHash }, ...(sig.deviceHash ? [{ deviceHash: sig.deviceHash }] : [])],
-    },
+  // A. everything this wallet or browser already has in this giveaway (single query)
+  const mine = await prisma.giveawayReservation.findMany({
+    where: { giveawayId, OR: [{ addressHash: who.addressHash }, ...(sig.deviceHash ? [{ deviceHash: sig.deviceHash }] : [])] },
     include: { code: true },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
   });
+
+  const live = mine.find((r) => r.status === 'ACTIVE' && r.expiresAt > now);
   if (live) {
     if (live.addressHash !== who.addressHash) {
       await recordBlock(giveawayId, 'WEAK_SIGNAL', 'SAME_DEVICE', sig, who, { note: 'same browser asked for a second code with a different wallet' });
@@ -87,88 +109,102 @@ export async function reserveSlot(giveawayId: string, sig: RequestSignals, who: 
     return { ok: false, error: 'ADDRESS_USED' };
   }
 
-  // 2. Already redeemed: this wallet, or this browser, or a bot-side claim with this wallet.
-  const done = await prisma.giveawayReservation.findFirst({
-    where: {
-      giveawayId, status: 'CONVERTED',
-      OR: [{ addressHash: who.addressHash }, ...(sig.deviceHash ? [{ deviceHash: sig.deviceHash }] : [])],
-    },
-    select: { addressHash: true },
-  });
+  const done = mine.find((r) => r.status === 'CONVERTED');
   if (done) {
     if (done.addressHash === who.addressHash) await recordBlock(giveawayId, 'CONFIRMED_DUPLICATE', 'SAME_WALLET_SAME_GIVEAWAY', sig, who, { via: 'website' });
     return { ok: false, error: 'ALREADY_CLAIMED' };
   }
-  const walletUse = await prisma.giveawayWalletUse.findUnique({ where: { giveawayId_addressHash: { giveawayId, addressHash: who.addressHash } } });
-  if (walletUse) {
-    const c = await prisma.giveawayClaim.findUnique({ where: { id: walletUse.claimId }, select: { status: true } });
-    if (c && !DEAD_CLAIM.includes(c.status)) {
-      await recordBlock(giveawayId, 'CONFIRMED_DUPLICATE', 'SAME_WALLET_SAME_GIVEAWAY', sig, who, { via: 'bot-claim' });
-      return { ok: false, error: 'ALREADY_CLAIMED' };
-    }
-  }
 
-  // 3. Spam guard (rate-limit, not accusation): unused codes per browser per day.
   if (sig.deviceHash) {
-    const unused = await prisma.giveawayReservation.count({
-      where: { giveawayId, deviceHash: sig.deviceHash, status: { in: ['ACTIVE', 'EXPIRED', 'RELEASED'] }, createdAt: { gt: new Date(now.getTime() - 24 * 3600_000) } },
-    });
+    const since = now.getTime() - 24 * 3600_000;
+    const unused = mine.filter((r) => r.deviceHash === sig.deviceHash && ['ACTIVE', 'EXPIRED', 'RELEASED'].includes(r.status) && r.createdAt.getTime() > since).length;
     if (unused >= cfg.rl.maxReservationsPerDeviceDay) return { ok: false, error: 'DEVICE_LIMIT' };
   }
 
-  // 4. Known-full fast path (rejects only).
-  const ff = fullFlag.get(giveawayId);
-  if (ff && ff.until > Date.now()) return { ok: false, error: 'FULL', mayReopen: ff.mayReopen };
+  // B. admission control (instant "full" for everyone who cannot possibly get a slot)
+  const gate = gateFor(giveawayId);
+  if (!(await gate.admit())) return { ok: false, error: 'FULL', mayReopen: gate.held > 0 || gate.inflight > 0 };
 
-  // 5. Authoritative section.
-  const lockKey = `giveaway:claim:${giveawayId}`;
-  let token: string | null = null;
-  for (let i = 0; i < 24 && !token; i++) {
-    token = await acquireLock(lockKey, 5000);
-    if (!token) await sleep(60 + Math.floor(Math.random() * 90));
+  let success = false;
+  try {
+    // bot-side claim already using this wallet in this giveaway
+    const walletUse = await prisma.giveawayWalletUse.findUnique({ where: { giveawayId_addressHash: { giveawayId, addressHash: who.addressHash } } });
+    if (walletUse) {
+      const c = await prisma.giveawayClaim.findUnique({ where: { id: walletUse.claimId }, select: { status: true } });
+      if (c && !DEAD_CLAIM.includes(c.status)) {
+        await recordBlock(giveawayId, 'CONFIRMED_DUPLICATE', 'SAME_WALLET_SAME_GIVEAWAY', sig, who, { via: 'bot-claim' });
+        return { ok: false, error: 'ALREADY_CLAIMED' };
+      }
+    }
+
+    // C. one at a time, in arrival order
+    const res = await gate.exclusive(() => authoritative(giveawayId, sig, who));
+    success = res.ok;
+    if (!res.ok && res.error === 'FULL') gate.markFull(res.mayReopen ? 1 : 0);
+    if (!res.ok && res.error === 'IP_LIMIT') await recordBlock(giveawayId, 'WEAK_SIGNAL', 'SAME_IP', sig, who, { policy: 'per-network cap', cap: cfg.rl.maxCodesPerIpPerGiveaway });
+    return res;
+  } finally {
+    gate.release(success);
   }
-  if (!token) return { ok: false, error: 'BUSY' };
+}
+
+/** The ONLY place a slot can be approved. */
+async function authoritative(giveawayId: string, sig: RequestSignals, who: Claimer): Promise<ReserveResult> {
+  const cfg = webConfig();
+  const lockKey = `giveaway:claim:${giveawayId}`;
+  // The Redis lock only coordinates with the bot's own claim flow. The DB row lock (FOR UPDATE) below is what
+  // guarantees correctness, so a visitor is NEVER turned away with "busy" just because the Redis lock is taken.
+  let token: string | null = null;
+  for (let i = 0; i < 5 && !token; i++) {
+    token = await acquireLock(lockKey, 5000);
+    if (!token) await sleep(20 + Math.floor(Math.random() * 30));
+  }
 
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       const code = generateClaimCode();
       try {
-        const res = await prisma.$transaction(async (tx): Promise<ReserveResult> => {
-          const rows = await tx.$queryRaw<{ status: string; claimedCount: number; maxClaimers: number; expiresAt: Date | null }[]>`
-            SELECT status::text AS status, "claimedCount", "maxClaimers", "expiresAt"
-              FROM giveaways WHERE id = ${giveawayId} FOR UPDATE`;
+        return await prisma.$transaction(async (tx): Promise<ReserveResult> => {
+          const rows = await tx.$queryRaw<{ status: string; claimedCount: number; maxClaimers: number; expired: boolean; held: number; fromIp: number }[]>`
+            SELECT g.status::text AS status, g."claimedCount", g."maxClaimers",
+                   (g."expiresAt" IS NOT NULL AND g."expiresAt" <= ${NOW_UTC}) AS expired,
+                   (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = g.id AND r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})::int AS held,
+                   (SELECT count(*) FROM giveaway_reservations r WHERE r."giveawayId" = g.id AND r."ipHash" = ${sig.ipHash ?? ''}
+                       AND (r.status = 'CONVERTED' OR (r.status = 'ACTIVE' AND r."expiresAt" > ${NOW_UTC})))::int AS "fromIp"
+              FROM giveaways g WHERE g.id = ${giveawayId} FOR UPDATE OF g`;
           const g = rows[0];
           if (!g) return { ok: false, error: 'NOT_FOUND' };
           if (g.status === 'FULL') return { ok: false, error: 'FULL', mayReopen: false };
           if (g.status !== 'ACTIVE') return { ok: false, error: g.status === 'EXPIRED' ? 'EXPIRED' : 'NOT_ACTIVE' };
-          if (g.expiresAt && g.expiresAt <= now) return { ok: false, error: 'EXPIRED' };
+          if (g.expired) return { ok: false, error: 'EXPIRED' };
+          if (g.claimedCount + g.held >= g.maxClaimers) return { ok: false, error: 'FULL', mayReopen: g.held > 0 };
 
-          const held = await tx.giveawayReservation.count({ where: { giveawayId, status: 'ACTIVE', expiresAt: { gt: now } } });
-          if (g.claimedCount + held >= g.maxClaimers) return { ok: false, error: 'FULL', mayReopen: held > 0 };
-
-          const cap = cfg.rl.maxCodesPerIpPerGiveaway;
-          if (cap > 0 && sig.ipHash) {
-            const fromIp = await tx.giveawayReservation.count({
-              where: { giveawayId, ipHash: sig.ipHash, OR: [{ status: 'CONVERTED' }, { status: 'ACTIVE', expiresAt: { gt: now } }] },
-            });
-            if (fromIp >= cap) return { ok: false, error: 'IP_LIMIT' };
+          // Authoritative uniqueness (two simultaneous requests for the same wallet can both pass the early check).
+          const dupe = await tx.giveawayReservation.findFirst({
+            where: { giveawayId, addressHash: who.addressHash, OR: [{ status: 'CONVERTED' }, { status: 'ACTIVE', expiresAt: { gt: new Date() } }] },
+            include: { code: true },
+          });
+          if (dupe) {
+            if (dupe.status === 'ACTIVE' && dupe.code?.status === 'ACTIVE' && dupe.code.codeCipher) {
+              const again = openCode(cfg.codeSecret, dupe.code.codeCipher);
+              if (again) return { ok: true, code: again, expiresAt: dupe.expiresAt, reused: true, maskedAddress: who.maskedAddress };
+            }
+            return { ok: false, error: 'ALREADY_CLAIMED' };
           }
 
-          const expiresAt = new Date(now.getTime() + cfg.reservationMinutes * 60_000);
-          const reservation = await tx.giveawayReservation.create({
-            data: { giveawayId, expiresAt, ipHash: sig.ipHash, deviceHash: sig.deviceHash, uaHash: sig.uaHash, addressHash: who.addressHash, maskedAddress: who.maskedAddress },
-          });
-          await tx.giveawayWebCode.create({
+          const cap = cfg.rl.maxCodesPerIpPerGiveaway;
+          if (cap > 0 && sig.ipHash && g.fromIp >= cap) return { ok: false, error: 'IP_LIMIT' };
+
+          const expiresAt = new Date(Date.now() + cfg.reservationMinutes * 60_000);
+          await tx.giveawayReservation.create({
             data: {
-              giveawayId, reservationId: reservation.id, codeHash: hashCode(cfg.hashSecret, code),
-              codeCipher: sealCode(cfg.codeSecret, code), expiresAt, audit: { createdVia: 'website' },
+              giveawayId, expiresAt, ipHash: sig.ipHash, deviceHash: sig.deviceHash, uaHash: sig.uaHash,
+              addressHash: who.addressHash, maskedAddress: who.maskedAddress,
+              code: { create: { giveawayId, codeHash: hashCode(cfg.hashSecret, code), codeCipher: sealCode(cfg.codeSecret, code), expiresAt, audit: { createdVia: 'website' } } },
             },
           });
           return { ok: true, code, expiresAt, reused: false, maskedAddress: who.maskedAddress };
         });
-        if (!res.ok && res.error === 'FULL') fullFlag.set(giveawayId, { until: Date.now() + FULL_FLAG_MS, mayReopen: !!res.mayReopen });
-        if (!res.ok && res.error === 'IP_LIMIT') await recordBlock(giveawayId, 'WEAK_SIGNAL', 'SAME_IP', sig, who, { policy: 'per-network cap', cap: cfg.rl.maxCodesPerIpPerGiveaway });
-        return res;
       } catch (err) {
         if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') continue;
         throw err;
@@ -176,7 +212,7 @@ export async function reserveSlot(giveawayId: string, sig: RequestSignals, who: 
     }
     return { ok: false, error: 'BUSY' };
   } finally {
-    await releaseLock(lockKey, token);
+    if (token) await releaseLock(lockKey, token);
   }
 }
 
@@ -195,10 +231,10 @@ export async function sweepExpired(): Promise<{ codes: number; reservations: num
     where: { status: 'ACTIVE', expiresAt: { lte: now } },
     data: { status: 'EXPIRED', releasedAt: now },
   });
-  if (codes.count || reservations.count) fullFlag.clear(); // freed slots become visible immediately
+  if (codes.count || reservations.count) gates.forEach((g) => g.reset()); // freed slots become visible immediately
   if (codes.count || reservations.count) {
     logger.info(`[web] expiry sweep: ${codes.count} code(s), ${reservations.count} reservation(s) released`);
   }
   return { codes: codes.count, reservations: reservations.count };
-            }
-                        
+        }
+                                         
