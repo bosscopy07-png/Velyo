@@ -179,8 +179,7 @@
       k ? h('i') : null,
       h('span', { class: i < n ? 'done' : i === n ? 'on' : '' }, h('b', { text: i < n ? '✓' : String(i) }), l)]));
 
-  
-async function detailView(slug) {
+  async function detailView(slug) {
     app.replaceChildren(h('div', { class: 'wrap' }, h('div', { class: 'skel', style: 'margin-top:40px;height:340px' })));
     let g;
     try { g = (await api('/giveaways/' + encodeURIComponent(slug))).giveaway; }
@@ -307,11 +306,12 @@ async function detailView(slug) {
       btn.addEventListener('click', async () => {
         if (busy || !ok()) return; busy = true; btn.disabled = true; errBox.hidden = true;
         btn.replaceChildren(h('span', { class: 'spin' }), 'Reserving your spot…');
+        const waitTimer = setTimeout(() => { if (busy) btn.replaceChildren(h('span', { class: 'spin' }), 'Many people are claiming — you’re in line…'); }, 4000);
         try {
           const r = await api(`/giveaways/${encodeURIComponent(slug)}/claim-code`, { method: 'POST', body: JSON.stringify({ address: input.value.trim() }) });
-          store.set('veylo_code_' + slug, r); showSuccess(r); refresh();
+          clearTimeout(waitTimer); store.set('veylo_code_' + slug, r); showSuccess(r); refresh();
         } catch (e) {
-          busy = false; btn.disabled = !ok(); btn.replaceChildren(ic('gift'), 'Generate Claim Code');
+          clearTimeout(waitTimer); busy = false; btn.disabled = !ok(); btn.replaceChildren(ic('gift'), 'Generate Claim Code');
           if (e.code === 'FULL') { await refresh(); return outcomeFull(e.data && e.data.mayReopen); }
           if (e.code === 'EXPIRED') { await refresh(); return outcomeEnded(); }
           errBox.textContent = ({
@@ -420,4 +420,4 @@ async function detailView(slug) {
   document.getElementById('yr').textContent = new Date().getFullYear();
   route();
 })();
-            
+              
