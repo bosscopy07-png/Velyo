@@ -56,7 +56,7 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
 
   async function call(name: string, path: string, headers: Record<string, string>, method = 'GET', body?: unknown) {
     await take();
-    if (aborted !== null) { give(); return { status: 0, json: null }; }
+    if (aborted !== null) { give(); return { status: 0, json: null, ms: 0 }; }
     const t0 = performance.now();
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -68,14 +68,14 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
       (lat[name] ??= []).push(performance.now() - t0);
       const sc = (statuses[name] ??= {}); sc[res.status] = (sc[res.status] ?? 0) + 1;
       if (res.status >= 500 && !(name === 'claim' && res.status === 503)) { note(`${name}: HTTP ${res.status}`); }
-      return { status: res.status, json };
+      return { status: res.status, json, ms: performance.now() - t0 };
     } catch (err) {
       (lat[name] ??= []).push(performance.now() - t0);
       const e = err as { name?: string; cause?: { code?: string } };
       const why = e.name === 'AbortError' ? `timeout after ${Math.round(timeoutMs / 1000)}s` : e.cause?.code ?? e.name ?? 'network error';
       note(`${name}: ${why}`);
       (statuses[name] ??= {})['network'] = ((statuses[name] ??= {})['network'] ?? 0) + 1;
-      return { status: 0, json: null };
+      return { status: 0, json: null, ms: performance.now() - t0 };
     } finally {
       clearTimeout(timer);
       give();
@@ -107,8 +107,8 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   // Phase B — everyone asks for a code at the same instant
   await Promise.all(users.map(async (u) => {
     const r = await call('claim', `/api/v1/giveaways/${o.slug}/claim-code`, u.headers, 'POST', { address: u.address });
-    if (r.status === 200 && r.json?.code) { claim.issued++; u.code = r.json.code; }
-    else if (r.status === 409 && r.json?.error === 'FULL') claim.full++;
+    if (r.status === 200 && r.json?.code) { claim.issued++; u.code = r.json.code; (lat['claim_win'] ??= []).push(r.ms); }
+    else if (r.status === 409 && r.json?.error === 'FULL') { claim.full++; (lat['claim_full'] ??= []).push(r.ms); }
     else if (r.status === 503) { claim.busy++; }
     else if (r.status === 429) claim.rateLimited++;
     else if (r.status >= 500) claim.serverErrors++;
@@ -154,9 +154,13 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   add('No "busy" replies', claim.busy === 0 ? 'pass' : 'fail', claim.busy === 0 ? 'none' : `${claim.busy} visitors were told "busy, try again" — this should never happen`);
   add('Rate limiter did not interfere', claim.rateLimited === 0 ? 'pass' : 'warn', claim.rateLimited === 0 ? 'none blocked' : `${claim.rateLimited} test visitors were rate-limited (results may be less reliable)`);
   if (issued.length) add('Issued codes are valid', verifiedActive === issued.length ? 'pass' : 'fail', `${verifiedActive}/${issued.length} verified ACTIVE`);
-  const page = endpoints.page, cl = endpoints.claim;
+  const page = endpoints.page, win = endpoints.claim_win, nope = endpoints.claim_full;
   if (page) add('Page loads quickly (p95 ≤ 3s)', page.p95 <= 3000 ? 'pass' : 'warn', `p95 ${page.p95} ms, slowest ${page.max} ms`);
-  if (cl) add('Code request is quick (p95 ≤ 5s)', cl.p95 <= 5000 ? 'pass' : 'warn', `p95 ${cl.p95} ms, slowest ${cl.max} ms`);
+  if (win && claim.issued) {
+    const perSlot = Math.round(win.max / claim.issued);
+    add('Winners get their code quickly', perSlot <= 400 ? 'pass' : 'warn', `the last winner waited ${(win.max / 1000).toFixed(1)}s (~${perSlot} ms per slot; winners are served one at a time to stay exact)`);
+  }
+  if (nope) add('"Full" answers are quick (p95 ≤ 3s)', nope.p95 <= 3000 ? 'pass' : 'warn', `p95 ${nope.p95} ms, slowest ${nope.max} ms`);
   if (finalAvail != null && capacity) add('Slots show as taken afterwards', finalAvail === Math.max(0, capacity - claim.issued) ? 'pass' : 'warn', `${finalAvail} slots left on the page`);
 
   const verdict = checks.some((c) => c.result === 'fail') ? 'FAIL' : checks.some((c) => c.result === 'warn') ? 'WARN' : 'PASS';
@@ -175,7 +179,7 @@ export function formatLoadTest(r: LoadTestReport): string {
     '',
     `Codes issued: <b>${r.claim.issued}</b> · "full" replies: ${r.claim.full} · busy: ${r.claim.busy} · rate-limited: ${r.claim.rateLimited}`,
     '',
-    ep('page', 'Page load'), ep('giveaway', 'Giveaway data'), ep('claim', 'Get code'),
+    ep('page', 'Page load'), ep('giveaway', 'Giveaway data'), ep('claim_win', 'Winners (got a code)'), ep('claim_full', 'Told "full"'),
     '',
     ...r.checks.map((c) => `${icon[c.result]} ${c.name} — ${c.detail}`),
     '',
@@ -184,4 +188,3 @@ export function formatLoadTest(r: LoadTestReport): string {
     r.errorSamples.length ? '<b>Errors seen:</b>\n' + r.errorSamples.map((e) => `• ${e.message} ×${e.count}`).join('\n') : 'No errors were seen.',
   ].filter((x) => x !== null).join('\n');
 }
-  
