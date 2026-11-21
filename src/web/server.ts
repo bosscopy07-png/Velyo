@@ -10,6 +10,7 @@ import { getPublicGiveaway, platformStats, resolveSlug } from './public';
 import { looksLikeEvmAddress } from './lib/address';
 import { staticHandler, sendHtml } from './static';
 import { codeStatus } from './status';
+import { forget } from './cache';
 import { recordRequest, SLOW_MS } from './health';
 import { giveawayService } from '../services/giveaway';
 import { reserveSlot, sweepExpired, type RequestSignals } from './reservations';
@@ -181,6 +182,7 @@ export function createWebRouter(): express.Router {
         if (!id) return res.status(404).json({ error: 'NOT_FOUND' });
         const result = await reserveSlot(id, signalsOf(req), { addressHash: hashAddress(cfg.hashSecret, address), maskedAddress: maskAddress(address) });
         if (result.ok) {
+          if (!result.reused) forget(`gw:${req.params.slug}`); // the page must show the slot as taken straight away
           // A freshly issued code counts as a claim attempt in the bot's giveaway statistics.
           if (!result.reused && !isLoadTest(req)) giveawayService.trackAttempt(id).catch((e) => logger.warn(`[web] attempt tracking skipped: ${(e as Error).message}`));
           const code = result.code;
@@ -300,4 +302,4 @@ export function startWebServer(): void {
 }
 
 if (require.main === module) startWebServer();
-    
+                                   
