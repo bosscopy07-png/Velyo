@@ -23,14 +23,14 @@ import { parseTestInput } from './loadtest-parse';
  */
 const STATE = 'admin_loadtest';
 const DEFAULT_USERS = 50;
-const MAX_USERS = 2000;
+const MAX_USERS = 1000;
 const isAdmin = (ctx: Context) => config.ADMIN_TELEGRAM_IDS.includes(ctx.from?.id.toString() ?? '');
 
 const PROMPT =
   `${e('chart')} <b>TRAFFIC TEST</b>\n\n` +
   `Send the giveaway link, and optionally how many visitors.\n\n` +
   `Example: <code>https://yourdomain.com/g/abc123xyz 50</code>\n\n` +
-  `• Default ${DEFAULT_USERS} visitors, maximum ${MAX_USERS}.\n` +
+  `• Default ${DEFAULT_USERS} visitors, maximum ${MAX_USERS}. The test stops by itself if the server's memory gets too high.\n` +
   `• Use a <b>test giveaway created by an admin account</b> (for example $1 with 20 slots).\n` +
   `• The test takes up the slots for about 10 minutes, then they return by themselves.\n` +
   `• Real visitors would be slowed down while it runs, so don't test during a live launch.`;
@@ -106,4 +106,3 @@ export function registerLoadTest(bot: any): void {
     await start(ctx, text);
   });
 }
-  
