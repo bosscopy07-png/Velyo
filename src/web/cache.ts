@@ -22,3 +22,8 @@ export async function memo<T>(key: string, ttlMs: number, fn: () => Promise<T>):
   }
   return p;
 }
+
+/** Drop a cached display value (e.g. right after a claim changes a giveaway's slot count). */
+export function forget(key: string): void {
+  store.delete(key);
+}
