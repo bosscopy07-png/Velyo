@@ -69,10 +69,16 @@ export async function slugFor(giveawayId: string): Promise<string> {
   throw new Error('slug allocation failed');
 }
 
+const slugCache = new Map<string, string>();
 export async function resolveSlug(slug: string): Promise<string | null> {
   if (!/^[a-z0-9]{6,32}$/.test(slug)) return null;
+  const hit = slugCache.get(slug);
+  if (hit) return hit;
   const row = await prisma.giveawayPublicLink.findUnique({ where: { slug } });
-  return row?.giveawayId ?? null;
+  if (!row) return null; // misses are not cached
+  if (slugCache.size > 5000) slugCache.clear();
+  slugCache.set(slug, row.giveawayId);
+  return row.giveawayId;
 }
 
 type Row = {
@@ -212,5 +218,4 @@ export async function platformStats(): Promise<PlatformStats> {
   };
   statsCache = { at: Date.now(), value };
   return value;
-      }
-  
+}
