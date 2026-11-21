@@ -120,8 +120,16 @@ export async function runLoadTest(o: LoadTestOptions): Promise<LoadTestReport> {
   const issued = users.filter((u) => u.code);
   const verified = await Promise.all(issued.map((u) => call('verify', '/api/v1/code-status', u.headers, 'POST', { code: u.code })));
   const verifiedActive = verified.filter((v) => v.json?.state === 'ACTIVE').length;
-  const fin = await call('giveaway', `/api/v1/giveaways/${o.slug}`, users[0].headers);
-  const finalAvail: number | null = fin.json?.giveaway ? Number(fin.json.giveaway.availableSlots) : null;
+  const readAvail = async () => {
+    const r = await call('giveaway', `/api/v1/giveaways/${o.slug}`, users[0].headers);
+    return r.json?.giveaway ? Number(r.json.giveaway.availableSlots) : null;
+  };
+  let finalAvail = await readAvail();
+  const expectedAvail = capacity == null ? null : Math.max(0, capacity - claim.issued);
+  if (expectedAvail != null && finalAvail !== expectedAvail) { // the page may cache for a moment: look once more
+    await new Promise((r) => setTimeout(r, 2500));
+    finalAvail = await readAvail();
+  }
   clearInterval(guard);
   const durationMs = Math.round(performance.now() - started);
 
@@ -175,5 +183,5 @@ export function formatLoadTest(r: LoadTestReport): string {
     '',
     r.errorSamples.length ? '<b>Errors seen:</b>\n' + r.errorSamples.map((e) => `• ${e.message} ×${e.count}`).join('\n') : 'No errors were seen.',
   ].filter((x) => x !== null).join('\n');
-                                                }
-                                                
+}
+  
