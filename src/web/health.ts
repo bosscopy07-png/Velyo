@@ -48,12 +48,18 @@ async function timeIt(fn: () => Promise<unknown>): Promise<number | null> {
   }
 }
 
+/** connection_limit from DATABASE_URL (null = not set, so Prisma uses a small default). */
+export function dbConnectionLimit(url = process.env.DATABASE_URL): number | null {
+  try { const v = new URL(url ?? '').searchParams.get('connection_limit'); return v ? Number(v) : null; } catch { return null; }
+}
+
 export async function siteHealth(probes: Probes) {
   const mem = process.memoryUsage();
   const lag = { p99: Math.round(loop.percentile(99) / 1e6), max: Math.round(loop.max / 1e6) };
   loop.reset();
   return {
     uptimeMinutes: Math.round((Date.now() - startedAt) / 60_000),
+    dbConnectionLimit: dbConnectionLimit(),
     rssMb: Math.round(mem.rss / 1048576),
     heapMb: Math.round(mem.heapUsed / 1048576),
     eventLoopLagMs: lag,
@@ -63,13 +69,15 @@ export async function siteHealth(probes: Probes) {
   };
 }
 
-export function formatHealth(h: Awaited<ReturnType<typeof siteHealth>>): string {
+type Health = Omit<Awaited<ReturnType<typeof siteHealth>>, 'dbConnectionLimit'> & { dbConnectionLimit?: number | null };
+export function formatHealth(h: Health): string {
   const flags: string[] = [];
   if (h.uptimeMinutes < 10) flags.push('⚠️ Process started only ' + h.uptimeMinutes + ' min ago (restart or cold start).');
   if (h.rssMb > 400) flags.push('⚠️ Memory is high (' + h.rssMb + ' MB).');
   if (h.eventLoopLagMs.p99 > 200) flags.push('⚠️ The server was busy: event-loop delay p99 ' + h.eventLoopLagMs.p99 + ' ms (CPU limit).');
   if (h.dbPingMs === null || h.dbPingMs > 300) flags.push('⚠️ Database is slow or unreachable (' + (h.dbPingMs ?? 'timeout') + ').');
   if (h.redisPingMs === null || h.redisPingMs > 150) flags.push('⚠️ Redis is slow or unreachable (' + (h.redisPingMs ?? 'timeout') + ').');
+  if (h.dbConnectionLimit === null) flags.push('⚠️ Database connection limit is not set, so only a few visitors can be served at once. Add ?connection_limit=15&pool_timeout=20 to the end of DATABASE_URL.');
   if (h.serverErrors > 0) flags.push('⚠️ ' + h.serverErrors + ' server errors in the last ' + h.windowMinutes + ' min.');
   if (h.slow > 0) flags.push('⚠️ ' + h.slow + ' slow requests (>' + SLOW_MS + ' ms).');
   return [
