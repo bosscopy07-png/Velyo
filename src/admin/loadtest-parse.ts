@@ -1,6 +1,6 @@
 /** Pure parser for the traffic-test input: a giveaway link plus an optional visitor count. */
 const DEFAULT_USERS = 50;
-const MAX_USERS = 2000;
+const MAX_USERS = 1000;
 
 export function parseTestInput(text: string): { slug: string; users: number } | null {
   const m = text.match(/\/g\/([a-z0-9]{6,32})/i);
